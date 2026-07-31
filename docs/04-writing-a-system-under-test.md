@@ -12,15 +12,24 @@ appears.
 ## The contract
 
 ```erlang
--callback init(Seed :: integer(), Config :: map()) -> {ok, sut()}.
--callback processes(sut()) -> [pid()].
--callback generate(sut(), rand:state()) -> {op(), rand:state()}.
--callback execute(op(), sut()) -> sut().
--callback check(sut()) -> ok | {violation, violation()}.
--callback terminate(sut()) -> ok.
+-callback init(Seed :: integer(), Config :: map()) -> {ok, state()}.
+-callback processes(state()) -> [pid()].
+-callback generate(state(), rand:state()) -> {op(), rand:state()}.
+-callback execute(op(), state()) -> state().
+-callback check(state()) -> ok | {violation, violation()}.
+-callback terminate(state()) -> ok.
+
+%% optional
+-callback label(pid(), state()) -> term().
 ```
 
-`sut()` is whatever you want it to be. A map is conventional.
+`state()` is whatever you want it to be. A map is conventional.
+
+A harness is not the system under test — your `gen_server`s and protocol code
+are that. It's the adapter that starts the system, declares which processes to
+schedule, drives it with a workload, and judges it. That distinction decides
+which modules include `dst.hrl` and use `?DST_LOG`: the ones that ship. Your
+harness never ships, so it can call `dst_log` directly.
 
 ## init/2
 

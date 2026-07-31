@@ -90,10 +90,13 @@ With perfect replayability, you can debug system state more precisely, and
 find the logic error more quickly.
 
 But perfect replayability also buys you something less obvious: minimization
-of the trace (a.k.a shrinking). Once a trace and behavior is identified,
+of the trace (a.k.a. shrinking). Once a trace and behavior is identified,
 a search can be conducted to find the minimal set of steps necessary to
 match the behavior. This can reduce a trace of 1000s of events to a dozen,
-again speeding up the resoution. `dst_shrink` is provided for this purpose.
+again speeding up the resolution. `dst_shrink` is provided for this purpose.
+Even still, the trace is merely a set of steps for the scheduler to take,
+and doesn't tell a story about your system. `dst_log` is provided to help
+you define the narrative of your system.
 
 As mentioned above, virtual time can cover lots of ground that real-time
 simulation testing could not. A run of `dgen_registry` can simulate ~280

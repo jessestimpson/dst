@@ -9,12 +9,13 @@
 >
 > So: module and file paths such as `dgen_registry_member`, `dgen_mem` and
 > `test/support/sim/` refer to that project, not to this one. For the manual, see
-> the [walkthrough](overview.md).
+> the walkthrough, [`docs/01`](01-what-dst-is.md) through
+> [`docs/05`](05-gotchas.md).
 
 **Status:** Phases 0–4 are done, and Phase 5's central problem — OTP's own
 process creation — turned out to have a cheaper answer than the plan assumed, so
 that is done too. `dst_sched`, `dst_time`, `dst_transform`, `dst_after_transform`,
-`dst_observe`, `dgen_mem`, `dst_sut`, `dst_run` and `dst_shrink`, with two systems
+`dst_observe`, `dgen_mem`, `dst_harness`, `dst_run` and `dst_shrink`, with two systems
 under test on the full driver: `dgen_registry` and two-phase commit. The suite runs
 with no FoundationDB (`DGEN_BACKEND=dgen_mem mix test`).
 
@@ -519,7 +520,7 @@ it cannot vary — which is what `dst_sched` will make possible in Phase 3.
 ### Phase 3 — Extract the framework — **in progress**
 
 - ~~The behaviour, `dst_run`, record/replay, failure reporting.~~ Shipped as
-  [`src/dst_sut.erl`](../../src/dst_sut.erl) and
+  [`src/dst_harness.erl`](../../src/dst_harness.erl) and
   [`src/dst_run.erl`](../../src/dst_run.erl).
 - ~~**Port a second, unrelated SUT.**~~ Shipped as `test/support/dst_2pc*.erl`.
 - ~~`dst_sched` into its own process~~ — done first, as a prerequisite.
@@ -802,7 +803,7 @@ by measuring rather than reasoning:
 | 2 | OTP spawning inside `gen_server:start_monitor` | `dst_sched:start_monitor/3` | `adopted_late` → 0 |
 | 3 | Handover that was not quiescent | `init/2` waits for it | distinct traces 8 → 5 |
 
-The third is the one to remember. `dst_sut` requires `init/2` to return with the
+The third is the one to remember. `dst_harness` requires `init/2` to return with the
 system quiescent, and `dgen_registry`'s own SUT violated that: `Cluster.start/3`
 waits for *readiness*, which is not the same thing, and about one start in five
 left a member's elector still running an unprocessed call. Everything else about
@@ -841,7 +842,7 @@ begin
 end
 ```
 
-Shipped as [`src/dst_after_transform.erl`](../../src/dst_after_transform.erl), with
+Shipped as a pass inside [`src/dst_transform.erl`](../../src/dst_transform.erl), with
 `dst_time:arm_after/2` and `disarm_after/2` behind it and the properties pinned in
 `test/dst_after_test.exs`. Measured: a 60-second timeout resolves in single-digit
 milliseconds, and the same receive compiled without the transform ignores the

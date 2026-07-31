@@ -83,7 +83,7 @@ concurrently in the same node.
     read_timer/1
 ]).
 
-%% Receive timeouts — what dst_after_transform's rewritten `after` blocks call.
+%% Receive timeouts — what dst_transform's rewritten `after` blocks call.
 -export([
     arm_after/2,
     disarm_after/2
@@ -324,14 +324,14 @@ insert_timer(Time, Dest, Msg, Kind) ->
     Ref.
 
 %% ---------------------------------------------------------------------------
-%% Receive-timeout support (for dst_after_transform)
+%% Receive-timeout support (for dst_transform's `-dst_after(true)` pass)
 %% ---------------------------------------------------------------------------
 
 -if(?DOCATTRS).
 -doc """
 Arms the virtual timeout behind a rewritten `receive ... after`.
 
-`dst_after_transform` turns the `after` block into an ordinary receive clause
+`dst_transform` turns the `after` block into an ordinary receive clause
 waiting on `{'$dst_after', Ref}`, and this is what makes that message arrive. The
 handle it returns is opaque and belongs to `disarm_after/2`.
 
@@ -360,7 +360,7 @@ Cancels an armed timeout and removes its message if it already landed.
 
 The transform calls this at the *head* of every ordinary receive clause rather
 than after the receive, which is what keeps the clause bodies in tail position —
-see `dst_after_transform`. Flushing is not optional: a timer that fired before its
+see `dst_transform`. Flushing is not optional: a timer that fired before its
 receive matched something else leaves a `{'$dst_after', Ref}` nothing will ever
 match again.
 """.
@@ -369,12 +369,27 @@ match again.
 disarm_after(undefined, _Ref) ->
     ok;
 disarm_after(flush_only, Ref) ->
+    %% `arm_after(0, Ref)` delivered the message straight to our own mailbox, so
+    %% there is definitely one to remove.
     flush_after(Ref);
 disarm_after(TRef, Ref) ->
-    _ = cancel_timer(TRef),
-    flush_after(Ref).
+    case cancel_timer(TRef) of
+        false ->
+            %% Already fired, so a message may be queued for a receive that has
+            %% moved on. This is the only case that needs the flush.
+            flush_after(Ref);
+        _Remaining ->
+            %% Cancelled with time to spare, which means it never sent anything.
+            %%
+            %% Worth the extra clause: this runs on **every** successful receive
+            %% in a rewritten module, and `flush_after/1` is a selective receive
+            %% on a ref the compiler cannot prove is fresh — so it walks the
+            %% whole mailbox before giving up. Skipping it when there is provably
+            %% nothing to find takes an O(mailbox) scan off the common path.
+            ok
+    end.
 
-%% This module is never itself compiled with `dst_after_transform` — if it were,
+%% This module never declares `-dst_after(true)` — if it did,
 %% the `after 0` below would rewrite into a call to `arm_after/2`, which calls this.
 flush_after(Ref) ->
     receive

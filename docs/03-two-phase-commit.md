@@ -60,11 +60,11 @@ there. If the state exists only inside a process, publish it.
 
 ## The coordinator, and the timer
 
-The coordinator is where the transform is needed, for exactly one line, the
+The coordinator is where the header is needed, for exactly one line, the
 timer:
 
 ```erlang
--compile({parse_transform, dst_transform}).
+-include_lib("dst/include/dst.hrl").
 
 -define(VOTE_TIMEOUT, 30000).
 
@@ -75,6 +75,10 @@ handle_call({run_tx, TxId}, From, St) ->
     Timer = erlang:send_after(?VOTE_TIMEOUT, self(), {vote_timeout, TxId}),
     ...
 ```
+
+Including `dst.hrl` is the whole opt-in. Under a simulation build it brings the
+parse transform, so that `erlang:send_after/3` becomes `dst_time:send_after/3`;
+under a release build it brings nothing and the line ships as written.
 
 30 seconds is long enough that the timeout never fires by accident and short
 enough to be interesting, and it costs nothing because it's virtual. When every
@@ -122,9 +126,9 @@ schedule in which a `yes`-voting participant is stepped before the `no`-voting
 one. The workload generator draws `no` about a fifth of the time per
 participant. The rest is the scheduler's job.
 
-## The system under test
+## The harness
 
-6 callbacks, `init/2` through `terminate/1`.
+6 required callbacks, `init/2` through `terminate/1`, and one optional one.
 
 ### init/2
 
@@ -257,6 +261,25 @@ failure" from "a different failure that also happens to be a failure". Without
 it, a shrinker with more than one invariant to choose from will reduce one bug
 into another and report the result as progress.
 
+### label/2, the optional one
+
+```erlang
+label(Pid, #{coordinator := C, participants := Ps, clients := Clients}) ->
+    case lists:keyfind(Pid, 2, Ps) of
+        {Index, Pid} -> {participant, Index};
+        false when Pid =:= C -> coordinator;
+        false -> ...
+    end.
+```
+
+Without it a step reads `p3`; with it, `participant-2`. It's called once per
+process *after* the run, because ids are handed out as processes register and
+only your harness can name them, so it costs nothing during one. Return any
+term: `dst_log` renders `{participant, 2}` as `participant-2`.
+
+Six lines that decide whether a failure report is readable. See the section
+below.
+
 ### terminate/1
 
 ```erlang
@@ -338,10 +361,44 @@ result:
  {step, 1}]
 ```
 
-Transaction 3 is the one that matters, since participant 3 votes `no`, and the
-6 steps after it are the interleaving that lets a `yes` reach the coordinator
-first. Process 0 is the coordinator, 1 to 3 are the participants, and 5 is the
-client for that transaction.
+If that means little to you, that's the right reaction. **A trace is a
+scheduler artifact, not an explanation.** `{step, 5}` records which process the
+scheduler chose and says nothing about what that process did, and the ids are
+anonymous positions assigned in registration order. Turning one into a story
+means reconstructing every mailbox state by hand.
+
+What shrinking gives you is a trace short enough to be worth narrating.
+`dst_log` is what narrates it.
+
+### Reading it
+
+`dst_run` writes its own decisions into the same log your system writes to, so
+replaying the shrunk trace and printing gives you one timeline:
+
+```erlang
+dst_run:replay(dst_2pc, Minimal, Opts),
+dst_log:analyze().
+```
+
+```
+   30  $dst           {op,{run_tx,5,[{1,no},{2,yes},{3,stall}]}}
+   39  participant-2  {voted,5,yes}
+   42  coordinator    {decided,5,commit}
+   53  participant-1  {voted,5,no}
+   55  participant-1  {decided,5,commit,aborted}
+```
+
+Line 42 is the bug: the coordinator decided on one vote. Line 53 is the `no`
+arriving too late, and line 55 is the participant refusing, which is what makes
+the disagreement visible.
+
+The names come from `label/2`. Without it those rows read `p0` and `p2`, and
+the events come from `?DST_LOG` calls in the participant and coordinator —
+about one per protocol decision. `dst_log:analyze(#{until => N})` stops the
+output where the story does, which matters because everything after the run
+proper is the scheduler releasing the system during teardown.
+
+### What the shrinker couldn't remove
 
 Transaction 2 contributes nothing, and its survival illustrates the shrinker's
 one real limitation. Step ids are positional, so removing that leading

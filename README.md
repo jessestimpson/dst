@@ -18,13 +18,16 @@ reads. All of it is driven from a single seeded RNG.
   `replay/3` follows that trace back exactly.
 - **Shrinks failures.** `dst_shrink` delta-debugs a failing trace down to the
   decisions that matter, then verifies the result still reproduces.
+- **Explains failures.** A trace says which process ran, not what it did.
+  `dst_log` records both on one timeline, with your processes named, so a
+  counterexample reads as a story instead of a column of integers.
 - **Reads frozen state.** `dst_observe` gets a suspended process's state out
   without asking it anything, which is the only way an invariant can inspect a
   system the scheduler has stopped.
 
 ## Getting Started
 
-A system under test provides 6 callbacks (see `dst_sut`), and a run is one
+A system under test provides 6 callbacks (see `dst_harness`), and a run is one
 call:
 
 ```erlang
@@ -45,7 +48,7 @@ purposes.
 
 ## Documentation
 
-The [walkthrough](docs/overview.md) is the manual, in 5 parts:
+The walkthrough is the manual, in 5 parts:
 
 1. [What DST is](docs/01-what-dst-is.md). Discusses the kinds of bugs we're
    looking for, how the technique works, and how your project implementation

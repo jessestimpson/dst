@@ -7,6 +7,7 @@ defmodule Dst.MixProject do
       version: "0.1.0",
       elixir: "~> 1.15",
       erlc_paths: erlc_paths(Mix.env()),
+      erlc_options: erlc_options(Mix.env()),
       elixirc_paths: [],
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
@@ -26,6 +27,13 @@ defmodule Dst.MixProject do
   defp erlc_paths(:test), do: ["src", "test/support"]
   defp erlc_paths(_), do: ["src"]
 
+  # The `DST` define is the contract `include/dst.hrl` hangs on: with it, the
+  # header brings the parse transform and the `?DST_LOG` macros; without it, it
+  # brings nothing. This project's own test suite is a simulation build, so it
+  # sets it — the same line every adopter writes.
+  defp erlc_options(:test), do: [:debug_info, {:d, :DST}]
+  defp erlc_options(_), do: [:debug_info]
+
   def application do
     [extra_applications: [:logger]]
   end
@@ -41,7 +49,7 @@ defmodule Dst.MixProject do
     [
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => "https://github.com/foundationdb-beam/dst"},
-      files: ["src", "mix.exs", "rebar.config", "README.md", "LICENSE.md", "docs"]
+      files: ["src", "include", "mix.exs", "rebar.config", "README.md", "LICENSE.md", "docs"]
     ]
   end
 
@@ -51,7 +59,6 @@ defmodule Dst.MixProject do
       extras: [
         "README.md",
         "LICENSE.md",
-        {"docs/overview.md", [title: "Walkthrough"]},
         {"docs/01-what-dst-is.md", [title: "What DST is"]},
         {"docs/02-setting-up.md", [title: "Setting up a project"]},
         {"docs/03-two-phase-commit.md", [title: "Example: two-phase commit"]},
@@ -60,7 +67,7 @@ defmodule Dst.MixProject do
         {"docs/design.md", [title: "Design history"]}
       ],
       groups_for_extras: [
-        Walkthrough: ~r{docs/(overview|0\d)},
+        Walkthrough: ~r{docs/0\d},
         Design: ~r{docs/design}
       ]
     ]

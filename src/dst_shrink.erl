@@ -57,8 +57,19 @@ and a shrinker that reports a beautifully small trace nobody can reproduce.
 Both dimensions at once, since both are entries in the same list: operations
 disappear entirely, and so do scheduling decisions. Removing an operation is the
 larger win and usually happens first because ddmin works coarse-to-fine; what
-survives at the end is close to a minimal interleaving, which is the interesting
-artefact — it is nearly a proof sketch of the defect.
+survives at the end is close to a minimal interleaving.
+
+**A shrunk trace is not an explanation, and this doc used to claim otherwise.**
+It said the result was "nearly a proof sketch of the defect", which is true for
+somebody who already knows the protocol and how ids were assigned, and false for
+everybody else. `{step, 8}` names a position, not a process, and says nothing
+about what that process did. Reading one means reconstructing every mailbox
+state by hand.
+
+What shrinking gives you is a trace short enough to be worth narrating.
+`dst_log` is what narrates it: run the shrunk trace back through `replay/3` and
+`dst_log:analyze/0` prints the schedule and the system's own behaviour on one
+timeline, with processes named. Use both.
 
 It cannot shrink below what the system needs to reach the violation at all, and it
 does not try to simplify the *contents* of an operation (a smaller name, fewer
@@ -94,7 +105,7 @@ entries are removed, which is a real extension rather than a tuning change.
 -record(s, {
     mod :: module(),
     opts :: map(),
-    match :: fun((dst_sut:violation()) -> boolean()),
+    match :: fun((dst_harness:violation()) -> boolean()),
     tests = 0 :: non_neg_integer(),
     budget :: non_neg_integer()
 }).

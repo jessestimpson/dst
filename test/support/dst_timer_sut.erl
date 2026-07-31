@@ -8,7 +8,12 @@
 %% Production modules guard the transform; see `dst_transform`'s module doc.
 -compile({parse_transform, dst_transform}).
 
--export([start/2, start_periodic/3, elapsed/1]).
+%% `both/2` carries both rewrites in one function — a rewritten *call* and a
+%% rewritten *`after`*. That combination was impossible while the receive-timeout
+%% rewrite lived in a second `parse_transform`, since Mix cannot reliably order a
+%% module that names two.
+
+-export([start/2, start_periodic/3, elapsed/1, both/2]).
 
 %% A process that sets a one-shot timer and records when it fires, according to
 %% the clock it can see.
@@ -66,3 +71,19 @@ periodic(Trace, IntervalMs, Count) ->
 %% and not merely that timers fire.
 elapsed(Since) ->
     erlang:monotonic_time(millisecond) - Since.
+
+%% Every source of real time in one function. `erlang:monotonic_time/1` is
+%% rewritten by the call pass, and the `receive ... after` by the timeout pass.
+%% Nothing here can observe the wall clock, so the elapsed time it reports is
+%% exactly the interval the driver advanced.
+both(Trace, TimeoutMs) ->
+    spawn(fun() ->
+        Started = erlang:monotonic_time(millisecond),
+        Result =
+            receive
+                {ping, From} -> From ! pong, got_message
+            after TimeoutMs -> timed_out
+            end,
+        Now = erlang:monotonic_time(millisecond),
+        ets:insert(Trace, {erlang:unique_integer([monotonic]), {Result, Now - Started}})
+    end).

@@ -1,7 +1,7 @@
 -module(dst_2pc).
--behaviour(dst_sut).
+-behaviour(dst_harness).
 
-%% Two-phase commit as a `dst_sut` — the framework's second system under test.
+%% Two-phase commit as a `dst_harness` — the framework's second system under test.
 %%
 %% It exists to answer one question: is `dst_run` a framework, or is it
 %% one system's simulation with the names changed? So it deliberately shares
@@ -24,12 +24,12 @@
 %%   only the coordinator's prepare timeout can resolve the transaction. Under a
 %%   frozen clock the run would deadlock; it is the idle callback that unblocks it.
 
--export([init/2, processes/1, generate/2, execute/2, check/1, terminate/1]).
+-export([init/2, processes/1, generate/2, execute/2, check/1, terminate/1, label/2]).
 
 -define(PARTICIPANTS, 3).
 
 %% ---------------------------------------------------------------------------
-%% dst_sut
+%% dst_harness
 %% ---------------------------------------------------------------------------
 
 init(Seed, Config) ->
@@ -56,11 +56,39 @@ init(Seed, Config) ->
         %% A fixed vote plan, if the caller wants one. Pinning the workload is how
         %% a test isolates the schedule as the only variable: same votes, different
         %% seed, and any change in outcome is the interleaving and nothing else.
-        plan => maps:get(plan, Config, random)
+        plan => maps:get(plan, Config, random),
+        %% Off by default. When set, a client reaches for a module the run has
+        %% not loaded yet, which is what `modules_loaded` exists to catch. See
+        %% `dst_2pc_lazy`.
+        lazy => maps:get(lazy, Config, false)
     }}.
 
 processes(#{coordinator := Coordinator, participants := Participants, clients := Clients}) ->
     [Coordinator | [P || {_Index, P} <- Participants]] ++ Clients.
+
+%% Optional, and worth the six lines. Without it `dst_log:analyze/0` reports
+%% `p0` through `p5`; with it, `coordinator`, `participant-2`, `client-3`.
+%% Called once per process at teardown, so it costs nothing during a run.
+label(Pid, #{coordinator := Coordinator, participants := Participants, clients := Clients}) ->
+    case lists:keyfind(Pid, 2, Participants) of
+        {Index, Pid} ->
+            {participant, Index};
+        false when Pid =:= Coordinator ->
+            coordinator;
+        false ->
+            %% Clients are prepended as they are created, so the oldest is last.
+            case index_of(Pid, lists:reverse(Clients)) of
+                undefined -> undefined;
+                N -> {client, N}
+            end
+    end.
+
+index_of(Pid, List) ->
+    index_of(Pid, List, 1).
+
+index_of(_Pid, [], _N) -> undefined;
+index_of(Pid, [Pid | _], N) -> N;
+index_of(Pid, [_ | Rest], N) -> index_of(Pid, Rest, N + 1).
 
 %% A transaction, plus what each participant will do when asked to prepare it.
 %% Drawn entirely from the supplied rand state, so the workload replays.
@@ -86,7 +114,7 @@ vote_for(Roll) when Roll < 0.70 -> yes;
 vote_for(Roll) when Roll < 0.90 -> no;
 vote_for(_Roll) -> stall.
 
-execute({run_tx, TxId, Plan}, Sut = #{tab := Tab, coordinator := Coordinator}) ->
+execute({run_tx, TxId, Plan}, Sut = #{tab := Tab, coordinator := Coordinator, lazy := Lazy}) ->
     [ets:insert(Tab, {{plan, TxId, Index}, Vote}) || {Index, Vote} <- Plan],
 
     %% Spawned, not called: the coordinator is suspended, so a synchronous call
@@ -97,11 +125,30 @@ execute({run_tx, TxId, Plan}, Sut = #{tab := Tab, coordinator := Coordinator}) -
     %% run before the scheduler owns it, and two of those race each other to the
     %% coordinator's mailbox. That produced two different traces from one seed.
     Client = dst_run:spawn_op(fun() ->
+        _ = maybe_touch_lazy(Lazy, TxId),
         Result = gen_server:call(Coordinator, {run_tx, TxId}, infinity),
         ets:insert(Tab, {{client, TxId}, Result})
     end),
 
     Sut#{clients := [Client | maps:get(clients, Sut)], next_tx := TxId + 1}.
+
+%% Deliberately a demand-load from inside a *scheduled* process, which is the
+%% shape that breaks a seed. Off unless a test asks for it.
+%%
+%% The first transaction only, and that is not fussiness. A process blocked
+%% inside `code_server` looks to `dst_sched` exactly like one blocked in a
+%% receive: not runnable. If *every* client reached for the cold module at once
+%% they would all block there, nothing would be runnable, no timer would be
+%% pending, and the run would end at what looks like quiescence having taken one
+%% step per client. Measured, before this clause existed: 5 operations, 5 steps,
+%% nothing exited, `outcome => ok`.
+%%
+%% Touching it once leaves the other transactions to keep the run moving while
+%% the code server answers, which is what a real system's first cold module
+%% would find too.
+maybe_touch_lazy(false, _TxId) -> ok;
+maybe_touch_lazy(true, 1) -> dst_2pc_lazy:touch();
+maybe_touch_lazy(true, _TxId) -> ok.
 
 %% Atomicity: no two participants may reach opposite conclusions about the same
 %% transaction. Read entirely from ETS — nothing here sends a message or waits.

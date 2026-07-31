@@ -1,6 +1,7 @@
 defmodule DstAfterTest do
   @moduledoc """
-  `dst_after_transform` — putting `receive ... after` on the virtual clock.
+  `dst_transform`'s `-dst_after(true)` pass — putting `receive ... after` on the
+  virtual clock.
 
   The framework's plan assumed this could not be done: `after` is a language
   construct rather than a call, so `dst_transform` has nothing to redirect, and
@@ -28,7 +29,7 @@ defmodule DstAfterTest do
   #
   # Not belt and braces — without it these tests are not a regression suite at all.
   # Mix does not treat a `parse_transform` as a compile-time dependency, so editing
-  # `dst_after_transform` recompiles only the transform and leaves every module
+  # `dst_transform` recompiles only the transform and leaves every module
   # built with it stale. Verified by deliberately reintroducing the tail-position
   # bug: the suite stayed green until `dst_after_sut.erl` was touched by hand, and
   # then reported 200,000 extra words of stack. A transform test that silently
@@ -292,6 +293,118 @@ defmodule DstAfterTest do
       @sut.escaping(60_000)
     catch
       :exit, reason -> {:exited, reason}
+    end
+  end
+
+  describe "both passes on one module" do
+    # The capability this merge bought. While the receive-timeout rewrite lived
+    # in a second `parse_transform`, no module could carry both, because Mix
+    # cannot reliably order a module that names two — so a system with timers
+    # *and* `receive ... after` had to give one of them up.
+    #
+    # `dst_timer_sut` now declares `-dst_after(true)` alongside the transform,
+    # and `both/2` puts a rewritten call and a rewritten `after` in one function.
+
+    test "a rewritten call and a rewritten after coexist" do
+      trace = :ets.new(:both, [:public, :ordered_set])
+
+      :dst_timer_sut.both(trace, 30_000)
+
+      # Wait for the arm before advancing. The process runs on the real
+      # scheduler here, so advancing first would move the clock past a deadline
+      # that had not been set yet and the timeout would never fire.
+      wait_for(fn -> :dst_time.pending() == 1 end)
+
+      # Nothing has run the timeout yet, and no wall clock is going to.
+      assert :ets.tab2list(trace) == []
+
+      # 30 virtual seconds, in microseconds of real time.
+      {elapsed_us, _} = :timer.tc(fn -> :dst_time.advance(30_000) end)
+      wait_for(fn -> :ets.tab2list(trace) != [] end)
+
+      assert [{_, {:timed_out, 30_000}}] = :ets.tab2list(trace),
+             "the after fired on the virtual clock and monotonic_time agreed with it"
+
+      assert elapsed_us < 1_000_000, "30 simulated seconds should not cost a real one"
+      :ets.delete(trace)
+    end
+
+    test "the message still wins when one is waiting" do
+      trace = :ets.new(:both_msg, [:public, :ordered_set])
+
+      pid = :dst_timer_sut.both(trace, 30_000)
+      send(pid, {:ping, self()})
+      assert_receive :pong, 1_000
+
+      wait_for(fn -> :ets.tab2list(trace) != [] end)
+      assert [{_, {:got_message, 0}}] = :ets.tab2list(trace)
+      :ets.delete(trace)
+    end
+  end
+
+  # The transformed process runs on the real scheduler here, so there is a
+  # genuine race between it and this test. Polling on the real clock is correct
+  # in a test that is not itself under `dst_sched`.
+  defp wait_for(pred, attempts \\ 200) do
+    cond do
+      pred.() -> :ok
+      attempts == 0 -> flunk("condition never became true")
+      true -> Process.sleep(5) && wait_for(pred, attempts - 1)
+    end
+  end
+
+  describe "on by default, and the escape hatch" do
+    # `dst_after_sut` carries no `-dst_after` attribute at all, so every test
+    # above is already evidence that the pass is on by default. What is left is
+    # the opt-out, and that opting out of one pass leaves the others alone.
+
+    test "-dst_after(false) leaves the receive on the real clock" do
+      pid = proc(fn -> :dst_after_optout.wait(60_000) end)
+      Process.sleep(20)
+
+      assert :dst_time.pending() == 0, "an opted-out `after` armed a virtual timer"
+      refute :dst_time.advance_to_next(), "there was something to advance to"
+      assert await(pid, 100) == :no_answer, "it resolved without the real clock"
+
+      Process.exit(pid, :kill)
+    end
+
+    test "opting out of the after pass does not opt out of call rewriting" do
+      :dst_after_optout.armed()
+
+      assert :dst_time.pending() == 1,
+             "erlang:send_after/3 was not rewritten in a module with -dst_after(false)"
+
+      assert :dst_time.next_deadline() == 60_000
+    end
+  end
+
+  describe "disarming does not scan the mailbox it does not need to" do
+    # `disarm_after/2` runs on every successful receive in a rewritten module.
+    # It used to flush unconditionally, and `flush_after/1` is a selective
+    # receive on a ref the compiler cannot prove is fresh, so it walked the
+    # whole mailbox every time. It now flushes only when the cancel reports the
+    # timer had already fired. These pin the behaviour that made that safe.
+
+    test "a cancelled timer leaves nothing to flush" do
+      send(self(), {:msg, :hello})
+
+      assert @sut.wait(60_000) == {:got, :hello}
+      assert :dst_time.pending() == 0, "the timer was not cancelled"
+      refute_received {:"$dst_after", _}, "a timeout message was left behind"
+    end
+
+    test "a timer that already fired is still flushed" do
+      # Arm, let it fire, then satisfy the receive from the mailbox. The
+      # timeout message is queued by now, so skipping the flush would strand it.
+      pid = proc(fn -> @sut.wait(60_000) end)
+      await_armed()
+      assert :dst_time.advance_to_next()
+      assert await(pid) == :timed_out
+
+      # And the classic case: a real message and an expired timer racing.
+      assert :dst_time.pending() == 0
+      refute_received {:"$dst_after", _}
     end
   end
 end

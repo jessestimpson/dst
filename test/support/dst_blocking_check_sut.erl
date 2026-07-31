@@ -1,5 +1,5 @@
 -module(dst_blocking_check_sut).
--behaviour(dst_sut).
+-behaviour(dst_harness).
 
 %% A system under test whose `check/1` does the wrong thing on purpose: it asks a
 %% scheduled process a question. Every process the scheduler owns is suspended
@@ -14,7 +14,7 @@
 %% catches its own call timeout and answers plausibly. A `status/1` that returns
 %% `undefined` on `exit:_` leaves an invariant built on it computing over
 %% "no members believe they lead" and pass, having checked nothing. Only reading
-%% state out of band avoids that. See `dst_sut`.
+%% state out of band avoids that. See `dst_harness`.
 
 -export([init/2, processes/1, generate/2, execute/2, check/1, terminate/1]).
 

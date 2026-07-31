@@ -1,13 +1,19 @@
 -module(dst_after_sut).
 
-%% A system under test for `dst_after_transform`, in the same spirit as
-%% `dst_timer_sut` is for `dst_transform`: compiled with the transform
+%% The subject for `dst_transform`'s receive-timeout pass, in the same spirit as
+%% `dst_timer_sut` is for its call-rewriting pass: compiled with the transform
 %% unconditionally, because being rewritten is its entire purpose.
+%%
+%% Carries no `-dst_after` attribute, deliberately: the pass is on by default,
+%% so this module is also the fixture for that. It used to need a second
+%% `parse_transform`, which Mix could not reliably order, so no module could
+%% carry both passes at once. `dst_timer_sut:both/2` proves one now can, and
+%% `dst_after_optout` covers the escape hatch.
 %%
 %% Every function here is one property of the rewrite. `test/dst_after_test.exs`
 %% drives them; `loop_control/1` in that file's helper module is the untransformed
 %% twin of `loop/1`, which is the only way to state the tail-position property.
--compile({parse_transform, dst_after_transform}).
+-compile({parse_transform, dst_transform}).
 
 -export([
     wait/1,

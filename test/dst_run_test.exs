@@ -1,6 +1,6 @@
 defmodule DstRunTest do
   @moduledoc """
-  `dst_run` and the `dst_sut` contract — Phase 3 of the DST framework.
+  `dst_run` and the `dst_harness` contract — Phase 3 of the DST framework.
 
   Driven against `dst_2pc`, deliberately not against the registry this framework grew
   out of. The claim
@@ -209,11 +209,178 @@ defmodule DstRunTest do
 
   describe "the check contract" do
     test "an invariant that calls into a suspended process is reported, not hung" do
-      # The trap `dst_sut` warns about, made concrete. `check/1` here does what an
+      # The trap `dst_harness` warns about, made concrete. `check/1` here does what an
       # invariant naturally wants to do — ask a process how it is doing — which
       # cannot be served while that process is suspended.
       assert %{outcome: {:error, :check_blocked}} =
                @run.run(:dst_blocking_check_sut, %{seed: 1, max_ops: 1, max_steps: 100})
+    end
+  end
+
+  # Loading a module on demand is a synchronous call into `code_server`, which
+  # the scheduler does not own, so a scheduled process that reaches an unloaded
+  # module blocks outside the schedule and is made runnable again on wall clock
+  # time. It is the cause of "the first run in a fresh VM diverges", and it is
+  # otherwise invisible: nothing is logged and `adopted_late` stays 0.
+  describe "modules_loaded" do
+    test "is empty when the run preloads its code" do
+      # `preload` defaults to `[kernel, stdlib, dst]`, and this harness lives in
+      # the dst application, so one run is enough. No warm-up, no second pass.
+      assert %{modules_loaded: []} =
+               :dst_run.run(:dst_2pc, %{seed: 1, max_ops: 5, max_steps: 5_000})
+    end
+
+    test "preload is what makes that hold across seeds" do
+      # The claim worth pinning. Warming is per *code path*, not per VM: a seed
+      # that first reaches a stalling participant runs the coordinator's timeout
+      # branch and loads code no earlier seed touched. Running a seed twice fixes
+      # that seed and not the next one. Preloading the application fixes all of
+      # them, which is why it is the recommended answer rather than a warm-up.
+      for seed <- 1..10 do
+        result = :dst_run.run(:dst_2pc, %{seed: seed, max_ops: 10, max_steps: 10_000})
+
+        # `audit/1` rather than three assertions: it knows which fields mean
+        # "wall clock got in", and it keeps knowing as more are added.
+        assert :dst_run.audit(result) == :ok, "seed #{seed}: #{inspect(:dst_run.audit(result))}"
+      end
+    end
+
+    test "names a module a scheduled process demand-loaded" do
+      # Plant the defect: `dst_2pc_lazy` is reachable only from inside a client,
+      # which is a process the scheduler owns. `preload: false` is required here
+      # — it ships in the dst application, so the default preload would warm the
+      # very module this test needs cold. That is the escape hatch working.
+      #
+      # Unloading only if it is loaded: ExUnit randomises test order, and
+      # `:code.delete/1` answers false for a module that was never loaded.
+      if :erlang.module_loaded(:dst_2pc_lazy) do
+        :code.purge(:dst_2pc_lazy)
+        :code.delete(:dst_2pc_lazy)
+        :code.purge(:dst_2pc_lazy)
+      end
+
+      refute :erlang.module_loaded(:dst_2pc_lazy)
+
+      %{modules_loaded: loaded} =
+        :dst_run.run(:dst_2pc, %{
+          seed: 1,
+          max_ops: 5,
+          max_steps: 5_000,
+          preload: false,
+          config: %{lazy: true}
+        })
+
+      assert :dst_2pc_lazy in loaded,
+             "a module loaded mid-run must be reported, or the failure it causes is silent"
+    end
+
+    test "preloading catches it before the run starts" do
+      # The other half: the same cold module, with preloading on. It is warm
+      # before there is a scheduler to be outside of, so the run is clean.
+      if :erlang.module_loaded(:dst_2pc_lazy) do
+        :code.purge(:dst_2pc_lazy)
+        :code.delete(:dst_2pc_lazy)
+        :code.purge(:dst_2pc_lazy)
+      end
+
+      assert %{modules_loaded: []} =
+               :dst_run.run(:dst_2pc, %{
+                 seed: 1,
+                 max_ops: 5,
+                 max_steps: 5_000,
+                 config: %{lazy: true}
+               })
+    end
+
+    test "a misnamed application fails loudly" do
+      # Silently preloading nothing would be the same class of failure the
+      # option exists to remove.
+      assert_raise ErlangError, fn ->
+        :dst_run.run(:dst_2pc, %{seed: 1, max_ops: 1, preload: [:no_such_app_here]})
+      end
+    end
+  end
+
+  # A step ends when the process blocks in a receive. If no scheduling event
+  # arrives at all, the scheduler eventually gives up and suspends the process
+  # wherever it happens to be — a suspension point chosen by wall clock rather
+  # than by the schedule. This used to be a 5ms deadline and was silent.
+  describe "steps that never finished" do
+    test "a healthy run reports none" do
+      %{sched: sched} = :dst_run.run(:dst_2pc, %{seed: 4, max_ops: 10, max_steps: 10_000})
+
+      assert sched.timeouts == 0
+    end
+
+    test "the two determinism counters are what a suite should assert on" do
+      # All three should be clean, and all three are silent failures otherwise.
+      # This is the assertion worth copying into your own suite, next to the
+      # invariants.
+      #
+      # Warming is per *code path*, not per VM, which is worth knowing before
+      # you write this assertion yourself. A seed that first reaches a stalling
+      # participant runs the coordinator's timeout branch and loads code no
+      # earlier seed touched, so one warm-up run does not cover the next seed.
+      # Either warm each seed, as here, or preload the application in `init/2`.
+      for seed <- 1..10 do
+        opts = %{seed: seed, max_ops: 10, max_steps: 10_000}
+        :dst_run.run(:dst_2pc, opts)
+
+        %{modules_loaded: modules, sched: sched} = :dst_run.run(:dst_2pc, opts)
+
+        assert sched.adopted_late == 0, "seed #{seed} adopted #{sched.adopted_late} late"
+        assert sched.timeouts == 0, "seed #{seed} had #{sched.timeouts} unfinished steps"
+        assert modules == [], "seed #{seed} loaded #{inspect(modules)} mid-run"
+      end
+    end
+  end
+
+  describe "reading a result" do
+    test "summary/1 swaps the trace for its length" do
+      result = :dst_run.run(:dst_2pc, %{seed: 1, max_ops: 5, max_steps: 5_000})
+      summary = :dst_run.summary(result)
+
+      # The point: inspecting a result whole renders a few hundred trace entries
+      # and elides the fields you were looking for underneath them.
+      refute Map.has_key?(summary, :trace)
+      assert summary.trace_length == length(result.trace)
+      assert summary.trace_length > 0
+      assert summary.outcome == result.outcome
+      assert summary.sched == result.sched
+    end
+
+    test "audit/1 passes a healthy run" do
+      result = :dst_run.run(:dst_2pc, %{seed: 1, max_ops: 5, max_steps: 5_000})
+
+      assert :dst_run.audit(result) == :ok
+    end
+
+    test "audit/1 names what went wrong" do
+      # Same planted defect as the modules_loaded tests: a module reachable only
+      # from a scheduled process, with preloading off so it stays cold.
+      if :erlang.module_loaded(:dst_2pc_lazy) do
+        :code.purge(:dst_2pc_lazy)
+        :code.delete(:dst_2pc_lazy)
+        :code.purge(:dst_2pc_lazy)
+      end
+
+      refute :erlang.module_loaded(:dst_2pc_lazy), "the module did not unload"
+
+      result =
+        :dst_run.run(:dst_2pc, %{
+          seed: 1,
+          max_ops: 5,
+          max_steps: 5_000,
+          preload: false,
+          config: %{lazy: true}
+        })
+
+      assert :erlang.module_loaded(:dst_2pc_lazy),
+             "the run never reached the module: #{inspect(:dst_run.summary(result), pretty: true)}"
+
+      assert {:suspect, reasons} = :dst_run.audit(result)
+      assert {:modules_loaded, loaded} = List.keyfind(reasons, :modules_loaded, 0)
+      assert :dst_2pc_lazy in loaded
     end
   end
 end

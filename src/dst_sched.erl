@@ -108,9 +108,9 @@ releasing, not after.
 ## Determinism boundary
 
 - **Timers.** A process blocked in `receive ... after N` wakes on the real clock
-  unless its module is compiled with `dst_after_transform`, which puts the timeout
-  on the virtual clock. Untransformed, a system under test must avoid
-  real-time-dependent receives (use `infinity` in simulation).
+  unless its module declares `-dst_after(true)` alongside `dst_transform`, which
+  puts the timeout on the virtual clock. Without it, a system under test must
+  avoid real-time-dependent receives (use `infinity` in simulation).
 - **Spawn races.** A child spawned with a plain `erlang:spawn` is adopted via
   `set_on_spawn` tracing, which reports the spawn *after* the child exists — so it
   runs briefly, on the real scheduler, before it is suspended. `stats/1`'s
@@ -118,6 +118,16 @@ releasing, not after.
   the child blocked; `dst_transform` points a transformed module's spawns there, so
   a system under simulation should show `adopted_late` at or near zero. A run with
   a high count is a run whose interleaving is partly wall-clock.
+- **Steps that never finished.** A step ends when the process blocks in a receive.
+  If no scheduling event arrives for it at all, the scheduler eventually suspends
+  it wherever it happens to be, and that suspension point was chosen by wall clock
+  rather than by the schedule. `stats/1`'s `timeouts` counts these and a warning is
+  logged for each. It should be 0; anything else means the run is not replayable.
+
+  The wait is deliberately generous and condition-based rather than a deadline —
+  the scheduler keeps waiting while the process is alive and not suspended, since
+  the event is then in flight. Only a process that is dead, or that did not resume
+  at all, ends a step this way in practice.
 """.
 -endif.
 
@@ -127,6 +137,7 @@ releasing, not after.
     register/2,
     release/1,
     ids/1,
+    procs/1,
     runnable/1,
     step/2,
     run/1,
@@ -160,10 +171,24 @@ releasing, not after.
 %% a test suite on a process that never blocks.
 -define(MAX_EVENTS_PER_STEP, 100000).
 
-%% How long to wait for a scheduling event before concluding none is coming. Only
-%% paid when a process passed the awaited point before we started listening, which
-%% is rare; the common path returns as soon as the event lands.
--define(EVENT_TIMEOUT, 5).
+%% How long to wait for a scheduling event before looking at the process to see
+%% whether one is still coming. Only paid when the event has not landed yet; the
+%% common path returns the moment it does.
+-define(EVENT_POLL, 5).
+
+%% How many of those polls before giving up on an event entirely.
+%%
+%% This used to be a single 5ms deadline, and that was a determinism hole in the
+%% middle of the machinery that exists to remove them. A trace event delayed past
+%% 5ms by a loaded machine or a GC pause made the scheduler conclude the process
+%% would never run, suspend it wherever it happened to be, and carry on — so the
+%% suspension point was chosen by wall clock. Nothing reported it.
+%%
+%% Polling instead makes the wait a question about the process rather than about
+%% the clock: keep waiting while it is alive and not suspended, since the event
+%% is then either in flight or imminent. The bound survives only to stop a
+%% genuinely wedged process hanging a test suite, which is why it is generous.
+-define(EVENT_PATIENCE, 200).
 
 %% Bound on waiting for erlang:trace_delivered/1 to report the trace stream drained.
 -define(DELIVERED_TIMEOUT, 5000).
@@ -195,10 +220,13 @@ releasing, not after.
     gated = #{} :: #{pid() => true},
     choices = [] :: [id()],
     adopted_late = 0 :: non_neg_integer(),
+    %% Steps that ended without the process reaching a receive. See
+    %% `note_quiescence/5`; any nonzero value means the run is not replayable.
+    timeouts = 0 :: non_neg_integer(),
     steps = 0 :: non_neg_integer()
 }).
 
-%% A step is internally bounded (?MAX_EVENTS_PER_STEP, ?EVENT_TIMEOUT,
+%% A step is internally bounded (?MAX_EVENTS_PER_STEP, ?EVENT_PATIENCE,
 %% ?DELIVERED_TIMEOUT) and a run is bounded by MaxSteps, so the call cannot hang
 %% for reasons a caller-side timeout would diagnose better than the bounds do.
 -define(CALL_TIMEOUT, infinity).
@@ -536,6 +564,21 @@ ids(S) ->
 
 -if(?DOCATTRS).
 -doc """
+Every known process, by id.
+
+Ids are what a trace records and pids are what a caller recognises, so anything
+that wants to say something about a recorded step needs this mapping. `dst_run`
+uses it to turn `{step, 7}` into a name at teardown.
+
+Includes processes that have exited, because a trace can name one.
+""".
+-endif.
+-spec procs(sched()) -> #{id() => pid()}.
+procs(S) ->
+    call(S, procs).
+
+-if(?DOCATTRS).
+-doc """
 Ids that have work to do: a non-empty mailbox they are not known to be blocked
 against. See the module doc on selective receive.
 """.
@@ -546,9 +589,12 @@ runnable(S) ->
 
 -if(?DOCATTRS).
 -doc """
-Run statistics: steps taken, processes known, how many have exited, and how many
-children were adopted after they had already started running (see the module
-doc's determinism boundary).
+Run statistics: steps taken, processes known, how many have exited, how many
+children were adopted after they had already started running, and how many steps
+ended without the process reaching a receive.
+
+`adopted_late` and `timeouts` are both determinism failures and both should be
+0. See the module doc's determinism boundary.
 """.
 -endif.
 -spec stats(sched()) -> #{atom() => non_neg_integer()}.
@@ -662,17 +708,26 @@ handle_call(release, _From, St) ->
     {reply, ok, do_release(St)};
 handle_call(ids, _From, St = #st{procs = Procs}) ->
     {reply, lists:sort(maps:keys(Procs)), St};
+handle_call(procs, _From, St = #st{procs = Procs}) ->
+    {reply, Procs, St};
 handle_call(runnable, _From, St) ->
     {reply, runnable_ids(St), St};
 handle_call(choices, _From, St = #st{choices = Choices}) ->
     {reply, lists:reverse(Choices), St};
 handle_call(stats, _From, St) ->
-    #st{steps = Steps, procs = Procs, exited = Exited, adopted_late = Late} = St,
+    #st{
+        steps = Steps,
+        procs = Procs,
+        exited = Exited,
+        adopted_late = Late,
+        timeouts = Timeouts
+    } = St,
     Reply = #{
         steps => Steps,
         processes => maps:size(Procs),
         exited => maps:size(Exited),
-        adopted_late => Late
+        adopted_late => Late,
+        timeouts => Timeouts
     },
     {reply, Reply, St};
 handle_call({step, Id}, _From, St) ->
@@ -806,7 +861,7 @@ do_step(St0 = #st{procs = Procs}, Id) ->
     Pid = maps:get(Id, Procs),
     QueueBefore = queue_len(Pid),
     safe_resume(Pid),
-    St1 = await_quiescent(St0, Pid),
+    {Quiescence, St1} = await_quiescent(St0, Pid),
     St2 = St1#st{steps = St1#st.steps + 1, choices = [Id | St1#st.choices]},
     case status(Pid) of
         dead ->
@@ -816,14 +871,7 @@ do_step(St0 = #st{procs = Procs}, Id) ->
             {SelfSends, St3} = drain_trace(St2, Pid),
             QueueAfter = queue_len(Pid),
             Consumed = QueueBefore + SelfSends - QueueAfter,
-            %% The step ended with the process blocked, and a receive blocks only
-            %% after failing to match *every* queued message — so whatever is left
-            %% is known not to match, whether or not the step consumed anything
-            %% first. Record the block unconditionally. (Recording it only on an
-            %% unproductive step would leave a process that consumed one message
-            %% and blocked on the rest looking runnable, costing a wasted step
-            %% every time round.)
-            St4 = St3#st{blocked_at = (St3#st.blocked_at)#{Id => QueueAfter}},
+            St4 = note_quiescence(St3, Id, Pid, Quiescence, QueueAfter),
             Outcome =
                 case Consumed > 0 of
                     true -> progress;
@@ -832,35 +880,67 @@ do_step(St0 = #st{procs = Procs}, Id) ->
             {Outcome, St4}
     end.
 
+%% Where a process blocked, but only when it actually blocked.
+%%
+%% On a completed step the queue length is meaningful: a receive blocks only
+%% after failing to match *every* queued message, so whatever is left is known
+%% not to match, whether or not the step consumed anything first. Recording it
+%% unconditionally is what makes selective receive work — recording it only on
+%% an unproductive step would leave a process that consumed one message and
+%% blocked on the rest looking runnable, costing a wasted step every time round.
+%%
+%% On a step that timed out, none of that holds. The process was suspended
+%% wherever it happened to be rather than at a receive, so its mailbox says
+%% nothing about what it has scanned. Recording a block it never reached would
+%% mark it blocked at a queue length it may never grow past, stranding it for
+%% the rest of the run. Leaving `blocked_at` alone keeps it runnable, so the
+%% next step re-runs it and the schedule usually repairs itself.
+-spec note_quiescence(#st{}, id(), pid(), blocked | timeout, non_neg_integer()) -> #st{}.
+note_quiescence(St = #st{blocked_at = Blocked}, Id, _Pid, blocked, QueueAfter) ->
+    St#st{blocked_at = Blocked#{Id => QueueAfter}};
+note_quiescence(St = #st{timeouts = Timeouts}, _Id, Pid, timeout, _QueueAfter) ->
+    logger:warning(
+        "dst_sched: no scheduling event for ~p within ~wms, so it was suspended "
+        "mid-step. This run's interleaving is partly wall clock and its seed will "
+        "not reproduce. See stats/1's `timeouts`.",
+        [Pid, ?EVENT_POLL * ?EVENT_PATIENCE]
+    ),
+    St#st{timeouts = Timeouts + 1}.
+
 %% Wait for the process to run and then block again.  See the module doc on why
 %% the `in` event must be awaited before status is trusted.
--spec await_quiescent(#st{}, pid()) -> #st{}.
+%%
+%% `blocked` means the process reached a receive it cannot satisfy, which is what
+%% a completed step is. `timeout` means it did not, and the caller must treat
+%% everything it would otherwise conclude from the mailbox as unreliable.
+-spec await_quiescent(#st{}, pid()) -> {blocked | timeout, #st{}}.
 await_quiescent(St, Pid) ->
     case await_event(St, Pid, in, ?MAX_EVENTS_PER_STEP) of
-        {exited, St1} -> St1;
-        {timeout, St1} -> St1;
+        %% A process that exited did finish; there is nothing left to strand.
+        {exited, St1} -> {blocked, St1};
+        {timeout, St1} -> {timeout, St1};
         {ok, St1} -> await_block(St1, Pid, ?MAX_EVENTS_PER_STEP)
     end.
 
--spec await_block(#st{}, pid(), non_neg_integer()) -> #st{}.
+-spec await_block(#st{}, pid(), non_neg_integer()) -> {blocked | timeout, #st{}}.
 await_block(St, Pid, Budget) when Budget > 0 ->
     case await_event(St, Pid, out, Budget) of
         {exited, St1} ->
-            St1;
+            {blocked, St1};
         {timeout, St1} ->
-            St1;
+            {timeout, St1};
         {ok, St1} ->
             %% Scheduled out — but that also happens on preemption, so only a
             %% `waiting` status means it is genuinely blocked in a receive.
             case status(Pid) of
-                waiting -> St1;
-                dead -> St1;
+                waiting -> {blocked, St1};
+                dead -> {blocked, St1};
                 _ -> await_block(St1, Pid, Budget - 1)
             end
     end;
 await_block(St, Pid, _Budget) ->
     logger:warning("dst_sched: ~p never blocked; suspending it mid-flight", [Pid]),
-    St.
+    {timeout, St}.
 
 %% Consume trace messages until `Want` (`in` or `out`) arrives for this pid.
 %%
@@ -869,7 +949,12 @@ await_block(St, Pid, _Budget) ->
 %% eating one of those would be just as confusing as eating a reply used to be.
 -spec await_event(#st{}, pid(), in | out, non_neg_integer()) ->
     {ok | exited | timeout, #st{}}.
-await_event(St, Pid, Want, Budget) when Budget > 0 ->
+await_event(St, Pid, Want, Budget) ->
+    await_event(St, Pid, Want, Budget, ?EVENT_PATIENCE).
+
+-spec await_event(#st{}, pid(), in | out, non_neg_integer(), non_neg_integer()) ->
+    {ok | exited | timeout, #st{}}.
+await_event(St, Pid, Want, Budget, Patience) when Budget > 0, Patience > 0 ->
     receive
         {trace, Pid, Want, _} ->
             {ok, St};
@@ -878,18 +963,26 @@ await_event(St, Pid, Want, Budget) when Budget > 0 ->
         {trace, Pid, exit, _Reason} ->
             {exited, handle_trace(St, {trace, Pid, exit, normal})};
         {trace, _, _, _} = T ->
-            await_event(handle_trace(St, T), Pid, Want, Budget - 1);
+            await_event(handle_trace(St, T), Pid, Want, Budget - 1, Patience);
         {trace, _, _, _, _} = T ->
-            await_event(handle_trace(St, T), Pid, Want, Budget - 1)
-    after ?EVENT_TIMEOUT ->
-        %% No event is coming. Either the process already passed this point
-        %% before we started listening, or it is dead.
+            await_event(handle_trace(St, T), Pid, Want, Budget - 1, Patience)
+    after ?EVENT_POLL ->
+        %% Nothing yet. Whether to keep waiting is a question about the process,
+        %% not about how long we have waited.
         case status(Pid) of
-            dead -> {exited, St};
-            _ -> {timeout, St}
+            dead ->
+                {exited, St};
+            suspended ->
+                %% The resume did not take, so this process is not going to run
+                %% and no event is coming. The one case where giving up is right.
+                {timeout, St};
+            _ ->
+                %% Alive and not suspended, so it is running, runnable, or about
+                %% to be scheduled in. The event is in flight.
+                await_event(St, Pid, Want, Budget, Patience - 1)
         end
     end;
-await_event(St, _Pid, _Want, _Budget) ->
+await_event(St, _Pid, _Want, _Budget, _Patience) ->
     {timeout, St}.
 
 %% Collect this tracee's pending trace messages, synchronised with

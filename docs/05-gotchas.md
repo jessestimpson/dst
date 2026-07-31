@@ -29,12 +29,27 @@ Bisecting what you compare helps too. Removing the client workload entirely and
 finding the system still nondeterministic, or suddenly not, narrows the search
 for very little effort.
 
+**And put the evidence in the failure message rather than deriving it.** The
+most recent bug found in this library took 3 rounds of theorising and one
+hypothesis that got zero reproductions out of forty isolated attempts. What
+worked was adding `inspect(dst_run:summary(Result))` to the assertion message
+and looping until it failed. The answer arrived in one shot and was none of the
+three theories.
+
+That generalises past determinism bugs. A test whose failure message carries the
+run's summary costs one line and saves the round trip where you guess, add a
+print, and try to make it fail again.
+
 ## The code server
 
-The symptom is that the first run in a fresh VM produces a different trace from
-every subsequent run of the same seed. Nothing is adopted late, no scheduler
-timeout fires, no warning is logged, and the scheduler's accounting is correct
-throughout.
+**`modules_loaded` in a run result is what tells you.** It lists modules loaded
+while the scheduler was in charge, and it should be empty. `dst_run:audit/1`
+checks it for you.
+
+Before that field existed the symptom was all you had: the first run in a fresh
+VM produces a different trace from every subsequent run of the same seed, with
+nothing adopted late, no scheduler timeout, no warning logged, and the
+scheduler's accounting correct throughout.
 
 Loading a module on demand is a synchronous call to `code_server`, which the
 scheduler doesn't own. A scheduled process that reaches a module it hasn't
@@ -43,20 +58,40 @@ as the step ending, the code server runs freely and makes the process runnable
 again at a moment decided by wall clock, and every choice after that point
 shifts. On the second run everything is loaded and it never happens again.
 
-Load everything before the scheduler owns anything, at the top of `init/2`:
+The fix is the `preload` option. Name your own application; `kernel`, `stdlib`
+and `dst` are always included.
 
-```elixir
-defp preload do
-  for app <- [:my_app, :stdlib, :kernel] do
-    _ = Application.load(app)
-    :code.ensure_modules_loaded(Application.spec(app, :modules) || [])
-  end
-end
+```erlang
+dst_run:run(my_harness, #{seed => 1, preload => [my_app]}).
 ```
 
-The obligation belongs to `init/2` for the same reason quiescence does. Its
-contract isn't "start the system". It's "hand over a system that won't do
-anything the schedule didn't ask for".
+**Do it even when runs look fine**, because of the second failure below.
+
+Running a seed twice is not a substitute, and this is worth being precise about:
+**warming is per code path, not per VM.** A seed that first reaches a timeout
+handler runs a branch no earlier seed touched and loads code no earlier seed
+needed. Warming up fixes the seed you warmed and not the next one.
+
+### The worse failure, which nothing catches
+
+A process waiting on `code_server` is, to `dst_sched`, a process blocked in a
+receive. It isn't runnable. So if enough of the system reaches for cold code at
+once, nothing is runnable, no timer is pending, and **the run ends at what looks
+exactly like quiescence.**
+
+Measured on this project's own two-phase commit example, with preloading off and
+a cold module every client touches:
+
+```
+ops: 5, steps: 5, exited: 0, processes: 9, outcome: ok
+```
+
+5 steps for 5 operations, against a workload that normally takes about a
+hundred. Reported as success. `modules_loaded` doesn't catch this one either,
+because the loads complete after the run has finished.
+
+The symptom is a run that ends far too early with `ok` and nothing exited. The
+prevention is `preload`.
 
 There's a second form that isn't a warm-up effect. `code:ensure_loaded/1`
 returns immediately for a module that's already loaded, but for a *missing*
@@ -98,10 +133,12 @@ transform it already names and gate it behind an attribute. That's why
 `dst_transform` carries the state-publishing pass, and why modules opt into it
 with `-dst_observe(...)`.
 
-It's also why `dst_after_transform`, which puts `receive ... after` timeouts on
-the virtual clock, isn't currently applied to anything. The modules that would
-want it already carry `dst_transform`, and the 2 can't coexist. Merging the
-passes is the way out, and we haven't needed it yet.
+That's why the receive-timeout rewrite is a *pass* inside `dst_transform` rather
+than a transform of its own, and why it and the state-publishing pass can be
+used on the same module. They used to be separate and couldn't.
+
+It's also why you include `dst.hrl` rather than naming the transform: the header
+carries the one attribute, so there is nothing to get wrong.
 
 ### Mix doesn't recompile a module when its transform changes
 
@@ -151,12 +188,23 @@ rather than by you beforehand. A timer armed while `dst_time` is inert goes
 onto the real clock and stays there until it fires and re-arms, so long-period
 timers, the interesting ones, would silently never become virtual.
 
-### receive ... after is not a timer call
+### receive ... after is handled, and used not to be
 
 `dst_transform` rewrites calls, and `after` is a language construct rather than
-a call, so a module compiled with it still has real-clock receive timeouts.
-Without `dst_after_transform`, a system under simulation has to avoid
-real-time-dependent receives. Use `infinity` where you can.
+a call, so this looks as though it can't work. It can: `receive Cs after T -> B
+end` is an abstract form like any other, and the transform rewrites it into a
+receive whose timeout is an ordinary message clause on the virtual clock.
+
+**It's on by default.** `after` is the one real-time dependence a system can
+hold without naming a function, so leaving it to an attribute would mean a
+module that quietly wakes on the wall clock with nothing reporting it.
+
+`-dst_after(false).` opts a module out, for a hot receive loop where the cost of
+arming and cancelling a timer per receive is measurable. `after 0` is never
+rewritten, since it's a mailbox poll rather than a wait.
+
+If you read older notes saying this is impossible or unapplied, they predate the
+merge.
 
 ### timer:sleep/1 is not rewritten, deliberately
 
@@ -247,6 +295,44 @@ while the timer-driven system's "replay works" measurement re-ran the *seed*,
 which exercises `run/2`. 2 different claims that both sound like "replay
 works", and only one of them was tested.
 
+### A seed-pinned regression test is coupled to your generator
+
+A seed names a schedule **only in the context of a particular `generate/2`**.
+Change the operation mix and every seed you pinned quietly starts testing
+something else.
+
+If the test asserts on a violation you find out, because it fails. If it asserts
+`ok` it goes vacuous without a word, which is the same silent failure as an
+invariant that never gets evaluated.
+
+Pin the trace instead. `replay/3` never calls `generate/2` — it walks the
+entries it is given — so a saved trace survives a rewritten workload, and a
+different seed, entirely.
+
+```erlang
+%% once, from a shrink whose `verified` was true
+{ok, _Outcome} = dst_run:save_fixture("test/fixtures/atomicity.dst",
+                                      my_harness, Trace, Opts),
+
+%% in the test, forever after
+#{outcome := {violation, #{property := atomicity}}} =
+    dst_run:replay_fixture("test/fixtures/atomicity.dst").
+```
+
+`save_fixture/4` replays the trace strictly before writing anything and refuses
+on a divergence, so a fixture on disk is one that has been demonstrated to
+reproduce. It stores the harness and the options alongside the trace, which
+matters as much as the trace does: a reproduction that needs
+`config => #{mode => broken}` and gets replayed without it does not reproduce.
+
+Pin a seed to test that seeds reproduce. Pin a trace to regress a bug.
+
+**You cannot write the mirror test.** Replaying a failing trace against a fixed
+implementation does not report `ok` — the fix changes which messages exist, so
+recorded step ids stop being runnable and you get `{error, {diverged, _, _}}`.
+"The fix works" is a claim about the whole system, and a seed sweep is the right
+shape for it.
+
 ## Fault injection hazards
 
 ### A seeded fault schedule starts where its seed is applied
@@ -284,6 +370,37 @@ recovery may repair the very divergence you were trying to observe. In the
 registry, a rejoin makes the leader send that member a fresh snapshot. A run
 that asserts a property *during* a fault has to restrict the loss to a channel
 whose recovery is self-contained.
+
+### Faults are not free, and the currency is the other faults
+
+Adding a second fault costs you search efficiency on the first. Measured on a
+quorum register: a workload that reproduced its write-back bug in **21 of 200
+seeds** dropped to **12 of 200** once a replica-pause fault was added, with the
+first failing seed moving from 6 to 53. Operations that time out never complete,
+and only completed operations can violate a safety property.
+
+The sharper version of the same problem, seen before retuning that pause rate:
+the crashed-writer fault that made the bug reachable **disappeared from the event
+log entirely**. Not one completed. The new fault had crowded out the old one.
+
+The rule above is about injecting faults the system could never see. This is the
+opposite failure and it is just as quiet: inject too many and the suite stays
+green because nothing interesting ever completes.
+
+### A workload happens at virtual time zero
+
+Worth knowing before you inject anything with a *duration*, because the natural
+mental model is wrong.
+
+The virtual clock only advances when nothing is runnable, and the driver is busy
+injecting and stepping throughout, so **an entire `max_ops` workload is
+typically injected while the clock still reads 0.** A fault lasting about as
+long as a run is therefore either active for all of it or none of it.
+
+The consequence is that such a fault tunes bimodally rather than smoothly. Ten
+seeds of a 3-replica register with a 10-second pause gave give-up counts of
+`0, 0, 0, 0, 0, 0, 9, 9, 11, 12`. Lowering the rate makes jams rarer. It cannot
+make them milder.
 
 ## Shrinking hazards
 

@@ -4,11 +4,12 @@
 %% A two-phase commit coordinator. The other half of `dst_2pc`.
 %%
 %% Its prepare timeout must run on the virtual clock, or a run that depends on a
-%% participant stalling would cost real seconds and stop being deterministic. Only
-%% `dst_transform` is needed — the timeout is an `erlang:send_after/3`, not a
-%% `receive ... after`, and a module must never carry two parse transforms (see
-%% `dst_transform`'s module doc on why).
--compile({parse_transform, dst_transform}).
+%% participant stalling would cost real seconds and stop being deterministic.
+%%
+%% Including the header is the whole opt-in: under `-D DST` it brings the parse
+%% transform and the `?DST_LOG` macros, and under a release build it brings
+%% nothing, so this module could ship with its instrumentation intact.
+-include_lib("dst/include/dst.hrl").
 
 -export([start_link/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -21,11 +22,13 @@ start_link(Tab, Participants, Mode) ->
     gen_server:start_link(?MODULE, {Tab, Participants, Mode}, []).
 
 init({Tab, Participants, Mode}) ->
+    ok = ?DST_ROLE(coordinator),
     {ok, #{tab => Tab, participants => Participants, mode => Mode, pending => #{}}}.
 
 handle_call({run_tx, TxId}, From, St) ->
     #{participants := Participants, pending := Pending} = St,
     Self = self(),
+    _ = ?DST_LOG({prepare_sent, TxId}),
     [gen_server:cast(P, {prepare, TxId, Self}) || {_Index, P} <- Participants],
     Timer = erlang:send_after(?VOTE_TIMEOUT, self(), {vote_timeout, TxId}),
     Tx = #{from => From, votes => #{}, timer => Timer},
@@ -83,6 +86,7 @@ on_vote(TxId, Index, Vote, Tx = #{votes := Votes}, St = #{participants := Ps, pe
 
 decide(TxId, Decision, St = #{tab := Tab, participants := Ps, pending := Pending}) ->
     #{from := From, timer := Timer} = maps:get(TxId, Pending),
+    _ = ?DST_LOG({decided, TxId, Decision}),
     _ = erlang:cancel_timer(Timer),
     ets:insert(Tab, {{tx, TxId}, Decision}),
     [gen_server:cast(P, {decision, TxId, Decision}) || {_Index, P} <- Ps],

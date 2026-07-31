@@ -1,4 +1,6 @@
 -module(dst_2pc_participant).
+
+-include_lib("dst/include/dst.hrl").
 -behaviour(gen_server).
 
 %% A two-phase commit participant. Half of the second system under test for the
@@ -6,7 +8,7 @@
 %%
 %% All durable-ish state goes in a shared ETS table rather than the process
 %% dictionary or gen_server state, because the invariants have to be readable
-%% while every one of these processes is suspended. See `dst_sut` on why an
+%% while every one of these processes is suspended. See `dst_harness` on why an
 %% invariant that asks a process anything is an invariant that checks nothing.
 
 -export([start_link/2]).
@@ -18,6 +20,9 @@ start_link(Tab, Index) ->
     gen_server:start_link(?MODULE, {Tab, Index}, []).
 
 init({Tab, Index}) ->
+    %% Names this process for `dst_log`. One call, at startup, and every event it
+    %% records afterwards is attributed without any API having to carry a label.
+    ok = ?DST_ROLE({participant, Index}),
     {ok, #{tab => Tab, index => Index}}.
 
 handle_call(_Request, _From, St) ->
@@ -29,9 +34,11 @@ handle_cast({prepare, TxId, Coordinator}, St = #{tab := Tab, index := Index}) ->
             %% Votes are never sent. The coordinator's prepare timeout is the only
             %% thing that can resolve this transaction, which is what puts the
             %% virtual clock on the critical path of a run.
+            _ = ?DST_LOG({stalling, TxId}),
             {noreply, St};
         Vote ->
             record(Tab, TxId, Index, {prepared, Vote}),
+            _ = ?DST_LOG({voted, TxId, Vote}),
             gen_server:cast(Coordinator, {vote, TxId, Index, Vote}),
             {noreply, St}
     end;
@@ -47,6 +54,7 @@ handle_cast({decision, TxId, Decision}, St = #{tab := Tab, index := Index}) ->
             {abort, _} -> aborted
         end,
     record(Tab, TxId, Index, Final),
+    _ = ?DST_LOG({decided, TxId, Decision, Final}),
     {noreply, St}.
 
 %% ---------------------------------------------------------------------------

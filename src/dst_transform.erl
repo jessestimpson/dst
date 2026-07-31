@@ -11,44 +11,101 @@ Nothing else about the module changes, and the rewrite is a pure call-target
 substitution: `erlang:send_after(T, D, M)` becomes `dst_time:send_after(T, D, M)`,
 and so on for the table below.
 
-## Two passes, one attribute
+## Three passes, one transform
 
-This module runs two passes, and a module opts into the second by declaring an
-attribute rather than by naming a second transform:
+A module never names more than one `parse_transform`. The extra passes are
+controlled by attributes rather than by naming another transform:
 
 1. **Timer and clock rewriting** — the table below, applied always.
-2. **State observability** — applied only to a module declaring `-dst_observe(...)`,
-   which republishes the named state fields on every `gen_server` callback return
-   so a simulation can read them while the process is suspended. See `dst_observe`.
+2. **Receive timeouts** — puts `receive ... after T` on the virtual clock.
+   Applied unless the module declares `-dst_after(false)`; see below.
+3. **State observability** — applied only to a module declaring
+   `-dst_observe(...)`, which republishes the named state fields on every
+   `gen_server` callback return so a simulation can read them while the process
+   is suspended. See `dst_observe`.
 
-The second pass lives here rather than in a module of its own for a build reason,
-and it is worth recording because it cost a broken CI run to find. **Mix does not
-reliably order a module after more than one `parse_transform`.** With two
-attributes on one module, an incremental build where both the transform and that
-module changed failed with `undefined parse transform` roughly two times in
-three — nondeterministically, so it looked intermittent before it was pinned down.
-One attribute is ordered correctly; two are not.
+They live here rather than in modules of their own for a build reason, and it is
+worth recording because it cost a broken CI run to find. **Mix does not reliably
+order a module after more than one `parse_transform`.** With two attributes on
+one module, an incremental build where both the transform and that module
+changed failed with `undefined parse transform` roughly two times in three —
+nondeterministically, so it looked intermittent before it was pinned down. One
+attribute is ordered correctly; two are not.
 
-Delegating from here to a separate module would not have helped: the compiler loads
-a transform module from the code path when it runs, so `dst_transform` calling
-`dst_observe_transform:parse_transform/2` has exactly the same ordering hazard one
-level down. The passes have to be in the module the attribute names.
+Delegating from here to a separate module does not reliably help either. Mix
+must compile a transform before anything that uses it and does not track a
+runtime call as a dependency, so within this project the hazard just moves down
+a level. Merging is what removes it.
 
-So: **never give a module two parse transforms.** If a module needs another pass,
-add it here behind an attribute.
+So: **never give a module two parse transforms.** If a module needs another
+pass, add it here and gate it on an attribute.
+
+## Virtualising `receive ... after`
+
+On by default. The rewrite turns
+
+```erlang
+receive Pat -> Body after T -> Timeout end
+```
+
+into a receive whose timeout is an ordinary message clause, armed through
+`dst_time:arm_after/2`. Under `dst_sched` the waiting process is correctly
+unrunnable until the virtual clock delivers it, so a 60-second timeout costs
+microseconds instead of a minute — and, more importantly, fires at a point the
+schedule chose.
+
+`after 0` is left alone. It is a mailbox poll rather than a wait, never blocks,
+and never consults a clock; routing it through the timer wheel would turn a
+non-blocking poll into a blocking one.
+
+**Why it is on by default.** `after` is the one real-time dependence a system
+can hold without naming a function, so leaving it to an attribute means a module
+compiled with this transform can still wake on the wall clock with nothing
+reporting it. The call-rewriting pass is unconditional for the same reason;
+there is no principled line that puts `erlang:send_after/3` on one side of it
+and `after` on the other.
+
+**`-dst_after(false).` opts out**, for a module where the cost is measurable. It
+is a ref, an `update_counter` and two inserts to arm, and a `take` to cancel.
+No mailbox scan: `dst_time:disarm_after/2` skips its flush when the cancel
+succeeded, because a timer removed before it fired never sent anything. Worth
+knowing about before putting it on a hot receive loop, and not worth thinking
+about otherwise.
+
+### Why the timeout being an ordinary clause does not change the semantics
+
+Worth stating, because it looks as though it should. Native `after` is a
+*fallback*: it fires only when no queued message matches. The rewrite makes the
+timeout an ordinary clause, and a `receive` takes the first message matching
+*any* clause — so it appears to compete on arrival order rather than deferring.
+
+It does not diverge, because arrival order and time order are the same order.
+The `{'$dst_after', Ref}` message is appended *at* the deadline, so any message
+that would have satisfied native `after` before it elapsed is necessarily older
+in the mailbox and is scanned first. A message arriving after the deadline sits
+behind a timeout that native would already have fired. Stale timeouts from an
+earlier receive cannot match, because of the ref guard, and `disarm_after/2`
+flushes one that fired just as a real message landed.
+
+A two-stage rewrite — poll with `after 0` first, arm only on a miss — would make
+that structural rather than emergent, and would skip arming when a message is
+already waiting. It is deliberately not done. The poll still walks the whole
+mailbox before failing, so a miss scans twice, and a miss is the deep selective
+receive `gen_server:call/3` produces. It also duplicates every clause body into
+both receives. With the flush gone from the hit path there is little left to
+win.
 
 ## Enabling it
 
-Guard it so it is absent from ordinary builds:
+Include the header, which carries the attribute behind the `DST` define:
 
 ```erlang
--ifdef(DST).
--compile({parse_transform, dst_transform}).
--endif.
+-include_lib("dst/include/dst.hrl").
 ```
 
 and compile the simulation build with `{d, 'DST'}`. Per-module and opt-in, so
-there is no way to ship it by accident and no runtime cost when it is off.
+there is no way to ship it by accident and no runtime cost when it is off. The
+same header defines `?DST_LOG` and `?DST_ROLE`; see `dst_log`.
 
 Even when it *is* on, `dst_time` delegates to `erlang` unless a virtual clock is
 running — so a module built with the transform behaves normally outside a
@@ -128,7 +185,8 @@ it would hide that rather than surface it.
 -spec parse_transform(Forms, list()) -> Forms when Forms :: [erl_parse:abstract_form()].
 parse_transform(Forms, _Options) ->
     Locals = local_functions(Forms),
-    observe_pass([walk(Form, Locals) || Form <- Forms]).
+    Rewritten = [walk(Form, Locals) || Form <- Forms],
+    observe_pass(after_pass(Rewritten)).
 
 %% Every `{Name, Arity}` the module defines itself. Needed to decide whether an
 %% unqualified `spawn(F)` is the auto-imported BIF or the module's own function.
@@ -186,7 +244,105 @@ rewrite(Node, _Locals) ->
     Node.
 
 %% ---------------------------------------------------------------------------
-%% Observability pass — see the module doc's "Two passes, one attribute"
+%% Receive-timeout pass — applied only to a module declaring `-dst_after(true)`
+%% ---------------------------------------------------------------------------
+
+%% `receive Cs after T -> B end` is the five-element abstract form
+%% `{'receive', Anno, Cs, T, B}`, so it is fully visible to a transform and can
+%% be rewritten into a form with no real-time dependence at all:
+%%
+%%     begin
+%%         Ref  = make_ref(),
+%%         TRef = dst_time:arm_after(T, Ref),
+%%         receive
+%%             Pat1 -> dst_time:disarm_after(TRef, Ref), Body1;
+%%             ...
+%%             {'$dst_after', G} when G =:= Ref -> B
+%%         end
+%%     end
+%%
+%% The `after` block becomes an ordinary clause, so the wait is on a message and
+%% the virtual clock can deliver it. Under `dst_sched` the waiting process is
+%% correctly unrunnable until then, and a 60-second timeout costs microseconds.
+after_pass(Forms) ->
+    case after_enabled(Forms) of
+        false ->
+            Forms;
+        true ->
+            {Forms1, _Counter} = after_walk(Forms, 0),
+            Forms1
+    end.
+
+%% On unless a module says otherwise. A knob you have to know about is a silent
+%% determinism leak waiting to happen: without this, a module compiled with the
+%% transform and holding one `receive ... after 5000` gets a real-clock timeout
+%% under simulation, and nothing reports it. Opting out is for someone who has
+%% measured a problem, not something to get right in advance.
+after_enabled([{attribute, _, dst_after, false} | _]) -> false;
+after_enabled([_ | Rest]) -> after_enabled(Rest);
+after_enabled([]) -> true.
+
+%% Postorder walk threading a counter, so the variables introduced for each
+%% rewritten receive are unique within the module.
+after_walk({'receive', Anno, Clauses, {integer, _, 0} = Zero, AfterBody}, N) ->
+    %% An optimisation, not a correctness guard — `dst_time:arm_after/2` handles a
+    %% zero timeout correctly however it arrives. Skipping the rewrite when the
+    %% zero is visible at compile time just saves a ref, a send and a flush on
+    %% every poll, and `after 0` tends to sit on hot paths.
+    {Clauses1, N1} = after_walk(Clauses, N),
+    {AfterBody1, N2} = after_walk(AfterBody, N1),
+    {{'receive', Anno, Clauses1, Zero, AfterBody1}, N2};
+after_walk({'receive', Anno, Clauses, Timeout, AfterBody}, N) ->
+    {Clauses1, N1} = after_walk(Clauses, N),
+    {Timeout1, N2} = after_walk(Timeout, N1),
+    {AfterBody1, N3} = after_walk(AfterBody, N2),
+    {after_expand(Anno, Clauses1, Timeout1, AfterBody1, N3), N3 + 1};
+after_walk(Tuple, N) when is_tuple(Tuple) ->
+    {List, N1} = after_walk(tuple_to_list(Tuple), N),
+    {list_to_tuple(List), N1};
+after_walk(List, N) when is_list(List) ->
+    lists:mapfoldl(fun after_walk/2, N, List);
+after_walk(Other, N) ->
+    {Other, N}.
+
+after_expand(Anno, Clauses, Timeout, AfterBody, N) ->
+    RefV = after_var(Anno, "__DstAfterRef", N),
+    TRefV = after_var(Anno, "__DstAfterTRef", N),
+    GotV = after_var(Anno, "__DstAfterGot", N),
+
+    %% A fresh variable compared in a guard, rather than matching the bound
+    %% `Ref` directly. Matching it is correct and emits "variable is already
+    %% bound" on every rewritten receive, which breaks `--warnings-as-errors`.
+    TimeoutClause =
+        {clause, Anno, [{tuple, Anno, [{atom, Anno, '$dst_after'}, GotV]}],
+            [[{op, Anno, '=:=', GotV, RefV}]], AfterBody},
+
+    %% The disarm goes at the head of each clause rather than after the receive.
+    %% Saving the receive's value to disarm afterwards forces a block whose last
+    %% expression is that saved value, which takes the receive out of tail
+    %% position — for `loop() -> receive ... -> loop() end` that turns constant
+    %% stack into unbounded growth. It also makes the disarm exception-safe for
+    %% free, since it has already run before any body that might throw.
+    Disarm = after_call(Anno, dst_time, disarm_after, [TRefV, RefV]),
+    Clauses1 = [after_prepend(Disarm, C) || C <- Clauses],
+
+    {block, Anno, [
+        {match, Anno, RefV, after_call(Anno, erlang, make_ref, [])},
+        {match, Anno, TRefV, after_call(Anno, dst_time, arm_after, [Timeout, RefV])},
+        {'receive', Anno, Clauses1 ++ [TimeoutClause]}
+    ]}.
+
+after_prepend(Expr, {clause, Anno, Pats, Guards, Body}) ->
+    {clause, Anno, Pats, Guards, [Expr | Body]}.
+
+after_var(Anno, Prefix, N) ->
+    {var, Anno, list_to_atom(Prefix ++ integer_to_list(N))}.
+
+after_call(Anno, Mod, Fun, Args) ->
+    {call, Anno, {remote, Anno, {atom, Anno, Mod}, {atom, Anno, Fun}}, Args}.
+
+%% ---------------------------------------------------------------------------
+%% Observability pass — applied only to a module declaring `-dst_observe(...)`
 %% ---------------------------------------------------------------------------
 
 %% The callbacks whose return value carries the state.
