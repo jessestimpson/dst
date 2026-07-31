@@ -443,3 +443,9 @@ And don't edit source while background test runs are in flight.
 2 clean runs isn't evidence for an intermittent fix. What is evidence is a test
 that fails deterministically before the fix and passes after it. If you can't
 produce one, the diagnosis isn't finished.
+
+## Next
+
+[A journey through DST](06-a-journey-through-dst.md) is the whole thing end to
+end: an empty directory, a quorum register, a planted bug, and a minimized
+replayable failure that explains itself.

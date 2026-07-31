@@ -64,6 +64,7 @@ defmodule Dst.MixProject do
         {"docs/03-two-phase-commit.md", [title: "Example: two-phase commit"]},
         {"docs/04-writing-a-system-under-test.md", [title: "Writing a system under test"]},
         {"docs/05-gotchas.md", [title: "Gotchas and footguns"]},
+        {"docs/06-a-journey-through-dst.md", [title: "A journey through DST"]},
         {"docs/design.md", [title: "Design history"]}
       ],
       groups_for_extras: [

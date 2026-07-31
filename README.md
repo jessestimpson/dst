@@ -48,7 +48,7 @@ purposes.
 
 ## Documentation
 
-The walkthrough is the manual, in 5 parts:
+The walkthrough is the manual, in 6 parts:
 
 1. [What DST is](docs/01-what-dst-is.md). Discusses the kinds of bugs we're
    looking for, how the technique works, and how your project implementation
@@ -62,6 +62,10 @@ The walkthrough is the manual, in 5 parts:
    behaviour callbacks and the practices around them.
 5. [Gotchas and footguns](docs/05-gotchas.md). Nondeterminism can leak in from
    many sources. This page details some common pain points.
+6. [A journey through DST](docs/06-a-journey-through-dst.md). The whole thing
+   end to end, in 15 steps: an empty directory becomes a quorum register with a
+   planted bug, and the bug becomes a minimized, replayable failure that
+   explains itself.
 
 [docs/design.md](docs/design.md) is still a work in progress. Eventually, it will
 be the internal specification for the `dst` project itself.

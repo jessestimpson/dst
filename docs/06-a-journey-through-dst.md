@@ -1,25 +1,4 @@
-# A Journey Through DST
-
-> Working draft of the final walkthrough, and **the specification for rebuilding
-> ABD**. There is no living copy of that project to fall back on: if a delta is
-> missing here, the step cannot be reproduced, so treat any gap as a defect
-> rather than untidiness.
->
-> It has been updated for the library as it now stands — the `dst.hrl` include,
-> `dst_harness`, `dst_log`, `preload`, `audit/1`, `save_fixture/4`, and
-> `receive ... after` being handled by default — but **it has not been walked end
-> to end since those changes.** `RESULT` blocks are real output from the
-> original pass; re-record them, and expect the `dst_log` output in step 11 to
-> differ in shape because the library interleaves the driver's own decisions.
->
-> Links to `01-what-dst-is.md`, `02-setting-up.md`, `04-writing-a-system-under-test.md`
-> and `05-gotchas.md` are dangling **on purpose**. They're relative links to
-> sibling walkthrough pages and resolve once this file lands in `docs/`. Don't
-> "fix" them here.
-
----
-
-# Your first system under test
+# A journey through DST
 
 The rest of this manual explains `dst`. This page is the part where you use it.
 We start with an empty directory and finish with a minimized, replayable

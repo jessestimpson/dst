@@ -312,7 +312,7 @@ underneath it.
     dst_run:summary(dst_run:run(my_harness, #{seed => 1})).
 ```
 
-Takes a `dst_shrink:result/0` too, and there `trace_length` says something the
+Takes a `t:dst_shrink:result/0` too, and there `trace_length` says something the
 other fields do not: which trace you were handed. It matches `shrunk` when
 `verified` is true and `original` when it is false, because an unverified shrink
 gives the original back.

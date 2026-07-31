@@ -204,7 +204,7 @@ Each phase is independently useful; the plan can stop after any of them.
 
 ### Phase 0 — Harden the scheduler — **DONE**
 
-Shipped as [`src/dst_sched.erl`](../../src/dst_sched.erl), with exit criteria in
+Shipped as [`src/dst_sched.erl`](../src/dst_sched.erl), with exit criteria in
 `test/dst_sched_test.exs`. All four items landed: trace-driven quiescence, correct
 selective-receive runnability, auto-registration of spawned processes, and a
 recorded choice sequence replayable independently of the seed.
@@ -252,8 +252,8 @@ in its own process, which would remove the hazard structurally.
 
 ### Phase 1 — Virtual time — **DONE**
 
-Shipped as [`src/dst_time.erl`](../../src/dst_time.erl) (clock + timer wheel) and
-[`src/dst_transform.erl`](../../src/dst_transform.erl) (the parse transform), with
+Shipped as [`src/dst_time.erl`](../src/dst_time.erl) (clock + timer wheel) and
+[`src/dst_transform.erl`](../src/dst_transform.erl) (the parse transform), with
 the discrete-event loop as `dst_sched:run/3`. Exit criteria in
 `test/dst_time_test.exs`, driving a transformed system under test
 (`test/support/dst_timer_sut.erl`).
@@ -358,7 +358,7 @@ in the framework's eventual usage docs: **`dst_time` is not a standalone facilit
 
 ### Phase 2 — Deterministic backend — **DONE**
 
-Shipped as [`src/dgen_mem.erl`](../../src/dgen_mem.erl): MVCC read versions,
+Shipped as `dgen_mem.erl` in `dgen`: MVCC read versions,
 read-conflict detection, versionstamps, watches, and seeded commit fault injection
 (`conflict_p`, `commit_fail_p`). `dgen_backend` was already a behaviour with
 `dgen_erlfdb` as its only implementation, so this needed no production change —
@@ -520,8 +520,8 @@ it cannot vary — which is what `dst_sched` will make possible in Phase 3.
 ### Phase 3 — Extract the framework — **in progress**
 
 - ~~The behaviour, `dst_run`, record/replay, failure reporting.~~ Shipped as
-  [`src/dst_harness.erl`](../../src/dst_harness.erl) and
-  [`src/dst_run.erl`](../../src/dst_run.erl).
+  [`src/dst_harness.erl`](../src/dst_harness.erl) and
+  [`src/dst_run.erl`](../src/dst_run.erl).
 - ~~**Port a second, unrelated SUT.**~~ Shipped as `test/support/dst_2pc*.erl`.
 - ~~`dst_sched` into its own process~~ — done first, as a prerequisite.
 - ~~Port `dgen_registry`'s simulation onto the behaviour.~~ Shipped as
@@ -672,7 +672,7 @@ unreachable without it.
 
 ### Phase 4 — Shrinking — **DONE**
 
-Shipped as [`src/dst_shrink.erl`](../../src/dst_shrink.erl), with exit criteria in
+Shipped as [`src/dst_shrink.erl`](../src/dst_shrink.erl), with exit criteria in
 `test/dst_shrink_test.exs`. Delta debugging over the recorded trace, shrinking the
 operation list and the choice sequence together — they are entries in one list, so
 one pass does both.
@@ -842,7 +842,7 @@ begin
 end
 ```
 
-Shipped as a pass inside [`src/dst_transform.erl`](../../src/dst_transform.erl), with
+Shipped as a pass inside [`src/dst_transform.erl`](../src/dst_transform.erl), with
 `dst_time:arm_after/2` and `disarm_after/2` behind it and the properties pinned in
 `test/dst_after_test.exs`. Measured: a 60-second timeout resolves in single-digit
 milliseconds, and the same receive compiled without the transform ignores the
