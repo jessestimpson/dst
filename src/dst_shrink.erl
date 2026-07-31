@@ -67,9 +67,18 @@ about what that process did. Reading one means reconstructing every mailbox
 state by hand.
 
 What shrinking gives you is a trace short enough to be worth narrating.
-`dst_log` is what narrates it: run the shrunk trace back through `replay/3` and
-`dst_log:analyze/0` prints the schedule and the system's own behaviour on one
-timeline, with processes named. Use both.
+`dst_log` is what narrates it, and the order matters:
+
+```erlang
+#{trace := Minimal} = dst_shrink:shrink(Mod, Trace, Opts),
+dst_run:replay(Mod, Minimal, Opts),
+dst_log:analyze().
+```
+
+**The replay is not optional.** `dst_log` collection restarts with every run,
+and a shrink has just performed several hundred of them, so the log currently
+holds whatever its last candidate did. Replaying the surviving trace is what
+puts your failure in the log and nothing else.
 
 It cannot shrink below what the system needs to reach the violation at all, and it
 does not try to simplify the *contents* of an operation (a smaller name, fewer

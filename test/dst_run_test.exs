@@ -261,7 +261,7 @@ defmodule DstRunTest do
 
       refute :erlang.module_loaded(:dst_2pc_lazy)
 
-      %{modules_loaded: loaded} =
+      result =
         :dst_run.run(:dst_2pc, %{
           seed: 1,
           max_ops: 5,
@@ -270,8 +270,9 @@ defmodule DstRunTest do
           config: %{lazy: true}
         })
 
-      assert :dst_2pc_lazy in loaded,
-             "a module loaded mid-run must be reported, or the failure it causes is silent"
+      assert :dst_2pc_lazy in result.modules_loaded,
+             "a module loaded mid-run must be reported, or the failure it causes " <>
+               "is silent: #{inspect(:dst_run.summary(result), pretty: true)}"
     end
 
     test "preloading catches it before the run starts" do
@@ -347,6 +348,27 @@ defmodule DstRunTest do
       assert summary.trace_length > 0
       assert summary.outcome == result.outcome
       assert summary.sched == result.sched
+    end
+
+    test "summary/1 takes a shrink result too" do
+      config = %{mode: :first_vote_wins}
+
+      seed =
+        Enum.find(1..60, fn s ->
+          match?({:violation, _}, run(s, config).outcome)
+        end)
+
+      opts = Map.merge(@opts, %{seed: seed, config: config})
+      shrunk = :dst_shrink.shrink(@sut, run(seed, config).trace, opts)
+      summary = :dst_run.summary(shrunk)
+
+      refute Map.has_key?(summary, :trace)
+
+      # On a shrink result `trace_length` says which trace you were handed:
+      # `shrunk` when verified, `original` when the search found something
+      # smaller that did not survive strict replay.
+      expected = if shrunk.verified, do: shrunk.shrunk, else: shrunk.original
+      assert summary.trace_length == expected
     end
 
     test "audit/1 passes a healthy run" do

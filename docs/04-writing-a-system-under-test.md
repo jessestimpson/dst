@@ -20,16 +20,21 @@ appears.
 -callback terminate(state()) -> ok.
 
 %% optional
--callback label(pid(), state()) -> term().
+-callback labels(state()) -> #{pid() => term()}.
 ```
 
 `state()` is whatever you want it to be. A map is conventional.
 
 A harness is not the system under test — your `gen_server`s and protocol code
 are that. It's the adapter that starts the system, declares which processes to
-schedule, drives it with a workload, and judges it. That distinction decides
-which modules include `dst.hrl` and use `?DST_LOG`: the ones that ship. Your
-harness never ships, so it can call `dst_log` directly.
+schedule, drives it with a workload, and judges it.
+
+That distinction decides which modules include `dst.hrl` and use `?DST_LOG`: the
+ones that ship, where emitting nothing in a release build matters. A harness
+never ships, so it can go either way, and calling `dst_log:role/1` and
+`dst_log:log/1` directly buys it something the macros can't. The macros are
+Erlang, and so is `dst_transform`, so **the harness is the one part of a
+simulated system you can write in Elixir.**
 
 ## init/2
 

@@ -12,10 +12,11 @@ anything was in — and the ids are anonymous positions assigned in registration
 order. Turning one into an explanation means reconstructing every mailbox state
 by hand, which is a decoder ring rather than a repro.
 
-The schedule tells you what the scheduler did. This tells you what your system
-did. You need both, and `dst_run` writes its own decisions into the same log
-your system writes to, so there is one ordered timeline rather than two that
-have to be reconciled:
+The schedule tells you what the scheduler did. This is where you **define the
+narrative of your system** — nothing here generates a story, you choose what is
+worth recording and where, and the quality of a failure report follows from
+those choices. `dst_run` writes its own decisions into the same log, so there is
+one ordered timeline rather than two that have to be reconciled:
 
 ```
   12  $dst        {step,8}
@@ -43,15 +44,21 @@ handle_cast({read, Ref, From}, St = #st{ts = Ts}) ->
     ...
 ```
 
-`dst` is a test-only dependency, so a shipped module holding a bare
-`dst_log:log/1` call is an `undef` waiting for the first production run. Under a
-release build the macros expand to nothing and the module has no relationship to
-this library at all, which is what makes it safe to leave instrumentation in the
-source of something that ships. Same shape as EUnit's `TEST`.
+Under a release build the macros expand to nothing at all, so the module has no
+relationship to this library: no call, no table lookup, nothing to pay for and
+nothing for a release to carry. `log/1` below is inert when no collection is
+running, but inert is not free and still requires `dst` to be present. The
+macros are what make it safe to leave instrumentation in the source of something
+that ships. Same shape as EUnit's `TEST`.
 
 The functions below are the *driver* side — collection, correlation and
-presentation — and are called from tests and shells, never from a module that
-ships.
+presentation — and are called from tests and shells rather than from a module
+that ships.
+
+A harness may use either. It never ships, so the macros buy it nothing, and
+calling `role/1` and `log/1` directly means a harness can be written in Elixir:
+the macros are Erlang, and so is `dst_transform`, so the harness is the one part
+of a simulated system with that freedom.
 
 ## Three phases, like `fprof`
 
@@ -137,24 +144,44 @@ would be a different failure from the one you set out to investigate.
 
 -if(?DOCATTRS).
 -doc """
-Starts or stops collection. `dst_run` calls this for you unless you pass
-`log => false`; use it directly when driving `dst_sched` by hand.
+Starts or stops collection. `dst_run` calls this for you; use it directly when
+driving `dst_sched` by hand.
 
-Starting discards whatever was collected before, the same way
+`stamps` is collection turned off **without turning the clock off**: `log/1`
+still returns a real, increasing sequence number, it just records nothing. That
+is what `dst_run`'s `log => false` uses, and the distinction matters more than it
+sounds.
+
+A harness is told to stamp its operations from `log/1`, so that a violation
+reporting `earlier: {8, 11, ...}` indexes into the narrative. If switching
+collection off made those stamps 0, every one of them would compare equal, and
+an invariant phrased as "this finished before that started" would quietly stop
+holding — a run that checks nothing, reported as a clean pass. Keeping the
+counter costs one ETS row.
+
+Starting either way discards whatever was collected before, the same way
 `dst_time:start/0` resets a running clock.
 """.
 -endif.
--spec trace(start | stop) -> ok.
+-spec trace(start | stamps | stop) -> ok.
 trace(start) ->
-    stop(),
-    ?TAB = ets:new(?TAB, [named_table, public, ordered_set]),
-    true = ets:insert(?TAB, {'$seq', 0}),
-    ok;
+    fresh(true);
+trace(stamps) ->
+    fresh(false);
 trace(stop) ->
     stop().
 
+fresh(Record) ->
+    stop(),
+    ?TAB = ets:new(?TAB, [named_table, public, ordered_set]),
+    true = ets:insert(?TAB, [{'$seq', 0}, {'$record', Record}]),
+    ok.
+
 -if(?DOCATTRS).
--doc "Whether collection is active. When false, `log/1` is a no-op returning 0.".
+-doc """
+Whether a log exists, whether or not it is recording. `log/1` returns 0 only
+when this is false.
+""".
 -endif.
 -spec running() -> boolean().
 running() ->
@@ -183,8 +210,8 @@ Kept in the process dictionary, so logging costs nothing at the call sites and
 no API has to carry a label around. Call it once, wherever the process starts:
 in a `gen_server`'s `init/1`, or at the top of whatever an operation spawns.
 
-This is the *self-reported* name. `dst_harness`'s optional `label/2` is the
-harness naming a process from outside, and it wins when both exist.
+This is the *self-reported* name. `dst_harness`'s optional `labels/1` is the
+harness naming processes from outside, and it wins when both exist.
 """.
 -endif.
 -spec role(term()) -> ok.
@@ -197,8 +224,9 @@ role(Role) ->
 Records an event and returns its sequence number.
 
 Call `?DST_LOG(Event)` rather than this from a module that ships; see the module
-doc. This returns 0 when collection is not running, and the macro returns 0 when
-the module was not built for simulation at all, so the 2 are consistent.
+doc. This returns 0 when there is no log at all, and the macro returns 0 when the
+module was not built for simulation, so the 2 are consistent. Under
+`trace(stamps)` the number is real and only the recording is skipped.
 
 **Stamp your harness's own timestamps from this return value.** An invariant
 that reports "read A finished at 11, read B started at 12" is only useful if 11
@@ -212,7 +240,10 @@ log(What) ->
             0;
         _ ->
             Seq = ets:update_counter(?TAB, '$seq', 1),
-            true = ets:insert(?TAB, {Seq, get(?ROLE), What}),
+            case ets:lookup_element(?TAB, '$record', 2) of
+                true -> true = ets:insert(?TAB, {Seq, get(?ROLE), What});
+                false -> ok
+            end,
             Seq
     end.
 
@@ -316,7 +347,7 @@ label_for(Id, Labels) ->
         Name -> format(Name)
     end.
 
-%% Names are ordinary terms, from `role/1` or from a harness's `label/2`, and
+%% Names are ordinary terms, from `role/1` or from a harness's `labels/1`, and
 %% rendering them is this module's job rather than the caller's. A harness
 %% returning `{participant, 2}` is saying something clearer than one returning
 %% a preformatted string, so the tuple form gets first-class treatment and

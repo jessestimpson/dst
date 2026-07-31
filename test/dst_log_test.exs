@@ -34,11 +34,28 @@ defmodule DstLogTest do
       assert Enum.any?(roles, &match?({:participant, _}, &1)), "the system's events are missing"
     end
 
-    test "log => false collects nothing" do
+    test "log => false collects nothing but keeps the clock" do
       :dst_run.run(@harness, @opts |> Map.put(:seed, 1) |> Map.put(:log, false))
 
-      refute :dst_log.running()
-      assert :dst_log.profile() == []
+      assert :dst_log.profile() == [], "events were recorded despite log => false"
+
+      # The counter has to survive, and this is not a nicety. A harness stamps
+      # its operations from `log/1` so that a violation indexes into the
+      # narrative. If those stamps all read 0, an invariant phrased as "this
+      # finished before that started" compares 0 < 0, holds for no pair, and
+      # stops checking anything — a vacuous run reported as a clean pass.
+      assert :dst_log.seq() > 0, "the sequence counter stopped with the recording"
+    end
+
+    test "stamps keep increasing with recording off" do
+      :ok = :dst_log.trace(:stamps)
+
+      first = :dst_log.log(:a)
+      second = :dst_log.log(:b)
+
+      assert is_integer(first) and first > 0
+      assert second == first + 1
+      assert :dst_log.events() == []
     end
 
     test "log/1 is inert with no collection running, so a system can stay instrumented" do
@@ -113,7 +130,7 @@ defmodule DstLogTest do
              "teardown events must all follow the release marker"
     end
 
-    test "label/2 names the processes a step chose" do
+    test "labels/1 names the processes a step chose" do
       :dst_run.run(@harness, Map.put(@opts, :seed, 1))
 
       names = step_names()
@@ -123,7 +140,7 @@ defmodule DstLogTest do
       assert Enum.any?(names, &String.starts_with?(&1, "participant-"))
 
       refute Enum.any?(names, &Regex.match?(~r/^p\d+$/, &1)),
-             "every process this harness creates should be named by label/2"
+             "every process this harness creates should be named by labels/1"
     end
 
     test "unnamed processes fall back to positional names" do
@@ -137,7 +154,7 @@ defmodule DstLogTest do
       assert step_names() == ["p0", "p7"]
     end
 
-    test "a harness that never defines label/2 still profiles" do
+    test "a harness that never defines labels/1 still profiles" do
       # `dst_blocking_check_sut` implements the six required callbacks and not
       # the optional one, which is the case every adopter starts from. It also
       # fails in `check/1` before a single step runs, so this is the degenerate

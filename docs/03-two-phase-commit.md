@@ -261,21 +261,28 @@ failure" from "a different failure that also happens to be a failure". Without
 it, a shrinker with more than one invariant to choose from will reduce one bug
 into another and report the result as progress.
 
-### label/2, the optional one
+### labels/1, the optional one
 
 ```erlang
-label(Pid, #{coordinator := C, participants := Ps, clients := Clients}) ->
-    case lists:keyfind(Pid, 2, Ps) of
-        {Index, Pid} -> {participant, Index};
-        false when Pid =:= C -> coordinator;
-        false -> ...
-    end.
+labels(#{coordinator := C, participants := Ps, clients := Clients}) ->
+    maps:from_list(
+        [{C, coordinator}] ++
+            [{Pid, {participant, Index}} || {Index, Pid} <- Ps] ++
+            [{Pid, {client, N}} || {N, Pid} <- lists:enumerate(lists:reverse(Clients))]
+    ).
 ```
 
-Without it a step reads `p3`; with it, `participant-2`. It's called once per
-process *after* the run, because ids are handed out as processes register and
-only your harness can name them, so it costs nothing during one. Return any
-term: `dst_log` renders `{participant, 2}` as `participant-2`.
+Without it a step reads `p3`; with it, `participant-2`.
+
+Called **once**, after the run, which is why it takes the whole state rather
+than one pid at a time. A harness already holds its processes in lists and maps,
+so building this forwards is a comprehension; answering "what is this pid
+called" one at a time means writing reverse lookups you would otherwise never
+need. Ids are handed out as processes register, so the mapping cannot exist
+before the run is over.
+
+Name what you care about and leave the rest out. Names are ordinary terms:
+`dst_log` renders `{participant, 2}` as `participant-2`.
 
 Six lines that decide whether a failure report is readable. See the section
 below.
@@ -392,7 +399,7 @@ Line 42 is the bug: the coordinator decided on one vote. Line 53 is the `no`
 arriving too late, and line 55 is the participant refusing, which is what makes
 the disagreement visible.
 
-The names come from `label/2`. Without it those rows read `p0` and `p2`, and
+The names come from `labels/1`. Without it those rows read `p0` and `p2`, and
 the events come from `?DST_LOG` calls in the participant and coordinator —
 about one per protocol decision. `dst_log:analyze(#{until => N})` stops the
 output where the story does, which matters because everything after the run

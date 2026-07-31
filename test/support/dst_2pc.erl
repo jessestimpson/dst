@@ -24,7 +24,7 @@
 %%   only the coordinator's prepare timeout can resolve the transaction. Under a
 %%   frozen clock the run would deadlock; it is the idle callback that unblocks it.
 
--export([init/2, processes/1, generate/2, execute/2, check/1, terminate/1, label/2]).
+-export([init/2, processes/1, generate/2, execute/2, check/1, terminate/1, labels/1]).
 
 -define(PARTICIPANTS, 3).
 
@@ -68,27 +68,19 @@ processes(#{coordinator := Coordinator, participants := Participants, clients :=
 
 %% Optional, and worth the six lines. Without it `dst_log:analyze/0` reports
 %% `p0` through `p5`; with it, `coordinator`, `participant-2`, `client-3`.
-%% Called once per process at teardown, so it costs nothing during a run.
-label(Pid, #{coordinator := Coordinator, participants := Participants, clients := Clients}) ->
-    case lists:keyfind(Pid, 2, Participants) of
-        {Index, Pid} ->
-            {participant, Index};
-        false when Pid =:= Coordinator ->
-            coordinator;
-        false ->
+%%
+%% Called once, at teardown, with the whole state — which is why building the
+%% map forwards is a comprehension rather than a reverse lookup per pid.
+labels(#{coordinator := Coordinator, participants := Participants, clients := Clients}) ->
+    maps:from_list(
+        [{Coordinator, coordinator}] ++
+            [{Pid, {participant, Index}} || {Index, Pid} <- Participants] ++
             %% Clients are prepended as they are created, so the oldest is last.
-            case index_of(Pid, lists:reverse(Clients)) of
-                undefined -> undefined;
-                N -> {client, N}
-            end
-    end.
-
-index_of(Pid, List) ->
-    index_of(Pid, List, 1).
-
-index_of(_Pid, [], _N) -> undefined;
-index_of(Pid, [Pid | _], N) -> N;
-index_of(Pid, [_ | Rest], N) -> index_of(Pid, Rest, N + 1).
+            [
+                {Pid, {client, N}}
+             || {N, Pid} <- lists:enumerate(lists:reverse(Clients))
+            ]
+    ).
 
 %% A transaction, plus what each participant will do when asked to prepare it.
 %% Drawn entirely from the supplied rand state, so the workload replays.
@@ -124,28 +116,30 @@ execute({run_tx, TxId, Plan}, Sut = #{tab := Tab, coordinator := Coordinator, la
     %% `dst_run:spawn_op/1` rather than `spawn/1` — a plain spawn lets the client
     %% run before the scheduler owns it, and two of those race each other to the
     %% coordinator's mailbox. That produced two different traces from one seed.
+    _ = maybe_touch_lazy(Lazy, TxId),
+
     Client = dst_run:spawn_op(fun() ->
-        _ = maybe_touch_lazy(Lazy, TxId),
         Result = gen_server:call(Coordinator, {run_tx, TxId}, infinity),
         ets:insert(Tab, {{client, TxId}, Result})
     end),
 
     Sut#{clients := [Client | maps:get(clients, Sut)], next_tx := TxId + 1}.
 
-%% Deliberately a demand-load from inside a *scheduled* process, which is the
-%% shape that breaks a seed. Off unless a test asks for it.
+%% A demand-load inside the window `modules_loaded` measures. Off unless a test
+%% asks for it, and on the first transaction only.
 %%
-%% The first transaction only, and that is not fussiness. A process blocked
-%% inside `code_server` looks to `dst_sched` exactly like one blocked in a
-%% receive: not runnable. If *every* client reached for the cold module at once
-%% they would all block there, nothing would be runnable, no timer would be
-%% pending, and the run would end at what looks like quiescence having taken one
-%% step per client. Measured, before this clause existed: 5 operations, 5 steps,
-%% nothing exited, `outcome => ok`.
+%% Called from `execute/2`, which runs in the *driver* process, and that
+%% placement is deliberate rather than convenient. The version that actually
+%% bites a real system is a demand-load from inside a **scheduled** process, and
+%% it cannot be tested deterministically from inside one VM: a process waiting
+%% on `code_server` looks to `dst_sched` exactly like one blocked in a receive,
+%% so it is not runnable, and whether the code server answers before the run
+%% reaches quiescence is a question about real time. Measured while it was
+%% wired that way: 2 failures in 14 runs, and once a whole run ending after 5
+%% steps with `outcome => ok`.
 %%
-%% Touching it once leaves the other transactions to keep the run moving while
-%% the code server answers, which is what a real system's first cold module
-%% would find too.
+%% So the test here covers the mechanism, and `dst_run`'s docs cover the hazard.
+%% Pretending otherwise would mean a flaky suite in a project about determinism.
 maybe_touch_lazy(false, _TxId) -> ok;
 maybe_touch_lazy(true, 1) -> dst_2pc_lazy:touch();
 maybe_touch_lazy(true, _TxId) -> ok.

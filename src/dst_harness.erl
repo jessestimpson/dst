@@ -62,15 +62,19 @@ rule.
 `terminate(State)` — tear down. Called however the run ends, including on
 violation.
 
-`label(Pid, State)` — **optional.** A short name for a process, used when
+`labels(State)` — **optional.** A `#{pid() => Name}` map, used when
 `dst_log:analyze/0` renders a run. Without it a step reads `p7`; with it,
-`participant-2`. Called once per process *after* the run, so it costs nothing
-during one, and it is the difference between a timeline a person can read and a
-column of integers.
+`participant-2`.
 
-Return any term and `dst_log` renders it: an atom becomes itself, `{Kind, N}`
-becomes `kind-n`, anything else falls back to `~p`. Return `undefined` for
-processes you do not want to name.
+Called **once**, after the run, which is why it takes the whole state rather
+than one pid at a time: a harness already holds its processes in lists and maps,
+so building the mapping forwards is a comprehension, while answering "what is
+this pid called" one at a time means writing reverse lookups you otherwise would
+not need.
+
+Name whatever you care about and leave the rest out; anything absent falls back
+to its position. Names are ordinary terms and `dst_log` renders them: an atom
+becomes itself, `{Kind, N}` becomes `kind-n`, anything else falls back to `~p`.
 """.
 -endif.
 
@@ -86,6 +90,6 @@ processes you do not want to name.
 -callback execute(op(), state()) -> state().
 -callback check(state()) -> ok | {violation, violation()}.
 -callback terminate(state()) -> ok.
--callback label(pid(), state()) -> term().
+-callback labels(state()) -> #{pid() => term()}.
 
--optional_callbacks([label/2]).
+-optional_callbacks([labels/1]).

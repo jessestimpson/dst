@@ -6,8 +6,12 @@
 %% build sets and a release build does not. That is the point: under a release
 %% build this header contributes nothing at all — no parse transform, and no
 %% calls into `dst` — so instrumentation can be left in the source of a module
-%% that ships. `dst` is a test-only dependency, so a bare `dst_log:log/1` in a
-%% shipped module would be an `undef` waiting to happen.
+%% that ships without affecting it.
+%%
+%% `dst_log:log/1` is inert at runtime when no collection is running, but inert
+%% still costs a function call and a table lookup on every event, and it means a
+%% release has to carry `dst` to satisfy the call. The macros cost nothing and
+%% carry nothing.
 %%
 %% Same shape as EUnit's `TEST`: one define promotes a set of macros from
 %% nothing into something, and the guideline becomes a contract.

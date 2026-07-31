@@ -70,14 +70,53 @@ be the internal specification for the `dst` project itself.
 
 ```elixir
 def deps do
-  [{:dst, "~> 0.1", only: :test}]
+  [{:dst, "~> 0.1", runtime: false}]
 end
 ```
 
-`only: :test` is the usual choice. The parse transform goes on your modules
-behind an `-ifdef(DST)` guard so it can't reach a release build, and nothing
-here is needed at runtime in production.
+`runtime: false` rather than `only: :test`. Your modules include
+`dst/include/dst.hrl`, and `-include_lib` is resolved before any `-ifdef` inside
+the header, so it has to be findable in every environment. `runtime: false`
+keeps `dst` out of your release all the same: it isn't added to your
+application's `applications` list, so nothing here ships or runs in production.
+
+## Your system under test has to be Erlang
+
+`dst_transform` is an Erlang parse transform, so it never reaches an Elixir
+module, and `?DST_LOG` and `?DST_ROLE` are Erlang macros. A system written in
+Elixir gets none of it: its timers stay on the real clock, its spawns aren't
+gated by the scheduler, and it can't record into `dst_log`.
+
+**Your harness is the exception**, and a real one. It isn't transformed — it
+runs in the driver process, outside the schedule — so it can be written in
+Elixir and call `dst_log` directly. Your tests are `.exs` already.
+
+So an Elixir project can use `dst` today with the simulated part written in
+Erlang. Making Elixir a first-class system-under-test language is on the list
+below.
 
 ## Status
 
-Early.
+Early. The API is stable enough to build on and has driven 2 systems, but it has
+one consumer beyond its own test suite, so expect rough edges outside the paths
+that consumer exercises.
+
+### Known gaps, roughly by size
+
+- **No network simulation.** `dst` controls scheduling and time; it does not
+  control message delivery. A client that sends to 3 peers does so inside one
+  scheduler step, so a partially-delivered broadcast isn't a state the scheduler
+  can produce, and you have to model that fault in your workload instead.
+  Partial delivery, per-link reordering and partitions are all out of reach.
+  This is the largest gap.
+- **Elixir systems can't be transformed.** See above.
+- **One simulation per VM.** `dst_time` and `dst_log` keep state in named ETS
+  tables, so runs must be serial. Keep the tests `async: false`.
+- **No distribution.** A multi-node system has to run its nodes as processes in
+  one VM.
+- **`erlang:suspend_process/1` at scale is unverified.** It's documented for
+  debuggers. Clean at a few hundred processes; behaviour at thousands, with
+  supervisors and monitors in play, hasn't been measured.
+- **Shrinking is bounded by positional step ids.** Deleting an operation
+  renumbers every process created after it, so operations that contributed
+  nothing often survive a shrink. See [docs/05](docs/05-gotchas.md).

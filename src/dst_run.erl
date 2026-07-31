@@ -163,7 +163,9 @@ Options, all with defaults:
   is runnable. See the module doc; this is not a tuning knob so much as the thing
   that makes quiet-period bugs reachable.
 - `check_every` (1) — run the invariants every N actions.
-- `log` (`true`) — collect a `dst_log` record of the run. See `dst_log`.
+- `log` (`true`) — collect a `dst_log` record of the run. `false` suppresses the
+  events but **not** the sequence numbers `log/1` hands out, so a harness that
+  stamps its operations from them keeps working. See `dst_log`.
 - `preload` (`[]`) — applications whose modules to load before the run starts.
   **Name your own application here.** `kernel`, `stdlib` and `dst` are always
   included; anything you add is loaded on top. `false` disables it entirely.
@@ -297,23 +299,29 @@ release_ops() ->
 
 -if(?DOCATTRS).
 -doc """
-The result with the trace replaced by its length. What you want when printing.
+Any trace-carrying result, with the trace replaced by its length. What you want
+when printing.
 
-Inspecting a result whole is the first thing anybody does after a first
-successful run, and it is useless: a 20-operation run produces a few hundred
-trace entries, so a shell renders the schedule and elides the fields you were
-looking for underneath it.
+Inspecting one whole is the first thing anybody does after a first successful
+run, and it is useless: a 20-operation run produces a few hundred trace entries,
+so a shell renders the schedule and elides the fields you were looking for
+underneath it.
 
 ```erlang
 #{outcome := ok, steps := 97, trace_length := 213, modules_loaded := []} =
     dst_run:summary(dst_run:run(my_harness, #{seed => 1})).
 ```
 
-The trace is for later, once there is a failure worth shrinking. `dst_log` is
-what you want for reading one.
+Takes a `dst_shrink:result/0` too, and there `trace_length` says something the
+other fields do not: which trace you were handed. It matches `shrunk` when
+`verified` is true and `original` when it is false, because an unverified shrink
+gives the original back.
+
+The trace itself is for later, and even then it is not what you read. `dst_log`
+is.
 """.
 -endif.
--spec summary(result()) -> map().
+-spec summary(map()) -> map().
 summary(Result = #{trace := Trace}) ->
     (maps:remove(trace, Result))#{trace_length => length(Trace)}.
 
@@ -574,10 +582,14 @@ preload_app(App) ->
             error({dst_run, {preload_failed, App, no_modules}})
     end.
 
-%% `log => false` for a run that does not want the record. Stopping rather than
-%% leaving a stale log around means `dst_log:analyze/0` cannot quietly show you
-%% the previous run's story.
-start_log(false) -> dst_log:stop();
+%% `log => false` for a run that does not want the record. `stamps` rather than
+%% `stop`, so `dst_log:log/1` keeps returning real sequence numbers: a harness is
+%% told to stamp its operations from them, and stamps that all read 0 would make
+%% any "A finished before B started" invariant vacuous without saying so.
+%%
+%% Either way the previous run's log is discarded, so `analyze/0` cannot quietly
+%% show you an older story.
+start_log(false) -> dst_log:trace(stamps);
 start_log(true) -> dst_log:trace(start).
 
 %% The generated run. One action per iteration, invariants after each.
@@ -770,21 +782,28 @@ loaded_since(Before) ->
     Known = maps:from_keys(Before, []),
     lists:sort([M || M <- erlang:loaded(), not is_map_key(M, Known)]).
 
-%% `label/2` is optional, and a harness that does not define it gets `p0`, `p1`
-%% and so on. Wrapped because this runs during teardown, after a run that may
-%% already have failed: a harness whose labelling crashes should not turn a
-%% reported violation into a teardown error.
+%% `labels/1` is optional, and a harness that does not define it gets `p0`, `p1`
+%% and so on. Called once and joined against the scheduler's id-to-pid map here,
+%% so the harness never has to think in ids.
+%%
+%% Wrapped because this runs during teardown, after a run that may already have
+%% failed: a harness whose labelling crashes should not turn a reported violation
+%% into a teardown error.
 collect_labels(Mod, Sut, Sched) ->
-    case erlang:function_exported(Mod, label, 2) of
+    case erlang:function_exported(Mod, labels, 1) of
         false ->
             #{};
         true ->
+            ByPid =
+                case catch Mod:labels(Sut) of
+                    Map when is_map(Map) -> Map;
+                    _ -> #{}
+                end,
             maps:fold(
                 fun(Id, Pid, Acc) ->
-                    case catch Mod:label(Pid, Sut) of
-                        undefined -> Acc;
-                        {'EXIT', _} -> Acc;
-                        Name -> Acc#{Id => Name}
+                    case maps:find(Pid, ByPid) of
+                        {ok, Name} -> Acc#{Id => Name};
+                        error -> Acc
                     end
                 end,
                 #{},

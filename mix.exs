@@ -48,7 +48,7 @@ defmodule Dst.MixProject do
   defp package do
     [
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => "https://github.com/foundationdb-beam/dst"},
+      links: %{"GitHub" => "https://github.com/jessestimpson/dst"},
       files: ["src", "include", "mix.exs", "rebar.config", "README.md", "LICENSE.md", "docs"]
     ]
   end
