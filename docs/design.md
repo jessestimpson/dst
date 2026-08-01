@@ -14,13 +14,13 @@
 
 **Status:** Phases 0–4 are done, and Phase 5's central problem — OTP's own
 process creation — turned out to have a cheaper answer than the plan assumed, so
-that is done too. `dst_sched`, `dst_time`, `dst_transform`, `dst_after_transform`,
-`dst_observe`, `dgen_mem`, `dst_harness`, `dst_run` and `dst_shrink`, with two systems
+that is done too. `eta_sched`, `eta_time`, `eta_transform`, `eta_after_transform`,
+`eta_observe`, `dgen_mem`, `eta_harness`, `eta_run` and `eta_shrink`, with two systems
 under test on the full driver: `dgen_registry` and two-phase commit. The suite runs
 with no FoundationDB (`DGEN_BACKEND=dgen_mem mix test`).
 
 Both systems now reproduce their own schedule exactly and replay a recorded trace
-strictly; `dst_2pc` also shrinks. What remains is the acceptance criteria below and
+strictly; `eta_2pc` also shrinks. What remains is the acceptance criteria below and
 the rest of Phase 5's "no real-time dependence anywhere" goal.
 
 The framework has found one defect in `dgen_registry` that nobody planted, and two
@@ -95,7 +95,7 @@ Different seeds:
 distinct schedules across 4 seeds: 4
 ```
 
-(`dst_sched` now does this properly — the probe polled status, which is both
+(`eta_sched` now does this properly — the probe polled status, which is both
 wasteful and, as Phase 0 discovered, racy. The result stands.)
 
 The key consequence, and the reason this approach is tractable: **you do not need to
@@ -126,13 +126,13 @@ Six components. The first four are system-agnostic and are the reusable framewor
 the last two are what a system under test provides.
 
 ```
-dst_sched    serializing scheduler: owns the process set, picks who steps next
+eta_sched    serializing scheduler: owns the process set, picks who steps next
              from a seeded RNG, detects quiescence, emits the choice sequence
-dst_time     virtual clock + timer wheel; when nothing is runnable, advance to
+eta_time     virtual clock + timer wheel; when nothing is runnable, advance to
              the next timer deadline rather than waiting
-dst_run      driver: seed -> setup -> generate -> step -> check -> teardown,
+eta_run      driver: seed -> setup -> generate -> step -> check -> teardown,
              recording everything needed for exact replay
-dst_shrink   delta-debugging over the choice sequence and the op list
+eta_shrink   delta-debugging over the choice sequence and the op list
 ─────────────────────────────────────────────────────────────────────────────
 <sut>_world  the system's external dependencies, made deterministic and
              fault-injectable (for dgen: a pure-Erlang dgen_backend)
@@ -152,7 +152,7 @@ dst_shrink   delta-debugging over the choice sequence and the op list
 
 Shipped, with two corrections the sketch above did not anticipate — see Phase 3.
 `execute/2` cannot call the system synchronously and must spawn through
-`dst_run:spawn_op/1`, and `check/1` cannot ask a scheduled process anything at all.
+`eta_run:spawn_op/1`, and `check/1` cannot ask a scheduled process anything at all.
 
 The original note here claimed `dgen_registry`'s existing `DGen.Sim.Invariants` and
 workload generator would "drop into `check/1` and `generate/2` almost unchanged,
@@ -161,27 +161,27 @@ usefully so: `check_always/1` reaches `dgen_registry:status/1`, a `gen_server:ca
 that cannot be served while the member is suspended and which swallows its own
 timeout, so the invariant would pass vacuously rather than fail. The contract's
 shape was fine; the assumption that an invariant may *ask* rather than *read* was
-not. `dst_2pc` was written against the contract instead, and the registry port now
+not. `eta_2pc` was written against the contract instead, and the registry port now
 carries the cost of rewriting those checks to read ETS.
 
 ### Interception strategy
 
 Timers and clock reads need rewriting; a `parse_transform` enabled only under a
-`dst` build profile is the right mechanism, rewriting within SUT modules:
+`eta` build profile is the right mechanism, rewriting within SUT modules:
 
 | From | To | Where |
 |---|---|---|
-| `erlang:send_after/3`, `start_timer/3`, `cancel_timer/1` | `dst_time:*` | `dst_transform` |
-| `erlang:monotonic_time/0,1`, `system_time/0,1` | `dst_time:*` | `dst_transform` |
-| `receive ... after T -> B end` | a receive clause on a `dst_time` timer | `dst_after_transform` |
+| `erlang:send_after/3`, `start_timer/3`, `cancel_timer/1` | `eta_time:*` | `eta_transform` |
+| `erlang:monotonic_time/0,1`, `system_time/0,1` | `eta_time:*` | `eta_transform` |
+| `receive ... after T -> B end` | a receive clause on a `eta_time` timer | `eta_after_transform` |
 
 Opt-in at compile time, absent in production builds. No runtime cost, and nothing
 to accidentally ship.
 
-| `erlang:spawn*`, `proc_lib:spawn*` | `dst_sched:spawn*` (gated) | `dst_transform` |
+| `erlang:spawn*`, `proc_lib:spawn*` | `eta_sched:spawn*` (gated) | `eta_transform` |
 
 That last row was in the original table, removed in a later revision on the grounds
-that `dst_sched` adopts children through `set_on_spawn` tracing and so needed no
+that `eta_sched` adopts children through `set_on_spawn` tracing and so needed no
 rewrite, then reinstated and built when porting `dgen_registry` measured what
 adoption actually costs. `set_on_spawn` adopts a child *after the fact*; it does not
 stop the child acting first. The original table was right.
@@ -204,8 +204,8 @@ Each phase is independently useful; the plan can stop after any of them.
 
 ### Phase 0 — Harden the scheduler — **DONE**
 
-Shipped as [`src/dst_sched.erl`](../src/dst_sched.erl), with exit criteria in
-`test/dst_sched_test.exs`. All four items landed: trace-driven quiescence, correct
+Shipped as [`src/eta_sched.erl`](../src/eta_sched.erl), with exit criteria in
+`test/eta_sched_test.exs`. All four items landed: trace-driven quiescence, correct
 selective-receive runnability, auto-registration of spawned processes, and a
 recorded choice sequence replayable independently of the seed.
 
@@ -252,11 +252,11 @@ in its own process, which would remove the hazard structurally.
 
 ### Phase 1 — Virtual time — **DONE**
 
-Shipped as [`src/dst_time.erl`](../src/dst_time.erl) (clock + timer wheel) and
-[`src/dst_transform.erl`](../src/dst_transform.erl) (the parse transform), with
-the discrete-event loop as `dst_sched:run/3`. Exit criteria in
-`test/dst_time_test.exs`, driving a transformed system under test
-(`test/support/dst_timer_sut.erl`).
+Shipped as [`src/eta_time.erl`](../src/eta_time.erl) (clock + timer wheel) and
+[`src/eta_transform.erl`](../src/eta_transform.erl) (the parse transform), with
+the discrete-event loop as `eta_sched:run/3`. Exit criteria in
+`test/eta_time_test.exs`, driving a transformed system under test
+(`test/support/eta_timer_sut.erl`).
 
 Timer faults are in: `drop_p` (a timer that never fires but stays cancellable and
 readable — a lost message, not an unset timer) and `skew_ms` (deadlines perturbed
@@ -275,13 +275,13 @@ driving a gapped follower's recovery — a path that costs
 
 #### Design notes worth keeping
 
-**No process of its own.** `dst_time` is ETS plus module functions, deliberately.
+**No process of its own.** `eta_time` is ETS plus module functions, deliberately.
 A `gen_server` would make every `send_after/3` a blocking call, and a blocking call
-*is* quiescence to `dst_sched` — so each timer set would end a step, consume a
+*is* quiescence to `eta_sched` — so each timer set would end a step, consume a
 scheduling choice, and pollute the recorded schedule with the framework's own
 traffic. Safe because only one process under test runs at a time.
 
-**Inert unless started.** Every `dst_time` function delegates to its `erlang`
+**Inert unless started.** Every `eta_time` function delegates to its `erlang`
 counterpart when no clock is running, so a module built with the transform behaves
 normally outside a simulation. This is what makes the transform safe to leave
 enabled in a build that also runs ordinary tests, and it removes the need for a
@@ -299,9 +299,9 @@ sleep, and virtualising it silently would hide that rather than surface it.
 *Later correction:* the reason originally given here — "a sleeping process is
 neither runnable nor blocked on a receive" — is not accurate. `timer:sleep(N)` is
 `receive after N -> ok end`, so the process *is* blocked in a receive; what defeats
-`dst_sched` is narrower, that its runnability test is `queue_len > blocked_at` and a
+`eta_sched` is narrower, that its runnability test is `queue_len > blocked_at` and a
 sleeper's wakeup is a real-clock `after` with an empty mailbox. That distinction
-matters, because it means the same mechanism `dst_after_transform` uses (Phase 5)
+matters, because it means the same mechanism `eta_after_transform` uses (Phase 5)
 would virtualise a sleep too. Whether it *should* is a separate question, and the
 answer differs on either side of the transform boundary: a sleep inside the SUT
 wants a virtual timer, while a sleep in the driver — `dgen_registry:await_ready/2`
@@ -322,18 +322,18 @@ real obstacle to full simulation rather than anything about timers:
 `dgen_registry:await_ready_loop/2` (excluded, above) and
 `dgen_registry_member:gather_caught_up/6`, which runs in an off-loop helper the
 member spawns. A sleeping process is neither runnable nor blocked on a receive, so
-`dst_sched` cannot step it at all. `gather_caught_up/6` exits immediately on its
+`eta_sched` cannot step it at all. `gather_caught_up/6` exits immediately on its
 common path, so it does not bite today; a full run under the scheduler will need it
 converted to a timer. Recorded here rather than fixed, since it is Phase 2+ work.
 
 **Enabling the transform for the whole test environment, not a separate profile,
-is deliberate.** Because `dst_time` delegates to `erlang` unless a clock is running,
+is deliberate.** Because `eta_time` delegates to `erlang` unless a clock is running,
 the ordinary suite runs unchanged — and in doing so continuously proves that
 inertness across all 297 tests, which a dedicated profile would only prove for the
 tests run under it. The property that makes the transform safe is the one most
 worth having under constant test.
 
-**The clock must be started before the system.** A timer armed while `dst_time` is
+**The clock must be started before the system.** A timer armed while `eta_time` is
 inert goes to the real clock and stays there until it fires and re-arms. Starting
 the clock afterwards leaves long-period timers — precisely the ones a simulation
 cares about — on real time. It presented as a run sitting at *one* fired timer
@@ -352,9 +352,9 @@ the race it exists to remove. Driving `advance_to_next/0` in a bare loop against
 free-running system under test, the clock can reach the next deadline before the
 process has handled the previous timer and armed its next one — so the loop sees
 nothing pending and stops early. It cost a confusing test failure (1 tick instead of
-200) before the cause was obvious. Under `dst_sched` the race cannot exist, because
+200) before the cause was obvious. Under `eta_sched` the race cannot exist, because
 the idle callback is consulted only once nothing is runnable. Worth stating plainly
-in the framework's eventual usage docs: **`dst_time` is not a standalone facility.**
+in the framework's eventual usage docs: **`eta_time` is not a standalone facility.**
 
 ### Phase 2 — Deterministic backend — **DONE**
 
@@ -423,8 +423,8 @@ read-modify-write, and versions land out of order so a read returns an older val
 than it should. This is what the intermittent failures were.
 
 The fix is an ETS lock rather than a serialising process, for the same reason
-`dst_time` has none: a blocking call into a process reads as quiescence to
-`dst_sched`, so every commit would end a scheduling step.
+`eta_time` has none: a blocking call into a process reads as quiescence to
+`eta_sched`, so every commit would end a scheduling step.
 
 That introduced a second bug immediately, and a more instructive one: `try ...
 after` **does not run when a process is killed untrappably**, and killing a process
@@ -515,15 +515,15 @@ controllable and this is what the alternative costs: **a test that hardcodes an
 uncontrolled schedule reports timing changes as correctness failures**, and each one
 spends the credibility the suite needs for its real findings. The two options are
 to derive the expectation from what happened, as here, or to drive the schedule so
-it cannot vary — which is what `dst_sched` will make possible in Phase 3.
+it cannot vary — which is what `eta_sched` will make possible in Phase 3.
 
 ### Phase 3 — Extract the framework — **in progress**
 
-- ~~The behaviour, `dst_run`, record/replay, failure reporting.~~ Shipped as
-  [`src/dst_harness.erl`](../src/dst_harness.erl) and
-  [`src/dst_run.erl`](../src/dst_run.erl).
-- ~~**Port a second, unrelated SUT.**~~ Shipped as `test/support/dst_2pc*.erl`.
-- ~~`dst_sched` into its own process~~ — done first, as a prerequisite.
+- ~~The behaviour, `eta_run`, record/replay, failure reporting.~~ Shipped as
+  [`src/eta_harness.erl`](../src/eta_harness.erl) and
+  [`src/eta_run.erl`](../src/eta_run.erl).
+- ~~**Port a second, unrelated SUT.**~~ Shipped as `test/support/eta_2pc*.erl`.
+- ~~`eta_sched` into its own process~~ — done first, as a prerequisite.
 - ~~Port `dgen_registry`'s simulation onto the behaviour.~~ Shipped as
   `test/support/sim/registry_sut.ex`, reusing `DGen.Sim.Invariants` unchanged.
 - ~~Scheduler-owned spawn.~~ Built; late adoptions on the registry fell from
@@ -535,13 +535,13 @@ and a second system runs on the same framework unmodified.
 
 #### The scheduler needed its own process after all
 
-Phase 0 ran `dst_sched` in the calling process, arguing that a scheduler process
+Phase 0 ran `eta_sched` in the calling process, arguing that a scheduler process
 would itself need scheduling. That is false — nothing under test ever calls the
 scheduler, so it is never part of the system being serialized — and the argument
 cost a whole class of bug that only discipline prevented (§Phase 0's catch-all
 receive, which ate the system under test's replies to the driver).
 
-Phase 3 forced the issue rather than merely tidying it. `dst_run` interleaves
+Phase 3 forced the issue rather than merely tidying it. `eta_run` interleaves
 stepping with invariant checks and operation injection, so it needs a mailbox the
 scheduler is not also reading. The refactor came first for that reason.
 
@@ -583,10 +583,10 @@ simulated minutes across the forty, in well under a second of real time.
 
 #### The registry port, and the gap it found
 
-`DGen.Sim.RegistrySut` runs a real three-member cluster under `dst_run`, reusing
+`DGen.Sim.RegistrySut` runs a real three-member cluster under `eta_run`, reusing
 `DGen.Sim.Invariants` **unchanged** — which is what this document originally
 predicted, was wrong about for a while, and is now true, because the fix went into
-the observation mechanism (`dst_observe`) rather than into the invariants.
+the observation mechanism (`eta_observe`) rather than into the invariants.
 
 Three of its four properties hold: runs complete cleanly, the invariants are
 checked against a frozen system after every step, virtual time carries the waiting,
@@ -599,11 +599,11 @@ spawned by a system process and left running on the real scheduler until the
 for almost every operation, so almost nothing it creates is under control from
 birth, and the interleaving of those helpers is wall-clock rather than schedule.
 
-The remedy was the reinstated table row, and it is built: `dst_sched:spawn/1` and
+The remedy was the reinstated table row, and it is built: `eta_sched:spawn/1` and
 friends start the child **blocked** on a token, so there is no window at all. The
 child is spawned by MFA rather than as a fun, which is what lets the scheduler tell
 a gated child from one it must chase — the spawn trace event carries
-`{dst_sched, gated, _}`. Inert with no scheduler running, like everything else here.
+`{eta_sched, gated, _}`. Inert with no scheduler running, like everything else here.
 
 **Measured: 1212 late adoptions in 1233 processes became 1 in 431.**
 
@@ -613,7 +613,7 @@ remaining ungated children are `proc_lib:init_p` — processes OTP creates insid
 seven per run. That is precisely the OTP-coverage problem Phase 5 exists for, and it
 is now a concrete instance rather than an estimate: **full replay on `dgen_registry`
 is gated on Phase 5**, not on anything left in Phase 3. Pure-Erlang systems that
-spawn through the transform — `dst_2pc` — are unaffected.
+spawn through the transform — `eta_2pc` — are unaffected.
 
 Two smaller things the port needed, both worth knowing before porting anything
 else:
@@ -631,7 +631,7 @@ else:
 
 - **A system with periodic timers never quiesces**, so "nothing runnable and no
   timers pending" is not a termination condition for it. `dgen_registry` heartbeats
-  forever, and the first port ended every run on the step budget. `dst_run` grew a
+  forever, and the first port ended every run on the step budget. `eta_run` grew a
   `settle_steps` phase: once the operations are exhausted, run a bounded while
   longer and finish `ok`. That phase is not dead time — it is the only place the
   invariants are checked with no client traffic, which is where the quiet-period
@@ -646,12 +646,12 @@ the driver is not traced, so `set_on_spawn` does not adopt it, and the new proce
 runs on the *real* scheduler until the driver registers it. One racing process is
 usually harmless; two, from operations injected close together, race each other to
 deliver their first message. It presented exactly as it should have: one seed
-producing two different traces. `dst_run:spawn_op/1` parks the process on a
+producing two different traces. `eta_run:spawn_op/1` parks the process on a
 handshake until registration is done, which closes it.
 
 **Invariants must read state out of band, and the failure mode is silence.**
 `check/1` runs against a frozen system, so anything that sends a message and waits
-cannot be served. `dst_run` bounds the call and reports `check_blocked`, and there
+cannot be served. `eta_run` bounds the call and reports `check_blocked`, and there
 is a system under test in the suite whose whole purpose is to make that diagnosis
 fire. But the likelier mistake is worse and nothing can catch it:
 `dgen_registry:status/1` catches its own call timeout and returns `undefined`, so
@@ -666,18 +666,18 @@ injects an operation whenever nothing is runnable. That is wrong, and it is the
 kind of wrong that removes a whole class of defect from reach: `dgen_registry`'s
 traffic-triggered resync gap only manifests when nothing else is happening, so a
 client that always has something to say papers over it before it can be observed.
-`dst_run`'s `quiet_p` is the probability of letting time pass instead, and it
+`eta_run`'s `quiet_p` is the probability of letting time pass instead, and it
 exists for that reason rather than as a tuning knob. Acceptance criterion 4 is
 unreachable without it.
 
 ### Phase 4 — Shrinking — **DONE**
 
-Shipped as [`src/dst_shrink.erl`](../src/dst_shrink.erl), with exit criteria in
-`test/dst_shrink_test.exs`. Delta debugging over the recorded trace, shrinking the
+Shipped as [`src/eta_shrink.erl`](../src/eta_shrink.erl), with exit criteria in
+`test/eta_shrink_test.exs`. Delta debugging over the recorded trace, shrinking the
 operation list and the choice sequence together — they are entries in one list, so
 one pass does both.
 
-*Measured* against `dst_2pc`'s planted defect: **26 entries to 8**, in 142 candidate
+*Measured* against `eta_2pc`'s planted defect: **26 entries to 8**, in 142 candidate
 replays and 24ms, verified to replay strictly. What comes out is readable, which is
 the whole point — the transaction whose plan carries the dissenting vote, then the
 six scheduling decisions that let a `yes` reach the coordinator first.
@@ -689,7 +689,7 @@ clean run, or a **divergence** — the candidate is not a valid schedule and is
 evidence of nothing. Treating divergence as "did not fail" is the classic way to
 build a shrinker that appears to work and quietly reverts safe removals.
 
-Divergence is avoided here rather than classified. `dst_run:replay/3` grew a
+Divergence is avoided here rather than classified. `eta_run:replay/3` grew a
 `lenient` mode that skips a step naming a process that is not currently runnable,
 because entries are not independent: removing an operation necessarily strands the
 steps belonging to the process it created, so under strict replay nearly every
@@ -697,14 +697,14 @@ candidate diverges and the search learns nothing.
 
 That makes the surviving candidate a recipe rather than an artefact — a lenient
 replay silently dropped entries, so the candidate is not something to hand anyone.
-What the run *executed* is, and `dst_run` records exactly that, so a shrink ends by
+What the run *executed* is, and `eta_run` records exactly that, so a shrink ends by
 taking the executed trace and verifying it **strictly**. That verification is not a
 formality; it is the only thing between this and a shrinker that reports a
 beautifully small trace nobody can reproduce.
 
 #### Positional ids bound how much can be removed
 
-`dst_sched` assigns ids in registration order, so deleting an operation renumbers
+`eta_sched` assigns ids in registration order, so deleting an operation renumbers
 every process created after it and the surviving `{step, Id}` entries stop naming
 what they named. Measured on the shrunk 2PC trace: removing the leading operation —
 entirely irrelevant to the violation — left the run clean with six steps skipped,
@@ -721,7 +721,7 @@ The default "same failure" test is the violation's `property` when the system
 reports one, and *any* violation otherwise. The fallback is honest rather than
 good: with more than one invariant it will happily shrink one bug into a different
 one, which is worse than no shrink because it looks like progress. `shrink/3` takes
-a `match` predicate for exactly that, and `dst_2pc`'s test suite exercises the case
+a `match` predicate for exactly that, and `eta_2pc`'s test suite exercises the case
 where nothing matches — the original trace comes back with `verified => false`
 rather than a smaller trace implying success.
 
@@ -777,11 +777,11 @@ The fourth option, and the one that shipped: **do not intercept OTP's spawn — 
 an equivalent process yourself.**
 
 `gen_server:enter_loop/3` lets a process that `gen_server` did not start become a
-`gen_server`. So `dst_sched:start_monitor/3` spawns a *gated* process, sets up the
+`gen_server`. So `eta_sched:start_monitor/3` spawns a *gated* process, sets up the
 two process-dictionary entries `init_p/3` in `proc_lib` would have set, runs `init/1`,
-acknowledges, and enters the loop. `dst_transform` rewrites `gen_server:start_*` in
+acknowledges, and enters the loop. `eta_transform` rewrites `gen_server:start_*` in
 transformed modules, so `dgen_transaction` gained three inert lines and no
-production code names `dst_sched`.
+production code names `eta_sched`.
 
 Verified to produce a genuine OTP process — `sys:get_state/1`, `sys:get_status/1`
 and `sys:suspend/1` all work on it, and `$initial_call` reads correctly. Continue
@@ -799,11 +799,11 @@ by measuring rather than reasoning:
 
 | | Cause | Remedy | Effect |
 |---|---|---|---|
-| 1 | Spawned children adopted after they had started running | gated `dst_sched:spawn/1` | `adopted_late` 1212/1233 → 1/431 |
-| 2 | OTP spawning inside `gen_server:start_monitor` | `dst_sched:start_monitor/3` | `adopted_late` → 0 |
+| 1 | Spawned children adopted after they had started running | gated `eta_sched:spawn/1` | `adopted_late` 1212/1233 → 1/431 |
+| 2 | OTP spawning inside `gen_server:start_monitor` | `eta_sched:start_monitor/3` | `adopted_late` → 0 |
 | 3 | Handover that was not quiescent | `init/2` waits for it | distinct traces 8 → 5 |
 
-The third is the one to remember. `dst_harness` requires `init/2` to return with the
+The third is the one to remember. `eta_harness` requires `init/2` to return with the
 system quiescent, and `dgen_registry`'s own SUT violated that: `Cluster.start/3`
 waits for *readiness*, which is not the same thing, and about one start in five
 left a member's elector still running an unprocessed call. Everything else about
@@ -813,7 +813,7 @@ whole timer wheel — so it looked like anything but a startup problem.
 Two hypotheses that fit the evidence were tested and rejected on the way, both
 plausible enough to have been believed: state carried between runs in the shared
 `dgen_mem` database (a fresh database per run gave the same pattern), and timer
-insertion order at startup, since `dst_time` breaks deadline ties by sequence (the
+insertion order at startup, since `eta_time` breaks deadline ties by sequence (the
 wheel was identical across six runs).
 
 One seed still does not replay, and both of those explanations are now dead.
@@ -833,18 +833,18 @@ receive with no real-time dependence:
 ```erlang
 begin
     Ref  = make_ref(),
-    TRef = dst_time:arm_after(T, Ref),
+    TRef = eta_time:arm_after(T, Ref),
     receive
-        Pat1 -> dst_time:disarm_after(TRef, Ref), Body1;
+        Pat1 -> eta_time:disarm_after(TRef, Ref), Body1;
         ...
-        {'$dst_after', G} when G =:= Ref -> B
+        {'$eta_after', G} when G =:= Ref -> B
     end
 end
 ```
 
-Shipped as a pass inside [`src/dst_transform.erl`](../src/dst_transform.erl), with
-`dst_time:arm_after/2` and `disarm_after/2` behind it and the properties pinned in
-`test/dst_after_test.exs`. Measured: a 60-second timeout resolves in single-digit
+Shipped as a pass inside [`src/eta_transform.erl`](../src/eta_transform.erl), with
+`eta_time:arm_after/2` and `disarm_after/2` behind it and the properties pinned in
+`test/eta_after_test.exs`. Measured: a 60-second timeout resolves in single-digit
 milliseconds, and the same receive compiled without the transform ignores the
 virtual clock entirely.
 
@@ -881,11 +881,11 @@ before putting it on a hot receive loop.
 
 Found while checking that the tests above actually fail when the transform breaks.
 They did not. Reintroducing the tail-position bug left the suite green, because
-`mix compile` rebuilt only `dst_after_transform` and left every module built with
+`mix compile` rebuilt only `eta_after_transform` and left every module built with
 it stale; the failure appeared only after touching the SUT source by hand.
 
 This is a general hazard for transform-based testing, and it applies equally to
-`dst_transform` and `dst_timer_sut`. `test/dst_after_test.exs` closes it by
+`eta_transform` and `eta_timer_sut`. `test/eta_after_test.exs` closes it by
 recompiling its SUT from source in `setup_all`, so the test can never exercise
 yesterday's transform. Worth doing anywhere else a transform is the thing under
 test — a green suite that cannot go red is the most expensive kind of test there
@@ -935,7 +935,7 @@ The bug was reachable only in the window between "the system has stopped moving"
 false positive.* Members write their replicas optimistically — `route_unregister/3`
 deletes the row on both the calling member and the leader before anything commits —
 so replica agreement is simply false in mid-operation. The first gate was "nothing
-runnable", which the scheduler can answer directly (`dst_sched:current/0` exists for
+runnable", which the scheduler can answer directly (`eta_sched:current/0` exists for
 that). It fired on a seed where two members had speculatively deleted a name the
 third still held, and the run reported it as a divergence: the leader's commit was
 parked on its transaction worker, so nothing was runnable *in the middle of an
@@ -963,7 +963,7 @@ inter-member message. Left unscheduled it delivers them from a process running f
 on the real scheduler, so whether a message is in a member's mailbox when the driver
 next asks what is runnable is wall-clock timing — and it is also where the fault
 decisions are made, which must be a function of the seed. It is registered with
-`dst_sched` now, and its decision log is readable from ETS rather than by calling it,
+`eta_sched` now, and its decision log is readable from ETS rather than by calling it,
 for the same reason the invariants read ETS: at the one moment the log is most
 wanted, the process holding it is suspended.
 
@@ -981,7 +981,7 @@ runs of a seed group as `[[1], [2,3,4,5]]` — run 1 alone, the rest identical.
 
 **The cause is on-demand code loading.** A module that has not been used yet is
 loaded on first call, and that load is a *synchronous call to `code_server`* — a
-process `dst_sched` does not own. So a scheduled process reaches a module it has not
+process `eta_sched` does not own. So a scheduled process reaches a module it has not
 touched, blocks on a process outside the schedule, and the scheduler reads that as
 the step ending. The code server, running free, makes it runnable again at a moment
 wall-clock timing decides, and every choice after that point shifts.
@@ -1013,11 +1013,11 @@ Two things worth carrying to other systems under test:
 
 ### The trace was missing an action
 
-Found while asking why `dst_shrink` did nothing on the defect above: it reported
+Found while asking why `eta_shrink` did nothing on the defect above: it reported
 "nothing to shrink" for a failure that had just happened, because `classify/3`
 replays the trace to confirm it and the replay came back clean.
 
-`dst_run` records `{step, Id}` and `{op, Op}`. Its third action — **advancing the
+`eta_run` records `{step, Id}` and `{op, Op}`. Its third action — **advancing the
 virtual clock** — was not recorded at all, on the reasoning that the clock is a
 function of the timers and the timers are a function of the schedule. But
 `replay_loop/2` walks only the entries it is given, so a replay of a system with
@@ -1031,7 +1031,7 @@ the same split `{step, Id}` already had. Registry traces replay strictly with no
 skipped.
 
 The reason this survived is worth naming: **`replay/3` had only ever been exercised
-against a system with no timers.** `dst_2pc` has none, so its traces were complete by
+against a system with no timers.** `eta_2pc` has none, so its traces were complete by
 accident, and the registry's replay was measured by *re-running the seed* — which
 exercises `run/2`, not `replay/3`. Two things that both look like "replay works" and
 only one of them was tested.
@@ -1177,6 +1177,68 @@ lived.
 fraction of this cost. The case for proceeding is the speed multiplier (item 2 at
 the top) and exact replay — not a claim that the current one is exhausted.
 
+## Proposed, not built
+
+### Per-run state, instead of one clock per VM
+
+`eta_time`, `eta_log` and `eta_sched` each keep their state in **named** ETS
+tables, so there is exactly one of each per VM and runs have to be serial. That
+is now enforced rather than documented: `eta_time:start/1`, `eta_log:trace/1` and
+`eta_sched:new/1` refuse when a live foreign process already holds the table, and
+say which one. Before that guard, `start/1` opened with an unconditional `stop()`
+and a second concurrent run silently destroyed the first's tables, leaving it to
+die on its next clock read with an ETS `badarg` naming nothing relevant.
+
+Making runs self-contained would let them go parallel. Here is why it is harder
+than it looks and what it would take.
+
+**You cannot thread a context through the transform.** The obvious idea is to
+rewrite `erlang:send_after(T, D, M)` into `eta_time:send_after(Ctx, T, D, M)`.
+There is nowhere for `Ctx` to come from. The enclosing function is
+`handle_call/3`, whose arity `gen_server` fixes, and the transform rewrites calls
+rather than signatures. It is worse across a process boundary: a timer armed in
+`handle_cast` fires into a mailbox, and the code that receives it has no lexical
+relationship to the code that armed it. Threading works along a call chain, and a
+simulation is not one.
+
+So the context has to be **ambient**, and the BEAM offers two ways.
+
+**The process dictionary** — `eta_time:now_ms()` reads `get('$eta_run')`. `eta`
+can seed it wherever `eta` does the spawning, which is `eta_run:spawn_op/1` and
+`eta_sched:spawn/1`. It breaks on the population that matters: real systems have
+supervision trees, `supervisor:start_child` runs inside OTP where no transform of
+your code reaches, and `eta` learns of those children through `set_on_spawn`
+tracing, which by design reports the spawn *after* the child exists. You cannot
+write another process's dictionary. That is the same boundary that produced the
+stray-timer defect; the dictionary moves it rather than removing it.
+
+**A pid-to-run registry** — one global ETS table, but a *directory* rather than
+state, so two runs do not collide in it. Populated at adoption time, which is
+exactly where `set_on_spawn` already delivers, so it covers everything
+`eta_sched` covers. This one works, and its fallback is an improvement: a process
+not in the registry gets **real** `erlang`, where today it silently joins
+whichever simulation happens to be running.
+
+What it costs, measured on the current source: about 60 references to the named
+tables across the 3 modules, 28 public entry points in `eta_time`, 15 in
+`eta_log`, 5 in `eta_sched`. Every one becomes context-aware. Tables become
+unnamed tids held in the registry. `now_ms/0` goes from one ETS operation to 2
+and it is on the path of every timer insert and read; `eta_log:log/1` goes from 3
+to 4. The public API changes for anyone driving `eta_time` by hand, which the
+test suite does extensively.
+
+**Why it is not being built.** The prize is parallel runs, and that is already
+available one level up: **one OS process per run is perfectly isolated and needs
+no library change at all.** A 200-seed sweep or a `eta_shrink` search wants that
+anyway, since it isolates crashes and memory as well as the clock. What the
+registry buys over separate VMs is `async: true` inside a single ExUnit VM, which
+is a smaller prize, and it multiplies a risk already recorded below —
+`erlang:suspend_process/1` at scale is unverified, and N concurrent runs multiply
+exactly that.
+
+The version to avoid is the middle one: per-run tables behind a single global
+"current run" pointer. That is most of the rewrite for none of the parallelism.
+
 ## Open questions
 
 - Does Concuerror's DPOR subsume enough of phases 0 and 4 to change the plan?
@@ -1189,7 +1251,7 @@ the top) and exact replay — not a claim that the current one is exhausted.
   the sim backend simply complete commits synchronously under the scheduler?
 - `dgen_mem` has no retry backoff where FoundationDB backs off exponentially with
   jitter. A real `timer:sleep/1` is the wrong answer — a sleeping process is
-  neither runnable nor blocked on a receive, so `dst_sched` cannot step it — so a
+  neither runnable nor blocked on a receive, so `eta_sched` cannot step it — so a
   backoff worth having is one the scheduler drives. Left out until a workload is
   observed to need it; the timeouts that prompted the question turned out to be the
   watch-anchoring bug instead.

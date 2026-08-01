@@ -8,20 +8,20 @@ builds a project from an empty directory.
 ## The parts
 
 ```
-  dst_run          the driver: turns a seed into a run
+  eta_run          the driver: turns a seed into a run
     |
-    +-- dst_sched  runs one process at a time, choosing from the seeded RNG
-    +-- dst_time   virtual clock; timers fire when the driver says so
-    +-- dst_log    what your system did, on the same timeline
-    +-- your harness   six callbacks (dst_harness)
+    +-- eta_sched  runs one process at a time, choosing from the seeded RNG
+    +-- eta_time   virtual clock; timers fire when the driver says so
+    +-- eta_log    what your system did, on the same timeline
+    +-- your harness   six callbacks (eta_harness)
 ```
 
-`dst_transform` is the other piece, a parse transform applied to the modules that
+`eta_transform` is the other piece, a parse transform applied to the modules that
 make up the system under test. It rewrites their timer, clock and spawn calls to
-point at `dst_time` and `dst_sched` instead of `erlang`, and changes nothing
+point at `eta_time` and `eta_sched` instead of `erlang`, and changes nothing
 else. You never name it directly; a module opts in by including one header.
 
-`dst_run` owns the seed. Every choice comes from a single `rand` state seeded
+`eta_run` owns the seed. Every choice comes from a single `rand` state seeded
 from it: which process to step, whether to inject a client operation or let the
 system make progress, and whatever your workload generator draws. At each
 iteration the driver does exactly one of 3 things. It steps a runnable process
@@ -34,11 +34,11 @@ system.
 Every module that takes part in a simulation includes one header:
 
 ```erlang
--include_lib("dst/include/dst.hrl").
+-include_lib("eta/include/eta.hrl").
 ```
 
 That's the whole opt-in. Under a simulation build it brings the parse transform
-and the `?DST_LOG` and `?DST_LABEL` macros. Under a release build it brings
+and the `?ETA_LOG` and `?ETA_LABEL` macros. Under a release build it brings
 nothing at all, so a module carrying it has no relationship to this library and
 ships unchanged.
 
@@ -60,7 +60,7 @@ complaining. Put the define in before anything else.
 2 more decisions worth copying.
 
 **Enable the transform for the whole test environment**, not a dedicated
-simulation profile. `dst_time` falls back to the real `erlang` functions
+simulation profile. `eta_time` falls back to the real `erlang` functions
 whenever no virtual clock is running, so a transformed module behaves exactly as
 it did before outside a simulation. Compile your ordinary test suite with the
 transform on and every test you already have is continuously demonstrating that.
@@ -114,16 +114,16 @@ The transform rewrites qualified calls, and only qualified calls:
 
 | From | To |
 |---|---|
-| `erlang:send_after/3,4` | `dst_time:send_after/3,4` |
-| `erlang:start_timer/3,4` | `dst_time:start_timer/3,4` |
-| `erlang:cancel_timer/1,2` | `dst_time:cancel_timer/1,2` |
-| `erlang:read_timer/1` | `dst_time:read_timer/1` |
-| `erlang:monotonic_time/0,1` | `dst_time:monotonic_time/0,1` |
-| `erlang:system_time/0,1` | `dst_time:system_time/0,1` |
-| `erlang:timestamp/0` | `dst_time:timestamp/0` |
-| `os:system_time/0,1`, `os:timestamp/0` | `dst_time:*` |
-| `erlang:spawn/1,3`, `spawn_link`, `proc_lib` equivalents | `dst_sched:*` |
-| `gen_server:start/3`, `start_link/3`, `start_monitor/3` | `dst_sched:*` |
+| `erlang:send_after/3,4` | `eta_time:send_after/3,4` |
+| `erlang:start_timer/3,4` | `eta_time:start_timer/3,4` |
+| `erlang:cancel_timer/1,2` | `eta_time:cancel_timer/1,2` |
+| `erlang:read_timer/1` | `eta_time:read_timer/1` |
+| `erlang:monotonic_time/0,1` | `eta_time:monotonic_time/0,1` |
+| `erlang:system_time/0,1` | `eta_time:system_time/0,1` |
+| `erlang:timestamp/0` | `eta_time:timestamp/0` |
+| `os:system_time/0,1`, `os:timestamp/0` | `eta_time:*` |
+| `erlang:spawn/1,3`, `spawn_link`, `proc_lib` equivalents | `eta_sched:*` |
+| `gen_server:start/3`, `start_link/3`, `start_monitor/3` | `eta_sched:*` |
 
 A bare `monotonic_time()` is left alone, and has to be. None of these functions
 are auto-imported, so an unqualified call names something your own module
@@ -135,7 +135,7 @@ under simulation hangs forever. [Page 5](05-gotchas.md) has why.
 
 The spawn rewrites matter more than they look. A child spawned with a plain
 `erlang:spawn` runs briefly on the real scheduler before anything suspends it.
-`dst_sched:spawn/1` starts it blocked on a token instead, so there's no window
+`eta_sched:spawn/1` starts it blocked on a token instead, so there's no window
 at all.
 
 ## Make your state readable
@@ -146,17 +146,17 @@ makes the full argument. The setup step is a second attribute on the modules
 whose state the invariants need:
 
 ```erlang
--include_lib("dst/include/dst.hrl").
--dst_observe({state, [leader, epoch, applied_version]}).
+-include_lib("eta/include/eta.hrl").
+-eta_observe({state, [leader, epoch, applied_version]}).
 ```
 
 The transform republishes those fields into the process dictionary on every
-`gen_server` callback return, and `dst_observe:read/1` reads them back from
+`gen_server` callback return, and `eta_observe:read/1` reads them back from
 outside. That works while the process is suspended, in a couple of microseconds,
 whatever the mailbox depth:
 
 ```erlang
-#{leader := L, epoch := E} = dst_observe:read(my_server).
+#{leader := L, epoch := E} = eta_observe:read(my_server).
 ```
 
 Publishing on every return is what makes staleness impossible. There's no
@@ -179,7 +179,7 @@ a run is one call:
 
 ```erlang
 #{outcome := Outcome, trace := Trace, steps := Steps} =
-    dst_run:run(my_harness, #{seed => 7, max_ops => 25, max_steps => 20000}).
+    eta_run:run(my_harness, #{seed => 7, max_ops => 25, max_steps => 20000}).
 ```
 
 The options you're likely to touch:
@@ -195,7 +195,7 @@ The options you're likely to touch:
 | `quiet_p` | 0.3 | Chance of letting time pass rather than injecting, when nothing is runnable |
 | `check_every` | 1 | Run the invariants every N actions |
 | `preload` | `[]` | Applications to load before the run starts. **Name yours.** |
-| `log` | `true` | Collect a `dst_log` record of the run |
+| `log` | `true` | Collect a `eta_log` record of the run |
 
 3 of those deserve more.
 
@@ -224,7 +224,7 @@ than the thing that makes those bugs reachable at all.
 **The run's own accounting.**
 
 ```erlang
-ok = dst_run:audit(dst_run:run(my_harness, Opts)).
+ok = eta_run:audit(eta_run:run(my_harness, Opts)).
 ```
 
 Several fields in a result mean "part of this interleaving was decided by wall
@@ -235,7 +235,7 @@ added:
 - `modules_loaded` - code loaded mid-run, so a scheduled process called into
   `code_server`. Fix with `preload`.
 - `sched.adopted_late` - processes that ran before the scheduler owned them.
-  Fix by spawning through `dst_run:spawn_op/1`.
+  Fix by spawning through `eta_run:spawn_op/1`.
 - `sched.timeouts` - steps that ended without the process reaching a receive, so
   it was suspended wherever it happened to be.
 - `stray_timers` - timers held by a process the scheduler doesn't own, or that
@@ -251,7 +251,7 @@ it back. Assert on it next to your invariants.
 the whole setup.
 
 ```erlang
-Traces = [maps:get(trace, dst_run:run(my_harness, Opts#{seed => 3})) || _ <- lists:seq(1, 5)],
+Traces = [maps:get(trace, eta_run:run(my_harness, Opts#{seed => 3})) || _ <- lists:seq(1, 5)],
 1 = length(lists:usort(Traces)).
 ```
 
@@ -263,8 +263,8 @@ very fixable, as [page 5](05-gotchas.md) explains.
 **That a recorded trace replays.**
 
 ```erlang
-Original = dst_run:run(my_harness, Opts),
-Replayed = dst_run:replay(my_harness, maps:get(trace, Original), Opts),
+Original = eta_run:run(my_harness, Opts),
+Replayed = eta_run:replay(my_harness, maps:get(trace, Original), Opts),
 0 = maps:get(skipped, Replayed).
 ```
 
@@ -279,12 +279,12 @@ so a shell renders the schedule and elides the fields you wanted underneath it.
 
 ```erlang
 #{outcome := ok, steps := 97, trace_length := 213} =
-    dst_run:summary(dst_run:run(my_harness, Opts)).
+    eta_run:summary(eta_run:run(my_harness, Opts)).
 ```
 
 The trace is for later, once you have a failure worth shrinking, and even then
 it isn't what you read. `{step, 8}` records which process the scheduler chose
-and says nothing about what that process did. `dst_log` records what your
+and says nothing about what that process did. `eta_log` records what your
 *system* did on the same timeline, with your processes named. That's the thing
 to read, and [page 3](03-two-phase-commit.md) shows one.
 

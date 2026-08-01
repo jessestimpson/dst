@@ -1,7 +1,7 @@
 # A worked example: two-phase commit
 
-`dst` ships with a small two-phase commit implementation as an example system
-under test. It lives in `test/support/dst_2pc*.erl`: about 170 lines of protocol
+`eta` ships with a small two-phase commit implementation as an example system
+under test. It lives in `test/support/eta_2pc*.erl`: about 170 lines of protocol
 plus 150 of harness, with a bug planted in it that only an unlucky interleaving
 reveals.
 
@@ -47,12 +47,12 @@ resolve the transaction is the coordinator's prepare timeout.
 
 Everything the participant decides also goes into that table rather than into
 its `gen_server` state, because the atomicity invariant has to read it while
-every one of these processes is suspended. `dst_observe` would also make that
+every one of these processes is suspended. `eta_observe` would also make that
 readable, and choosing between the 2 comes up on every system. Our rule of
 thumb: **if the system already keeps the state somewhere readable, read it
 there. If the state exists only inside a process, publish it.** The table wins
 here because the driver has to write plans into it anyway, and because an
-accumulating history is the wrong shape for `dst_observe`, which publishes a
+accumulating history is the wrong shape for `eta_observe`, which publishes a
 snapshot of current fields.
 
 ## The coordinator, and the timer
@@ -60,7 +60,7 @@ snapshot of current fields.
 The coordinator is where the header is needed, for exactly one line:
 
 ```erlang
--include_lib("dst/include/dst.hrl").
+-include_lib("eta/include/eta.hrl").
 
 -define(VOTE_TIMEOUT, 30000).
 
@@ -73,7 +73,7 @@ handle_call({run_tx, TxId}, From, St) ->
 ```
 
 Under a simulation build the header brings the parse transform, so that
-`erlang:send_after/3` becomes `dst_time:send_after/3`. Under a release build it
+`erlang:send_after/3` becomes `eta_time:send_after/3`. Under a release build it
 brings nothing and the line ships as written.
 
 30 seconds is long enough that the timeout never fires by accident and short
@@ -129,12 +129,12 @@ rest is the scheduler's job.
 
 ```erlang
 init(Seed, Config) ->
-    Tab = ets:new(dst_2pc, [public, set]),
+    Tab = ets:new(eta_2pc, [public, set]),
     N = maps:get(participants, Config, 3),
     Mode = maps:get(mode, Config, correct),
 
     Participants = [...],
-    {ok, Coordinator} = dst_2pc_coordinator:start_link(Tab, Participants, Mode),
+    {ok, Coordinator} = eta_2pc_coordinator:start_link(Tab, Participants, Mode),
 
     {ok, #{tab => Tab, coordinator => Coordinator, participants => Participants,
            clients => [], next_tx => 1, plan => maps:get(plan, Config, random)}}.
@@ -161,7 +161,7 @@ The driver consults this after every operation, so processes an operation
 creates get picked up. Pids it already knows are ignored, so returning the whole
 set every time is both correct and expected.
 
-**The order is part of the contract.** `dst_sched` assigns ids in registration
+**The order is part of the contract.** `eta_sched` assigns ids in registration
 order and the trace records ids, so a list that comes out differently between
 runs makes the same seed pick different processes. The resulting trace
 difference looks exactly like a scheduling bug.
@@ -202,7 +202,7 @@ change in outcome is the interleaving.
 execute({run_tx, TxId, Plan}, Sut = #{tab := Tab, coordinator := Coordinator}) ->
     [ets:insert(Tab, {{plan, TxId, Index}, Vote}) || {Index, Vote} <- Plan],
 
-    Client = dst_run:spawn_op(fun() ->
+    Client = eta_run:spawn_op(fun() ->
         Result = gen_server:call(Coordinator, {run_tx, TxId}, infinity),
         ets:insert(Tab, {{client, TxId}, Result})
     end),
@@ -216,7 +216,7 @@ Operations are issued by spawning a process to perform them, which is the right
 model anyway: the client is part of the concurrent system, and the next
 `processes/1` call picks it up and interleaves it like everything else.
 
-The spawn goes through `dst_run:spawn_op/1` rather than `spawn/1`. The driver
+The spawn goes through `eta_run:spawn_op/1` rather than `spawn/1`. The driver
 isn't traced, so a process it creates isn't adopted until the driver registers
 it, and in that window the new process runs free. 2 clients created by
 operations injected close together race each other to the coordinator's mailbox,
@@ -233,7 +233,7 @@ check(#{tab := Tab, next_tx := Next}) ->
     first_violation(lists:seq(1, Next - 1), Tab).
 
 first_violation([TxId | Rest], Tab) ->
-    case lists:usort(dst_2pc_participant:decisions(Tab, TxId)) of
+    case lists:usort(eta_2pc_participant:decisions(Tab, TxId)) of
         Mixed when length(Mixed) > 1 ->
             {violation, #{property => atomicity,
                           detail => <<"participants disagreed about a transaction">>,
@@ -250,7 +250,7 @@ and some list operations. An invariant that calls into a suspended process
 either hangs or, worse, gets a plausible answer from an API that swallowed its
 own timeout, and then passes while checking nothing.
 
-**Give the violation a `property` key.** `dst_shrink` uses it to tell "the same
+**Give the violation a `property` key.** `eta_shrink` uses it to tell "the same
 failure" from "a different failure that also happens to be a failure". Without
 it, a shrinker with more than one invariant to choose from will reduce one bug
 into another and report the result as progress.
@@ -267,18 +267,18 @@ labels(#{coordinator := C, participants := Ps, clients := Clients}) ->
 ```
 
 Without a name a step reads `p3`; with one, `participant-2`. Names are ordinary
-terms; `dst_log` renders `{participant, 2}` as `participant-2`.
+terms; `eta_log` renders `{participant, 2}` as `participant-2`.
 
 Note what's doing the work here and what isn't. The coordinator and the
-participants call `?DST_LABEL` in their own `init/1`, and a self-reported label
+participants call `?ETA_LABEL` in their own `init/1`, and a self-reported label
 wins, so this callback isn't what names them.
 
 **The clients are the reason it exists.** They're anonymous funs handed to
-`dst_run:spawn_op/1`, with no module to put a `?DST_LABEL` in, so the harness is
+`eta_run:spawn_op/1`, with no module to put a `?ETA_LABEL` in, so the harness is
 the only thing that knows one of them is transaction 3. That's the general
 shape: reach for `labels/1` when the process can't name itself, whether it's a
 fun like this, something from a library you don't own, or a module you
-deliberately kept `dst.hrl` out of.
+deliberately kept `eta.hrl` out of.
 
 It's called once, after the run, which is why it takes the whole state rather
 than one pid at a time. Ids are handed out as processes register, so the mapping
@@ -305,7 +305,7 @@ deleted crashes with a `badarg` that has nothing to do with the run.
 In correct mode, over 40 seeds:
 
 ```erlang
-[dst_run:run(dst_2pc, #{seed => S, max_ops => 25, max_steps => 20000})
+[eta_run:run(eta_2pc, #{seed => S, max_ops => 25, max_steps => 20000})
  || S <- lists:seq(1, 40)].
 ```
 
@@ -314,7 +314,7 @@ Every one comes back `#{outcome := ok}`.
 Turning the defect on:
 
 ```erlang
-dst_run:run(dst_2pc, #{seed => 1, max_ops => 25, max_steps => 20000,
+eta_run:run(eta_2pc, #{seed => 1, max_ops => 25, max_steps => 20000,
                        config => #{mode => first_vote_wins}}).
 ```
 
@@ -333,7 +333,7 @@ Seed 1 fails after 19 steps:
 Participant 1 voted `no` and refused to commit. Participant 3 committed. The
 coordinator had already decided `commit` on participant 2's `yes`, which is why
 participant 2 is still at `{prepared, yes}`; the decision hasn't reached it yet.
-The run stopped after 7 of its 25 operations, because `dst_run` ends on the
+The run stopped after 7 of its 25 operations, because `eta_run` ends on the
 first violation.
 
 ## Making the failure readable
@@ -345,10 +345,10 @@ because the failure happened early. On a larger system a first trace runs to
 
 ```erlang
 #{outcome := {violation, _}, trace := Trace} =
-    dst_run:run(dst_2pc, Opts),
+    eta_run:run(eta_2pc, Opts),
 
 #{trace := Minimal, original := 26, shrunk := 8, verified := true} =
-    dst_shrink:shrink(dst_2pc, Trace, Opts).
+    eta_shrink:shrink(eta_2pc, Trace, Opts).
 ```
 
 26 entries down to 8, in 142 candidate replays and 24 msec:
@@ -371,20 +371,20 @@ positions assigned in registration order. Turning one into a story means
 reconstructing every mailbox state by hand.
 
 What shrinking gives you is a trace short enough to be worth narrating.
-`dst_log` is what narrates it.
+`eta_log` is what narrates it.
 
 ### Reading it
 
-`dst_run` writes its own decisions into the same log your system writes to, so
+`eta_run` writes its own decisions into the same log your system writes to, so
 replaying the shrunk trace and printing gives you one timeline:
 
 ```erlang
-dst_run:replay(dst_2pc, Minimal, Opts),
-dst_log:analyze().
+eta_run:replay(eta_2pc, Minimal, Opts),
+eta_log:analyze().
 ```
 
 ```
-   30  $dst           {op,{run_tx,5,[{1,no},{2,yes},{3,stall}]}}
+   30  $eta           {op,{run_tx,5,[{1,no},{2,yes},{3,stall}]}}
    39  participant-2  {voted,5,yes}
    42  coordinator    {decided,5,commit}
    53  participant-1  {voted,5,no}
@@ -395,8 +395,8 @@ Line 42 is the bug: the coordinator decided on one vote. Line 53 is the `no`
 arriving too late, and line 55 is the participant refusing, which is what makes
 the disagreement visible.
 
-The events come from `?DST_LOG` calls in the participant and coordinator, about
-one per protocol decision. `dst_log:analyze(#{until => N})` stops the output
+The events come from `?ETA_LOG` calls in the participant and coordinator, about
+one per protocol decision. `eta_log:analyze(#{until => N})` stops the output
 where the story does, which matters because everything after the run proper is
 the scheduler releasing the system during teardown.
 

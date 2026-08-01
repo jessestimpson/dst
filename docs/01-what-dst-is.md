@@ -17,11 +17,11 @@ its details.
 
 DST is an investment in time and complexity. This page explains the costs and
 potential rewards so that you can make an informed decision for your project.
-The rest of the walkthrough covers how to use the `dst` library itself.
+The rest of the walkthrough covers how to use the `eta` library itself.
 
 ## An example bug
 
-`dst` was built out of necessity. We were working on an Erlang process registry
+`eta` was built out of necessity. We were working on an Erlang process registry
 (`dgen_registry`) that had its own bespoke replication strategy, and things
 were getting complicated. This particular registry had a simple leader election
 process, and a goal to store `name -> pid` mapping in memory. Simple enough
@@ -37,7 +37,7 @@ new mappings to all followers. This means a particular follower has 2
 potential write paths to its local mapping: from a request that it forwards,
 and from a request that it was not otherwise involved in.
 
-When `dst` was being used for the first time, a particular simulation caused
+When `eta` was being used for the first time, a particular simulation caused
 a register and an unregister of a particular name to land in the same batch on
 the leader, but had origins from 2 different followers. When these writes
 were interleaved just right, one of the followers ended up with a stale
@@ -63,7 +63,7 @@ On the BEAM, that means the following.
 
 **Process scheduling.** The VM's scheduler tracks runnable Erlang processes and
 decides when to execute them. A single scheduler is single threaded, but the
-order of executions is not in your control. `dst_sched` acts as our process
+order of executions is not in your control. `eta_sched` acts as our process
 scheduler. It suspends every process it owns, and resumes exactly one at a time,
 allowing it to run until it yields. The next runnable process to be scheduled
 is decided from the seeded RNG.
@@ -71,12 +71,12 @@ is decided from the seeded RNG.
 **Time.** Timers are driven by a system wall clock. Say you have a `gen_server`
 that takes some action every 1000 msec. How many messages can it process in that
 1 sec of wall clock time? It can vary; it's unpredictable; it's not reproducible.
-`dst_time` provides a virtual clock. The clock moves deterministically, detached
+`eta_time` provides a virtual clock. The clock moves deterministically, detached
 from the wall clock, meaning we can control executions, but also we can effectively
 speed time up dramattically, covering a lot of virtual time in a short amount of
 real time.
 
-**Anything outside the VM.** Network, file I/O, NIFs, a database, etc. `dst` cannot
+**Anything outside the VM.** Network, file I/O, NIFs, a database, etc. `eta` cannot
 directly help here. It's up to you to root these out and replace them with
 deterministic stand-ins.
 
@@ -93,9 +93,9 @@ But perfect replayability also buys you something less obvious: minimization
 of the trace (a.k.a. shrinking). Once a trace and behavior is identified,
 a search can be conducted to find the minimal set of steps necessary to
 match the behavior. This can reduce a trace of 1000s of events to a dozen,
-again speeding up the resolution. `dst_shrink` is provided for this purpose.
+again speeding up the resolution. `eta_shrink` is provided for this purpose.
 Even still, the trace is merely a set of steps for the scheduler to take,
-and doesn't tell a story about your system. `dst_log` is provided to help
+and doesn't tell a story about your system. `eta_log` is provided to help
 you define the narrative of your system.
 
 As mentioned above, virtual time can cover lots of ground that real-time
@@ -115,16 +115,16 @@ interleaving will be exercised. Instead, formal modeling with something
 like TLA+ and checking with TLC **can** make such a guarantee.
 
 It's not cheap. As we alluded above, you are responsible for rooting out
-all sources of nondeterminsm. `dst` will help you along the way, but there
+all sources of nondeterminsm. `eta` will help you along the way, but there
 is real significant work in managing out the nondeterminism. Your
-Erlang modules will need to be written in a certain way for `dst` to
-engage its tooling. For example, the `dst_transform` parse transform
-is a critical part of `dst`'s tooling, and it means your code must
+Erlang modules will need to be written in a certain way for `eta` to
+engage its tooling. For example, the `eta_transform` parse transform
+is a critical part of `eta`'s tooling, and it means your code must
 adhere to its requirements.
 
 It's not a fuzzer or property-based testing. You may choose to employ
 a fuzzer to generate more DST workloads, but the inputs are your
-responsibility. `dst` will help with the execution.
+responsibility. `eta` will help with the execution.
 
 ## Next
 

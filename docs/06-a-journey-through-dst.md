@@ -1,7 +1,7 @@
 # A Journey Through DST
 
-This page guides you through the `dst` features. We start from scratch and build
-an [ABD Quorum Register](https://scholar.google.com/citations?view_op=view_citation&hl=en&user=eoMK92MAAAAJ&citation_for_view=eoMK92MAAAAJ:d1gkVwhDpl0C) in Erlang. `dst` requires you to build
+This page guides you through the `eta` features. We start from scratch and build
+an [ABD Quorum Register](https://scholar.google.com/citations?view_op=view_citation&hl=en&user=eoMK92MAAAAJ&citation_for_view=eoMK92MAAAAJ:d1gkVwhDpl0C) in Erlang. `eta` requires you to build
 your distributed system-under-test in a specific manner, to avoid leaking
 nondeterminism. This walkthrough explains those requirements through an actual
 implementation.
@@ -37,7 +37,7 @@ demonstrate exactly that over the course of this document.
 
 ## Step 1: create the project
 
-We'll put the project beside your `dst` checkout so the dependency can be a
+We'll put the project beside your `eta` checkout so the dependency can be a
 plain relative path. We're using `mix` because the tooling makes for a simpler
 walkthough, but `rebar` could just as well be used, with some modification.
 We'll write the ABD register itself in Erlang - we're going to use `parse_transform`.
@@ -64,20 +64,20 @@ Then edit `mix.exs`. In `project/0`, add 3 keys:
 Replace the commented-out examples in `deps/0` with:
 
 ```elixir
-      {:dst, path: "../dst", runtime: false}
+      {:eta, path: "../eta", runtime: false}
       # --- or ---
-      {:dst, git: "https://github.com/jessestimpson/dst.git", runtime: false}
+      {:eta, git: "https://github.com/jessestimpson/eta.git", runtime: false}
 ```
 
 and add 2 private function pairs at the bottom:
 
 ```elixir
-  # The ABD register itself is ordinary Erlang in src/. The dst harness lives in
+  # The ABD register itself is ordinary Erlang in src/. The eta harness lives in
   # test/support and only exists for the test env, so a release never sees it.
   defp erlc_paths(:test), do: ["src", "test/support"]
   defp erlc_paths(_), do: ["src"]
 
-  # The DST define is required for `dst` to engage
+  # The DST define is required for `eta` to engage
   defp erlc_options(:test), do: [:debug_info, {:d, :DST}]
   defp erlc_options(_), do: [:debug_info]
 ```
@@ -92,13 +92,13 @@ If the compile fails, double-check your configuration.
 
 ### Project configuration details
 
-**`runtime: false` rather than `only: :test`.** `dst` requires the inclusion
-of an hrl file in the ABD code. For the preprocessor to find the hrl, the `dst`
+**`runtime: false` rather than `only: :test`.** `eta` requires the inclusion
+of an hrl file in the ABD code. For the preprocessor to find the hrl, the `eta`
 project must be findable in all compilations. The `DST` define is what disables
-all `dst` features in your production code.
+all `eta` features in your production code.
 
 **`{:d, :DST}` for the whole test env, not a dedicated simulation profile.**
-`dst_time` falls back to the real `erlang` functions whenever no virtual clock
+`eta_time` falls back to the real `erlang` functions whenever no virtual clock
 is running, so a transformed module behaves normally outside a simulation.
 
 **No `mod:` in `application/0`.** ABD is small enough not to need one, and this
@@ -112,7 +112,7 @@ keeps the walkthrough short.
 -module(abd_replica).
 -behaviour(gen_server).
 
--include_lib("dst/include/dst.hrl").
+-include_lib("eta/include/eta.hrl").
 
 -export([start_link/1, stop/1, read/3, write/5, get/1]).
 -export([init/1, handle_call/3, handle_cast/2]).
@@ -196,7 +196,7 @@ This is because the process will be suspended during the check and unable to
 respond to any incoming requests. `check/1` must read shared memory rather than
 do message passing.
 
-### The `dst.hrl` include
+### The `eta.hrl` include
 
 Technically you can leave this out at this step, but if you do, remember to add it
 back in later, where it will be needed.
@@ -208,7 +208,7 @@ back in later, where it will be needed.
 ```erlang
 -module(abd_client).
 
--include_lib("dst/include/dst.hrl").
+-include_lib("eta/include/eta.hrl").
 
 -export([read/1, write/3]).
 
@@ -274,9 +274,9 @@ RESULT: `{{0, 0}, :undefined}`, `{1, 1}`, `{{1, 1}, :v1}`, `{2, 2}`,
 
 ### What to notice
 
-**The `dst` project is still not really involved.** We've defined the distributed
+**The `eta` project is still not really involved.** We've defined the distributed
 system with normal Erlang code, and we'll only need to tweak it to make it compatible
-with `dst`. The code that you ship to production is the same code that is under test.
+with `eta`. The code that you ship to production is the same code that is under test.
 
 **`abd_client` does not start a process.** It runs inside whatever
 process calls it, which right now is your `iex` shell. In a moment the harness
@@ -293,8 +293,8 @@ influence *control flow*, which would be very atypical for conventional Erlang.
 **Some messages can get stuck in the mailbox.** A quorum is 2, so after `collect_reads`
 returns there's still a `read_ack` sitting in the mailbox, and the next phase's
 `receive` scans straight past it on a different ref. That's what real ABD code
-looks like, and it exercises the trickiest part of `dst_sched`: a process
-blocked in a selective receive *with a non-empty mailbox*. `dst` can handle this
+looks like, and it exercises the trickiest part of `eta_sched`: a process
+blocked in a selective receive *with a non-empty mailbox*. `eta` can handle this
 just fine. Your actual code will probably want to flush these out, but we
 skip that here.
 
@@ -304,7 +304,7 @@ We'll delete it later and observe the result.
 ## Step 5: the harness
 
 Everything so far has been the actual ABD register. Next is the harness: a
-behaviour implementation that `dst_run` will exercise. This module could
+behaviour implementation that `eta_run` will exercise. This module could
 be in Elixir, if you want. As written, it doesn't use Erlang compile-time
 features.
 
@@ -312,7 +312,7 @@ features.
 
 ```erlang
 -module(abd_harness).
--behaviour(dst_harness).
+-behaviour(eta_harness).
 
 -export([init/2, processes/1, generate/2, execute/2, check/1, terminate/1]).
 
@@ -353,7 +353,7 @@ generate(#{next_op := N}, Rand0) ->
 
 execute(Op, Sut = #{tab := Tab, replicas := Replicas, clients := Clients}) ->
     N = op_number(Op),
-    Client = dst_run:spawn_op(fun() -> run_op(Op, Tab, Replicas) end),
+    Client = eta_run:spawn_op(fun() -> run_op(Op, Tab, Replicas) end),
     Sut#{clients := [Client | Clients], next_op := N + 1}.
 
 op_number({write, N, _Value}) -> N;
@@ -412,7 +412,7 @@ RESULT: compiles clean.
 
 `start_link` returns once `init/1` has run, and a fresh replica has an empty
 mailbox, so this system is quiescent - the replicas are at a steady-state. It's
-important to maintain this property, because `dst_run` will suspend all processes.
+important to maintain this property, because `eta_run` will suspend all processes.
 If it suspends a busy process, then the actual moment in time of that suspend action
 is nondeterministic. Make sure the system's processes are idle.
 
@@ -421,29 +421,29 @@ does not specify a term order in the API contract.
 
 ### `processes/1` and `lists:reverse`
 
-`dst_sched` assigns ids in registration order, and the trace records ids, so
+`eta_sched` assigns ids in registration order, and the trace records ids, so
 the order this callback returns is part of the contract. We prepend new clients
 to the list because that's cheap, which means the list itself is in reverse
 chronological order, so we reverse it here to hand them over oldest first.
 
 ### `generate/2` draws from the state it's handed
 
-40% writes, 60% reads, drawn from the `rand` state `dst_run` passes in and
+40% writes, 60% reads, drawn from the `rand` state `eta_run` passes in and
 returning the advanced state. Drawing from anywhere else, `rand:uniform/1` or
 the clock or `erlang:unique_integer/0`, breaks replay silently. Again, we're
 always on the lookout for nondeterminism leaks.
 
 #### Why generating and executing are separate
 
-`dst` will help us both run new seeds and replay old ones. The replay will avoid
+`eta` will help us both run new seeds and replay old ones. The replay will avoid
 calling generate, but must still call execute.
 
-### `execute/2` spawns using a special `dst` function
+### `execute/2` spawns using a special `eta` function
 
-Every process is suspended, and `dst_sched` is the only entity allowed to
-progress the system. A special `dst_run:spawn_op/1` function must be used. It
+Every process is suspended, and `eta_sched` is the only entity allowed to
+progress the system. A special `eta_run:spawn_op/1` function must be used. It
 prevents the newly spawned process from executing any real code. The pid is
-handed over to `dst_run` and `dst_sched` to progress.
+handed over to `eta_run` and `eta_sched` to progress.
 
 ### `check/1` is for defining the rules
 
@@ -470,9 +470,9 @@ MIX_ENV=test iex -S mix
 ```
 
 ```elixir
-result = :dst_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000})
-:dst_run.summary(result)
-:dst_run.audit(result)
+result = :eta_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000})
+:eta_run.summary(result)
+:eta_run.audit(result)
 ```
 
 RESULT:
@@ -498,7 +498,7 @@ the `iex` shell. The `trace` entries can get quite long, so we simply
 report the length of the trace in the summary. We'll make the trace easier to
 read later.
 
-**`steps` is the number of scheduler steps taken by `dst_sched`** If you see
+**`steps` is the number of scheduler steps taken by `eta_sched`** If you see
 20 steps for 20 operations, and nothing `exited`, check `modules_loaded`. A
 module being lazily loaded during runtime can break determinism. We'll handle
 this in step 7. It will always be something to look out for during all your runs.
@@ -513,7 +513,7 @@ should have a fully functional and safe ABD register.
 
 **`clock_ms`** is 0, because our system has no timers at all. Nothing ever
 armed one, so the virtual clock never had a reason to move. Later, we'll add
-in virtual time via `dst_time`.
+in virtual time via `eta_time`.
 
 **`modules_loaded`** must be empty, and **`sched.adopted_late`** and
 **`sched.timeouts`** must be 0. These are the properties that `audit/1` looks for.
@@ -537,7 +537,7 @@ defmodule AbdTest do
   test "the register satisfies regularity" do
     for seed <- 1..40 do
       %{outcome: outcome, sched: sched} =
-        :dst_run.run(:abd_harness, Map.put(@opts, :seed, seed))
+        :eta_run.run(:abd_harness, Map.put(@opts, :seed, seed))
 
       assert outcome == :ok, "seed #{seed}: #{inspect(outcome)}"
       assert sched.adopted_late == 0, "seed #{seed} adopted #{sched.adopted_late} late"
@@ -552,9 +552,9 @@ mix test
 
 RESULT: green.
 
-`async: false` is required. `dst_time` keeps its state in named ETS tables,
+`async: false` is required. `eta_time` keeps its state in named ETS tables,
 so exactly one virtual clock exists per node, and 2 simulations running
-concurrently will corrupt each other. Every test that drives `dst_run` has to
+concurrently will corrupt each other. Every test that drives `eta_run` has to
 be serial.
 
 Asserting on `adopted_late` in the same loop is a habit worth forming. It costs
@@ -575,7 +575,7 @@ This experiment will group traces that match each other. Notice that we're givin
 same seed on each of 5 runs. We hope to end up with identical traces each time.
 
 ```elixir
-traces = for _ <- 1..5, do: :dst_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000}).trace
+traces = for _ <- 1..5, do: :eta_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000}).trace
 
 length(Enum.uniq(traces))
 
@@ -603,10 +603,10 @@ Here are some potential outputs and what they might mean.
 
 ### Diagnosing the `code_server` problem
 
-Modules are loaded lazily, by a single `code_server` process on the node. `dst_sched`
+Modules are loaded lazily, by a single `code_server` process on the node. `eta_sched`
 has scheduled a process to run. That process reaches a module the system hasn't loaded yet,
-and sends a message to the `code_server` process, which isn't tracked by `dst_sched`.
-Our process waits on a reply, which `dst_sched` picks up as a yeild, and an opportunity
+and sends a message to the `code_server` process, which isn't tracked by `eta_sched`.
+Our process waits on a reply, which `eta_sched` picks up as a yeild, and an opportunity
 for something else to be scheduled. On future runs, this specific yield doesn't exist,
 so we end up with a different trace.
 
@@ -617,12 +617,12 @@ MIX_ENV=test iex -S mix
 ```
 
 ```elixir
-:dst_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000}).modules_loaded
+:eta_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000}).modules_loaded
 ```
 
 This should show you the modules that were loaded during the run. This is an
 indicator of nondeterminism, not because the sytem is nondeterministic, but because
-it changes `dst_sched`'s scheduling choices.
+it changes `eta_sched`'s scheduling choices.
 
 ### The fix
 
@@ -633,7 +633,7 @@ opts = %{seed: 1, max_ops: 20, max_steps: 20_000, preload: [:abd]}
 ```
 
 `preload` loads every module of the named applications before the run starts. It
-also always loads the modules of `kernel`, `stdlib` and `dst`. If your code has
+also always loads the modules of `kernel`, `stdlib` and `eta`. If your code has
 other modules, you will have to add them here.
 
 **Prewarming is not good enough** A prewarming run will only execute a subset of
@@ -654,7 +654,7 @@ test "a seed names an execution" do
   for seed <- [1, 7, 13] do
     traces =
       for _ <- 1..5 do
-        :dst_run.run(:abd_harness, Map.put(@opts, :seed, seed)).trace
+        :eta_run.run(:abd_harness, Map.put(@opts, :seed, seed)).trace
       end
 
     assert length(Enum.uniq(traces)) == 1, "seed #{seed} produced divergent traces"
@@ -673,7 +673,7 @@ failure that makes the bug visible.
 For example, your network can experience a failure
 that causes one of the ABD writers to crash. Right now our system can't
 express this failure mode, because the network is always reliable. Forcing the matter
-is called fault injection. Defining the system faults is your responsibility. `dst` gives
+is called fault injection. Defining the system faults is your responsibility. `eta` gives
 you the entrypoint for making those faults deterministic.
 
 ### What our reliable network looks like in code
@@ -749,9 +749,9 @@ RESULT: still green over 40 seeds.
 
 Even with network faults, a properly implemented ABD register still works.
 That's the power of correct distributed systems, and not a function of
-`dst`. We've increased our confidence that we've properly implemented the
+`eta`. We've increased our confidence that we've properly implemented the
 ABD Quorum Register. Next, we'll introduce a bug on purpose and discover
-it via `dst`.
+it via `eta`.
 
 ## Step 9: delete the write-back
 
@@ -794,7 +794,7 @@ Four edits in `test/support/abd_harness.erl`.
 ```erlang
 execute(Op, Sut = #{tab := Tab, replicas := Replicas, clients := Clients, mode := Mode}) ->
     N = op_number(Op),
-    Client = dst_run:spawn_op(fun() -> run_op(Op, Tab, Replicas, Mode) end),
+    Client = eta_run:spawn_op(fun() -> run_op(Op, Tab, Replicas, Mode) end),
     Sut#{clients := [Client | Clients], next_op := N + 1}.
 ```
 
@@ -823,7 +823,7 @@ opts = %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :no_wr
 {micros, results} =
   :timer.tc(fn ->
     for seed <- 1..200 do
-      {seed, :dst_run.run(:abd_harness, Map.put(opts, :seed, seed)).outcome}
+      {seed, :eta_run.run(:abd_harness, Map.put(opts, :seed, seed)).outcome}
     end
   end)
 ```
@@ -858,9 +858,9 @@ that reproduces the same violation. (Note: global minimization is not guaranteed
 
 ```elixir
 opts6 = Map.put(opts, :seed, 6)
-result = :dst_run.run(:abd_harness, opts6)
-shrunk = :dst_shrink.shrink(:abd_harness, result.trace, opts6)
-:dst_run.summary(shrunk)
+result = :eta_run.run(:abd_harness, opts6)
+shrunk = :eta_shrink.shrink(:abd_harness, result.trace, opts6)
+:eta_run.summary(shrunk)
 ```
 
 **Use the same options.** `opts6` has `config: %{mode: :no_writeback}`,
@@ -870,7 +870,7 @@ RESULT: `original: 35, shrunk: 19, tests: 393, verified: true`, in 457 ms.
 
 `verified: true` tells you that the search was successful. During the search, a
 candidate is only a recipe, replayed in lenient mode where some steps  get skipped.
-`verified: true` means `dst_shrink` took what that run actually
+`verified: true` means `eta_shrink` took what that run actually
 executed and replayed it again strictly, and it still failed. `false` means the
 search found something smaller that doesn't reproduce, and you get the original
 back.
@@ -889,26 +889,26 @@ Here is the shrunk trace:
 
 If that means nothing to you, that's the correct reaction.
 
-Remember that we're still working with replayable `dst_sched` actions. Even in
-this minimized state, the shrunk trace is an artifact of the `dst` library,
+Remember that we're still working with replayable `eta_sched` actions. Even in
+this minimized state, the shrunk trace is an artifact of the `eta` library,
 and it tells you little about the specifics of the ABD Register. Let's bridge
 that gap.
 
-### Using `dst_log`
+### Using `eta_log`
 
-`dst_log` uses a global table. It's API is modeled after `fprof` and other built-in
+`eta_log` uses a global table. It's API is modeled after `fprof` and other built-in
 Erlang analysis tools. Don't execute these yet; we need to instrument the ABD
 code first.
 
 ```erlang
-dst_run:run(abd_harness, Opts),   %% 1. collect  (automatic)
-dst_log:profile(),                %% 2. correlate
-dst_log:analyze().                %% 3. present
+eta_run:run(abd_harness, Opts),   %% 1. collect  (automatic)
+eta_log:profile(),                %% 2. correlate
+eta_log:analyze().                %% 3. present
 ```
 
 ### What you add to your system
 
-We'll use `?DST_LABEL` and `?DST_LOG` in our system code. Both of these macros
+We'll use `?ETA_LABEL` and `?ETA_LOG` in our system code. Both of these macros
 expand to no-ops when `DST` is undefined. In production code, this instrumentation
 simply does not exist.
 
@@ -916,20 +916,20 @@ simply does not exist.
 
 ```erlang
 init(Index) ->
-    ok = ?DST_LABEL({replica, Index}),
+    ok = ?ETA_LABEL({replica, Index}),
     {ok, #st{index = Index}}.
 ```
 
-and log what it does (with `?DST_LOG`), in the `handle_cast` clauses:
+and log what it does (with `?ETA_LOG`), in the `handle_cast` clauses:
 
 ```erlang
 handle_cast({read, Ref, From}, St = #st{index = I, ts = Ts, val = Val}) ->
-    _ = ?DST_LOG({answered_read, Ts}),
+    _ = ?ETA_LOG({answered_read, Ts}),
     From ! {read_ack, Ref, I, Ts, Val},
     {noreply, St};
 handle_cast({write, Ref, From, Ts, Val}, St = #st{index = I}) ->
     St1 = store(Ts, Val, St),
-    _ = ?DST_LOG({applied_write, Ts, St1#st.ts =:= Ts}),
+    _ = ?ETA_LOG({applied_write, Ts, St1#st.ts =:= Ts}),
     From ! {write_ack, Ref, I},
     {noreply, St1}.
 ```
@@ -939,39 +939,39 @@ that already holds a higher timestamp ignores it, and knowing which is which
 will help us troubleshoot.
 
 **`src/abd_client.erl`**, instrument where the protocol decides something, still
-using `?DST_LOG`. In `query_phase/1`, surrounding the collection:
+using `?ETA_LOG`. In `query_phase/1`, surrounding the collection:
 
 ```erlang
 query_phase(Replicas) ->
     Ref = make_ref(),
-    _ = ?DST_LOG(query_sent),
+    _ = ?ETA_LOG(query_sent),
     [abd_replica:read(Pid, Ref, self()) || Pid <- Replicas],
     Best = collect_reads(Ref, ?QUORUM, {{0, 0}, undefined}),
-    _ = ?DST_LOG({quorum_max, element(1, Best)}),
+    _ = ?ETA_LOG({quorum_max, element(1, Best)}),
     Best.
 ```
 
 in `write_phase/3`, before the sends:
 
 ```erlang
-    _ = ?DST_LOG({write_sent, Ts, length(Replicas)}),
+    _ = ?ETA_LOG({write_sent, Ts, length(Replicas)}),
 ```
 
 in `partial_write/4`, after the sends:
 
 ```erlang
-    _ = ?DST_LOG({crashed_after_writing, Ts, Targets}),
+    _ = ?ETA_LOG({crashed_after_writing, Ts, Targets}),
 ```
 
 and in `read/2`'s `no_writeback` branch, which is the one that names the bug:
 
 ```erlang
         no_writeback ->
-            _ = ?DST_LOG({returned_without_writeback, Ts})
+            _ = ?ETA_LOG({returned_without_writeback, Ts})
 ```
 
 This instrumentation requires knowledge of the system under test, ABD in this case,
-to be useful. `dst` can't do that for you. Choosing the right instrumentation means
+to be useful. `eta` can't do that for you. Choosing the right instrumentation means
 the trace will be readable. Luckily, since traces are replayable, the instrumentation
 can be decided upon post-fact. You will be able to hone your instrumentation over time
 using real bugs to define the narrative.
@@ -979,11 +979,11 @@ using real bugs to define the narrative.
 ### What you add to your harness
 
 `test/support/abd_harness.erl` never ships, so it can go either way: include
-`dst.hrl` and use the macros, or call `dst_log` directly. We call directly.
+`eta.hrl` and use the macros, or call `eta_log` directly. We call directly.
 
 The reason: **The macros are Erlang**. A harness that calls the functions instead
 could be written in Elixir, or another BEAM language. The system under test cannot,
-because `dst_transform` is an Erlang parse transform and never reaches an Elixir
+because `eta_transform` is an Erlang parse transform and never reaches an Elixir
 module. Your harness does not have special compile-time requirements, so write it
 in Elixir if you want.
 
@@ -996,13 +996,13 @@ label_for({partial_write, N, _Value, _Targets}) -> {crasher, N};
 label_for({read, N}) -> {reader, N}.
 ```
 
-There is an optional `labels/1` callback on `dst_harness`, but we don't need it here
+There is an optional `labels/1` callback on `eta_harness`, but we don't need it here
 because each process names itself.
 
 ### Use one clock, and only one
 
 Your harness has been stamping operations from its own `tick/1` counter since
-step 5. Throw it away and stamp from `dst_log:log/1`, which returns its sequence
+step 5. Throw it away and stamp from `eta_log:log/1`, which returns its sequence
 number. Four edits in `test/support/abd_harness.erl`.
 
 **In `init/2`**, delete the counter row:
@@ -1023,26 +1023,26 @@ tick(Tab) ->                               %% delete this function
 
 ```erlang
 run_op(Op, Tab, Replicas, Mode) ->
-    ok = dst_log:label(label_for(Op)),
-    Start = dst_log:log(started),
+    ok = eta_log:label(label_for(Op)),
+    Start = eta_log:log(started),
     run_op(Op, Tab, Replicas, Mode, Start).
 
 run_op({write, N, Value}, Tab, Replicas, _Mode, Start) ->
     Ts = abd_client:write(Replicas, N, Value),
-    ets:insert(Tab, {{write, N}, Start, dst_log:log({finished, Ts}), Ts, Value});
+    ets:insert(Tab, {{write, N}, Start, eta_log:log({finished, Ts}), Ts, Value});
 run_op({partial_write, N, Value, Targets}, Tab, Replicas, _Mode, Start) ->
     Ts = abd_client:partial_write(Replicas, N, Value, Targets),
-    ets:insert(Tab, {{partial_write, N}, Start, dst_log:log({finished, Ts}), Ts, Value});
+    ets:insert(Tab, {{partial_write, N}, Start, eta_log:log({finished, Ts}), Ts, Value});
 run_op({read, N}, Tab, Replicas, Mode, Start) ->
     {Ts, Val} = abd_client:read(Replicas, Mode),
-    ets:insert(Tab, {{read, N}, Start, dst_log:log({finished, Ts}), Ts, Val}).
+    ets:insert(Tab, {{read, N}, Start, eta_log:log({finished, Ts}), Ts, Val}).
 ```
 
 It can be helpful to confirm that the log does not influence trace replayability:
 
 ```elixir
-a = :dst_run.run(:abd_harness, Map.put(opts, :seed, 6)).trace
-b = :dst_run.run(:abd_harness, Map.put(opts, :seed, 6) |> Map.put(:log, false)).trace
+a = :eta_run.run(:abd_harness, Map.put(opts, :seed, 6)).trace
+b = :eta_run.run(:abd_harness, Map.put(opts, :seed, 6) |> Map.put(:log, false)).trace
 a == b
 ```
 
@@ -1065,9 +1065,9 @@ MIX_ENV=test iex -S mix
 opts = %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :no_writeback}}
 opts6 = Map.put(opts, :seed, 6)
 
-result = :dst_run.run(:abd_harness, opts6)
-shrunk = :dst_shrink.shrink(:abd_harness, result.trace, opts6)
-:dst_run.summary(shrunk)
+result = :eta_run.run(:abd_harness, opts6)
+shrunk = :eta_shrink.shrink(:abd_harness, result.trace, opts6)
+:eta_run.summary(shrunk)
 ```
 
 Use whichever seed your own step 9 sweep turned up; 6 was ours.
@@ -1077,26 +1077,26 @@ start of every run, and `shrink/3` just did several hundred of them. Make
 sure the system can collect the log events you care about.
 
 ```elixir
-:dst_run.replay(:abd_harness, shrunk.trace, opts6)
+:eta_run.replay(:abd_harness, shrunk.trace, opts6)
 
 {:violation, %{later: {_start, finish, _ts}}} = shrunk.outcome
-:dst_log.analyze(%{until: finish})
+:eta_log.analyze(%{until: finish})
 ```
 
 RESULT:
 
 ```
-    1  $dst           {op,{partial_write,1,{v,1},[2]}}
-    2  $dst           {op,{partial_write,2,{v,2},[3]}}
-    3  $dst           {op,{read,3}}
-    4  $dst           {op,{read,4}}
-    5  $dst           {op,{read,5}}
+    1  $eta           {op,{partial_write,1,{v,1},[2]}}
+    2  $eta           {op,{partial_write,2,{v,2},[3]}}
+    3  $eta           {op,{read,3}}
+    4  $eta           {op,{read,4}}
+    5  $eta           {op,{read,5}}
     6  crasher-1      {step,3}
     7  crasher-1      started
     8  crasher-1      query_sent
     9  replica-2      {step,1}
    10  replica-2      {answered_read,{0,0}}
-   11  $dst           {op,{read,6}}
+   11  $eta           {op,{read,6}}
    12  replica-3      {step,2}
    13  replica-3      {answered_read,{0,0}}
    14  crasher-1      {step,3}
@@ -1109,7 +1109,7 @@ RESULT:
    21  replica-2      {step,1}
    22  replica-2      {applied_write,{1,1},true}
    23  replica-2      {answered_read,{1,1}}
-   24  $dst           {op,{read,7}}
+   24  $eta           {op,{read,7}}
    25  replica-3      {step,2}
    26  replica-3      {answered_read,{0,0}}
    27  reader-6       {step,8}
@@ -1150,7 +1150,7 @@ understanding of the ABD system itself. Don't be alarmed if the trace remains
 confusing even at this stage. When you write your system, you will be the expert,
 and as the expert you will be able to parse this information.
 
-`dst_log:analyze(%{until: finish, driver: false})` drops the `$dst` lines
+`eta_log:analyze(%{until: finish, driver: false})` drops the `$eta` lines
 entirely if you want only what the system did.
 
 ### What it says
@@ -1186,12 +1186,12 @@ and one asserts system health.
 
   test "seed 6 reproduces the inversion without the write-back" do
     assert {:violation, %{property: :no_new_old_inversion}} =
-             :dst_run.run(:abd_harness, Map.put(@buggy, :seed, 6)).outcome
+             :eta_run.run(:abd_harness, Map.put(@buggy, :seed, 6)).outcome
   end
 
   test "the write-back fixes seed 6" do
     correct = Map.put(@buggy, :config, %{mode: :correct})
-    assert :ok = :dst_run.run(:abd_harness, Map.put(correct, :seed, 6)).outcome
+    assert :ok = :eta_run.run(:abd_harness, Map.put(correct, :seed, 6)).outcome
   end
 ```
 
@@ -1199,12 +1199,12 @@ and one asserts system health.
 ## Step 13: a virtual clock
 
 Every run so far has reported `clock_ms: 0`. The system has no timers, so
-`dst_time` has never done anything and the parse transform we put on `abd_replica`
+`eta_time` has never done anything and the parse transform we put on `abd_replica`
 back at step 3 has never rewritten a line. However, time is a very typical
 component of distributed systems, and usually shows up as timeouts.
 
-`dst_transform` rewrites `receive-after` language constructs and `erlang:send_after`.
-Both become deterministic with `dst_time`'s virtual clock.
+`eta_transform` rewrites `receive-after` language constructs and `erlang:send_after`.
+Both become deterministic with `eta_time`'s virtual clock.
 
 ### Another fault injection - a replica that dies
 
@@ -1216,7 +1216,7 @@ In `src/abd_replica.erl`, add a `paused` field, a `pause/2` cast, and 3 clauses
 
 ```erlang
 handle_cast({pause, Ms}, St) ->
-    _ = ?DST_LOG({paused, Ms}),
+    _ = ?ETA_LOG({paused, Ms}),
     _ = erlang:send_after(Ms, self(), resume),
     {noreply, St#st{paused = true}};
 %% An unreachable replica. The request arrives and is simply never answered,
@@ -1231,13 +1231,13 @@ and a `handle_info` clause to bring it back:
 
 ```erlang
 handle_info(resume, St) ->
-    _ = ?DST_LOG(resumed),
+    _ = ?ETA_LOG(resumed),
     {noreply, St#st{paused = false}}.
 ```
 
 That `erlang:send_after/3` is the first line in the project the parse transform
 actually rewrites. If it feels nondeterministic to you, you're right, it should!
-The reason it's ok is that `dst_transform` will rewrite things at compile time
+The reason it's ok is that `eta_transform` will rewrite things at compile time
 (when `DST` is defined). That rewrite replaces the wall clock with a virtual one,
 and removes the nondeterminism.
 
@@ -1259,7 +1259,7 @@ collect_reads(Ref, N, Best) ->
         {read_ack, Ref, _Index, Ts, Val} ->
             collect_reads(Ref, N - 1, best(Best, {Ts, Val}))
     after ?PHASE_TIMEOUT ->
-        _ = ?DST_LOG(gave_up_waiting_for_read_quorum),
+        _ = ?ETA_LOG(gave_up_waiting_for_read_quorum),
         throw({abd_timeout, Ref})
     end.
 ```
@@ -1274,12 +1274,12 @@ collect_writes(Ref, N) ->
         {write_ack, Ref, _Index} ->
             collect_writes(Ref, N - 1)
     after ?PHASE_TIMEOUT ->
-        _ = ?DST_LOG(gave_up_waiting_for_write_quorum),
+        _ = ?ETA_LOG(gave_up_waiting_for_write_quorum),
         throw({abd_timeout, Ref})
     end.
 ```
 
-Here we're execising `dst_transform`'s rewrite of the `receive-after` construct
+Here we're execising `eta_transform`'s rewrite of the `receive-after` construct
 instead of an `erlang:send_after` call.
 
 **The timeout is a client failure, so we throw.** A client
@@ -1326,7 +1326,7 @@ And `run_op/5` gains a clause for the new operation:
 
 ```erlang
 run_op({pause, _N, Index, Ms}, _Tab, Replicas, _Mode, _Start) ->
-    _ = dst_log:log({pausing, Index, Ms}),
+    _ = eta_log:log({pausing, Index, Ms}),
     abd_replica:pause(lists:nth(Index, Replicas), Ms);
 ```
 
@@ -1338,26 +1338,26 @@ The other 3 `run_op/4` clauses must catch the timeout and record the failure:
 run_op({write, N, Value}, Tab, Replicas, _Mode, Start) ->
     try abd_client:write(Replicas, N, Value) of
         Ts ->
-            ets:insert(Tab, {{write, N}, Start, dst_log:log({finished, Ts}), Ts, Value})
+            ets:insert(Tab, {{write, N}, Start, eta_log:log({finished, Ts}), Ts, Value})
     catch
         throw:{abd_timeout, _} ->
-            ets:insert(Tab, {{gave_up, write, N}, Start, dst_log:log(gave_up)})
+            ets:insert(Tab, {{gave_up, write, N}, Start, eta_log:log(gave_up)})
     end;
 run_op({partial_write, N, Value, Targets}, Tab, Replicas, _Mode, Start) ->
     try abd_client:partial_write(Replicas, N, Value, Targets) of
         Ts ->
-            ets:insert(Tab, {{partial_write, N}, Start, dst_log:log({finished, Ts}), Ts, Value})
+            ets:insert(Tab, {{partial_write, N}, Start, eta_log:log({finished, Ts}), Ts, Value})
     catch
         throw:{abd_timeout, _} ->
-            ets:insert(Tab, {{gave_up, partial_write, N}, Start, dst_log:log(gave_up)})
+            ets:insert(Tab, {{gave_up, partial_write, N}, Start, eta_log:log(gave_up)})
     end;
 run_op({read, N}, Tab, Replicas, Mode, Start) ->
     try abd_client:read(Replicas, Mode) of
         {Ts, Val} ->
-            ets:insert(Tab, {{read, N}, Start, dst_log:log({finished, Ts}), Ts, Val})
+            ets:insert(Tab, {{read, N}, Start, eta_log:log({finished, Ts}), Ts, Val})
     catch
         throw:{abd_timeout, _} ->
-            ets:insert(Tab, {{gave_up, read, N}, Start, dst_log:log(gave_up)})
+            ets:insert(Tab, {{gave_up, read, N}, Start, eta_log:log(gave_up)})
     end.
 ```
 
@@ -1370,7 +1370,7 @@ the read tuples.
 opts = %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :correct}}
 
 for seed <- 1..40 do
-  r = :dst_run.run(:abd_harness, Map.put(opts, :seed, seed))
+  r = :eta_run.run(:abd_harness, Map.put(opts, :seed, seed))
   {seed, r.outcome, r.clock_ms}
 end
 ```
@@ -1385,7 +1385,7 @@ Notice that `clock_ms` is nonzero now; the virtual clock is engaged. Nothing in 
 system actually had to wait around for 10 seconds. We simulated it in a fraction of
 the time.
 
-Feel free to run the `:dst_log` functions in your shell to inspect some traces.
+Feel free to run the `:eta_log` functions in your shell to inspect some traces.
 
 ## Step 14: pin the trace, not the seed
 
@@ -1403,7 +1403,7 @@ the generator can cause pinned seeds to silently stop testing what they were pin
 for. Ours failed loudly because it asserts on a violation. A test asserting
 `ok` would likely be just as pointless.
 
-Instead of pinning the seed, we can pin the trace. `dst_run:replay/3` never calls `generate/2`, it
+Instead of pinning the seed, we can pin the trace. `eta_run:replay/3` never calls `generate/2`, it
 walks the entries it's given, so a saved trace survives generator changes
 completely.
 
@@ -1414,12 +1414,12 @@ parameters, your first failing seed might be different.
 buggy = %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :no_writeback}}
 opts53 = Map.put(buggy, :seed, 53)
 
-r = :dst_run.run(:abd_harness, opts53)
-s = :dst_shrink.shrink(:abd_harness, r.trace, opts53)
+r = :eta_run.run(:abd_harness, opts53)
+s = :eta_shrink.shrink(:abd_harness, r.trace, opts53)
 {s.original, s.shrunk, s.verified}
 
 File.mkdir_p!("test/fixtures")
-:dst_run.save_fixture("test/fixtures/inversion.dst", :abd_harness, s.trace, opts53)
+:eta_run.save_fixture("test/fixtures/inversion.eta", :abd_harness, s.trace, opts53)
 ```
 
 RESULT: `{39, 19, true}`, then `{:ok, {:violation, %{property: :no_new_old_inversion}}}`.
@@ -1429,7 +1429,7 @@ Now we can load that fixture into a test.
 ```elixir
   test "the recorded inversion still reproduces" do
     assert %{outcome: {:violation, %{property: :no_new_old_inversion}}} =
-             :dst_run.replay_fixture("test/fixtures/inversion.dst")
+             :eta_run.replay_fixture("test/fixtures/inversion.eta")
   end
 ```
 
@@ -1440,21 +1440,21 @@ different order. Those are changes to the contract rather than to the workload.
 
 ## Step 15: How to incorporate system state into your invariant
 
-`dst_log` records what your system *did*. `dst_observe` is for tracking current
+`eta_log` records what your system *did*. `eta_observe` is for tracking current
 system state. It requires special configration of the parse transform because
 state is typically accessible via message passing, and all processes are suspended,
 which halts message passing during the `check/1` phase.
 
-### Tweak `dst_transform` with a `dst_observe` attribute
+### Tweak `eta_transform` with a `eta_observe` attribute
 
 One attribute on `src/abd_replica.erl`:
 
 ```erlang
--include_lib("dst/include/dst.hrl").
--dst_observe({st, [ts, val]}).
+-include_lib("eta/include/eta.hrl").
+-eta_observe({st, [ts, val]}).
 ```
 
-For every `gen_server` callback, `dst_transform` will publish the fields
+For every `gen_server` callback, `eta_transform` will publish the fields
 `ts` and `val` from the `st` record to a shared memory location, observable
 by the harness.
 
@@ -1473,14 +1473,14 @@ check(#{tab := Tab, replicas := Replicas}) ->
 
 %% What each replica holds, read straight out of its heap while it is suspended.
 replica_states(Replicas) ->
-    [{I, dst_observe:read(Pid)} || {I, Pid} <- lists:enumerate(Replicas)].
+    [{I, eta_observe:read(Pid)} || {I, Pid} <- lists:enumerate(Replicas)].
 ```
 
 ### Run it
 
 ```elixir
 opts = %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :no_writeback}}
-:dst_run.run(:abd_harness, Map.put(opts, :seed, 53)).outcome
+:eta_run.run(:abd_harness, Map.put(opts, :seed, 53)).outcome
 ```
 
 RESULT:
@@ -1509,19 +1509,19 @@ the trace, shrink, or log.
 So how do we pick the right one?
 
 **If the state already lives somewhere readable, read it there.** Our reads and
-writes go into ets because the invariant needs a history, `dst_observe` is not
+writes go into ets because the invariant needs a history, `eta_observe` is not
 a history.
 
 **If the state exists only inside a process, publish it.** A replica's
 `{Ts, Val}` is a current internal value, so publish it out to the harness with
-`dst_observe`.
+`eta_observe`.
 
-Finally, with respect to `dst_log`: the log is the narrative, this is a snapshot.
+Finally, with respect to `eta_log`: the log is the narrative, this is a snapshot.
 Use both to debug.
 
 ## Conclusion
 
-That covers all the high level concepts of `dst`. The main takeaway is that DST
+That covers all the high level concepts of `eta`. The main takeaway is that DST
 is an investment. Doing it right requires time and attention, but if your
 problem space is the right fit, it will probably prevent some headaches and
 lead to a more reliable software system.

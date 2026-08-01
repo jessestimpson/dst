@@ -28,11 +28,11 @@ A harness is not the system under test. Your `gen_server`s and protocol code are
 that. The harness is the adapter that starts the system, declares which
 processes to schedule, drives it with a workload, and judges it.
 
-That distinction decides which modules include `dst.hrl` and use `?DST_LOG`: the
+That distinction decides which modules include `eta.hrl` and use `?ETA_LOG`: the
 ones that ship, where emitting nothing in a release build matters. A harness
-never ships, so it can go either way, and calling `dst_log:label/1` and
-`dst_log:log/1` directly buys it something the macros can't. The macros are
-Erlang, and so is `dst_transform`, so **the harness is the one part of a
+never ships, so it can go either way, and calling `eta_log:label/1` and
+`eta_log:log/1` directly buys it something the macros can't. The macros are
+Erlang, and so is `eta_transform`, so **the harness is the one part of a
 simulated system you can write in Elixir.**
 
 ## init/2
@@ -132,7 +132,7 @@ and resolve it in `execute/2`.
 Covered on the [previous page](03-two-phase-commit.md). The short version: every
 process the scheduler owns is suspended, so a synchronous call into one from the
 driver is never answered. Operations are issued by spawning, and the spawn goes
-through `dst_run:spawn_op/1` so the new process can't act before the scheduler
+through `eta_run:spawn_op/1` so the new process can't act before the scheduler
 owns it.
 
 ## check/1
@@ -140,7 +140,7 @@ owns it.
 An invariant runs against a frozen system, so anything that sends a message and
 waits can't be served.
 
-The loud version of getting this wrong is a hang, which `dst_run` bounds and
+The loud version of getting this wrong is a hang, which `eta_run` bounds and
 reports as `check_blocked`. The quiet version is worse and nothing can catch it.
 Consider a status API written the way most of them are:
 
@@ -168,14 +168,14 @@ there anyway, so the invariant that compares replicas is an `ets:tab2list` per
 member.
 
 **If the state exists only inside a process, publish it.**
-`-dst_observe({state, [leader, epoch]})` makes the transform republish those
+`-eta_observe({state, [leader, epoch]})` makes the transform republish those
 fields into the process dictionary on every callback return, and
-`dst_observe:read/1` reads them from outside. That works on a suspended process,
+`eta_observe:read/1` reads them from outside. That works on a suspended process,
 in a couple of microseconds, whatever the mailbox depth. Publishing on every
 return is what makes staleness impossible, since there's no assignment site
 anybody can forget.
 
-Name the record and the fields rather than using `-dst_observe(all)`. `read/1`
+Name the record and the fields rather than using `-eta_observe(all)`. `read/1`
 copies what was published and gets called after every step, and naming the
 fields is what makes a typo a compile error instead of a wrong offset.
 
@@ -200,9 +200,9 @@ that knows:
 
 ```elixir
 def quiescent?(%{clients: clients}) do
-  case :dst_sched.current() do
+  case :eta_sched.current() do
     :undefined -> false
-    sched -> :dst_sched.runnable(sched) == [] and not Enum.any?(clients, &Process.alive?/1)
+    sched -> :eta_sched.runnable(sched) == [] and not Enum.any?(clients, &Process.alive?/1)
   end
 end
 ```
@@ -272,7 +272,7 @@ or merely produced by it most of the time.
 is a test that fails deterministically before the fix and passes after it.
 
 The stronger form is to break something on purpose and confirm the test notices.
-`dst`'s own acceptance criteria are that idea at a larger scale: plant a known
+`eta`'s own acceptance criteria are that idea at a larger scale: plant a known
 defect behind a compile flag and require the framework to find it again from a
 cold start.
 

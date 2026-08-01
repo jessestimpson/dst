@@ -31,7 +31,7 @@ for very little effort.
 
 **Put the evidence in the failure message rather than deriving it.** The most
 recent determinism bug found in this library survived 3 rounds of theorising.
-What worked was adding `inspect(dst_run:summary(Result))` to the assertion
+What worked was adding `inspect(eta_run:summary(Result))` to the assertion
 message and looping until it failed. The answer arrived in one shot and was none
 of the 3 theories.
 
@@ -42,7 +42,7 @@ print, and try to make it fail again.
 ## The code server
 
 **`modules_loaded` in a run result is what tells you.** It lists modules loaded
-while the scheduler was in charge, and it should be empty. `dst_run:audit/1`
+while the scheduler was in charge, and it should be empty. `eta_run:audit/1`
 checks it for you.
 
 Before that field existed the symptom was all you had: the first run in a fresh
@@ -58,10 +58,10 @@ again at a moment decided by wall clock, and every choice after that point
 shifts. On the second run everything is loaded and it never happens again.
 
 The fix is the `preload` option. Name your own application; `kernel`, `stdlib`
-and `dst` are always included.
+and `eta` are always included.
 
 ```erlang
-dst_run:run(my_harness, #{seed => 1, preload => [my_app]}).
+eta_run:run(my_harness, #{seed => 1, preload => [my_app]}).
 ```
 
 Running a seed twice is not a substitute, and this is worth being precise about:
@@ -71,7 +71,7 @@ needed. Warming up fixes the seed you warmed and not the next one.
 
 ### The worse failure, which nothing catches
 
-A process waiting on `code_server` is, to `dst_sched`, a process blocked in a
+A process waiting on `code_server` is, to `eta_sched`, a process blocked in a
 receive. It isn't runnable. So if enough of the system reaches for cold code at
 once, nothing is runnable, no timer is pending, and **the run ends at what looks
 exactly like quiescence.**
@@ -127,11 +127,11 @@ Delegating from one transform to another doesn't help, because the compiler
 loads a transform module from the code path when it runs, so the ordering hazard
 just moves down a level. If a module needs a second pass, add it to the
 transform it already names and gate it behind an attribute. That's why
-`dst_transform` carries both the state-publishing pass and the receive-timeout
-rewrite as *passes*, and why modules opt into the first with `-dst_observe(...)`.
+`eta_transform` carries both the state-publishing pass and the receive-timeout
+rewrite as *passes*, and why modules opt into the first with `-eta_observe(...)`.
 Those 2 used to be separate transforms and couldn't be used together.
 
-It's also why you include `dst.hrl` rather than naming the transform: the header
+It's also why you include `eta.hrl` rather than naming the transform: the header
 carries the one attribute, so there's nothing to get wrong.
 
 ### Mix doesn't recompile a module when its transform changes
@@ -155,9 +155,9 @@ registers it, and in that window the process runs on the real scheduler. One
 racing process is usually harmless. 2, created by operations injected close
 together, race each other to deliver their first message.
 
-Inside a transformed module `spawn` is rewritten to `dst_sched:spawn/1`
+Inside a transformed module `spawn` is rewritten to `eta_sched:spawn/1`
 automatically. Inside `execute/2` it isn't, because your harness isn't
-transformed, so use `dst_run:spawn_op/1` there. Watch `sched.adopted_late` in
+transformed, so use `eta_run:spawn_op/1` there. Watch `sched.adopted_late` in
 the run result. It should be at or very near zero.
 
 ### suspend_process/1 is documented for debuggers
@@ -167,24 +167,41 @@ fine at a few hundred, but behaviour at 1000s, with supervisors and monitors in
 play, is unverified. Satisfy yourself about it before building on top for a very
 large system.
 
-### One clock per VM
+### One clock, one log and one scheduler per VM
 
-`dst_time` keeps its state in named ETS tables, so exactly one virtual clock
-exists per node and 2 simulations running at once will corrupt each other. Keep
-the tests `async: false`.
+All 3 keep their state in named ETS tables, so exactly one of each exists per
+node and runs have to be serial. Keep the tests `async: false`.
+
+Getting it wrong is now loud rather than silent. Starting a second clock, log or
+scheduler while a live process holds the first is refused, and the error names
+the owner:
+
+```erlang
+{eta_time, {clock_in_use, <0.312.0>,
+            <<"one per VM; keep runs serial (`async: false`) ...">>}}
+```
+
+It used to succeed. `eta_time:start/1` opened with an unconditional `stop()`, so
+a second run deleted the first's tables and the first died on its next clock read
+with an ETS `badarg` in a stack that named nothing to do with the cause.
+
+If you want simulations to run in parallel, the unit of isolation is the **VM**,
+not the test process. Run seeds in separate OS processes; that isolates crashes
+and memory too. See [design.md](design.md) for why per-run state inside one VM is
+a bigger change than it looks.
 
 ## Time hazards
 
 ### Start the clock before the system
 
-`dst_run` does this for you, which is why `init/2` is called by the driver
-rather than by you beforehand. A timer armed while `dst_time` is inert goes onto
+`eta_run` does this for you, which is why `init/2` is called by the driver
+rather than by you beforehand. A timer armed while `eta_time` is inert goes onto
 the real clock and stays there until it fires and re-arms, so long-period
 timers, the interesting ones, would silently never become virtual.
 
 ### receive ... after is handled
 
-`dst_transform` rewrites calls, and `after` is a language construct rather than
+`eta_transform` rewrites calls, and `after` is a language construct rather than
 a call, so this looks as though it can't work. It can: `receive Cs after T -> B
 end` is an abstract form like any other, and the transform rewrites it into a
 receive whose timeout is an ordinary message clause on the virtual clock.
@@ -193,7 +210,7 @@ receive whose timeout is an ordinary message clause on the virtual clock.
 hold without naming a function, so leaving it to an attribute would mean a
 module that quietly wakes on the wall clock with nothing reporting it.
 
-`-dst_after(false).` opts a module out, for a hot receive loop where the cost of
+`-eta_after(false).` opts a module out, for a hot receive loop where the cost of
 arming and cancelling a timer per receive is measurable. `after 0` is never
 rewritten, since it's a mailbox poll rather than a wait.
 
@@ -201,7 +218,7 @@ rewritten, since it's a mailbox poll rather than a wait.
 
 A sleep is `receive after T -> ok end` inside OTP's `timer` module, which no
 transform of your code reaches. The sleeping process is blocked on a timeout
-rather than on a message, and `dst_sched` decides what's runnable by looking at
+rather than on a message, and `eta_sched` decides what's runnable by looking at
 mailboxes, so it sees a process with nothing waiting for it and never steps it.
 Only the real clock can end that wait, and the driver doesn't control the real
 clock. Code under simulation shouldn't sleep at all, and quietly virtualizing
@@ -229,7 +246,7 @@ deadline outlives it. And a process spawned before the scheduler existed, which
 means anything your system starts during `init/2`, is outside the schedule by
 construction.
 
-`dst` steps over such deadlines rather than advancing to them, so this no longer
+`eta` steps over such deadlines rather than advancing to them, so this no longer
 changes a schedule, and reports the count as `stray_timers` in the run result.
 `audit/1` checks it. A non-zero count still means something worth fixing: a
 process holding a timer that nothing will ever schedule. Either hand it to
@@ -251,7 +268,7 @@ testing.
 Covered on the [previous page](04-writing-a-system-under-test.md), and repeated
 here because it's the failure that doesn't announce itself. A client API that
 catches its own call timeout returns a plausible answer for a suspended process,
-and the invariant computes over that answer and passes. `dst_run` bounds
+and the invariant computes over that answer and passes. `eta_run` bounds
 `check/1` and reports `check_blocked` when it hangs. It can't detect the case
 where the API answers.
 
@@ -288,7 +305,7 @@ scheduling divergence.
 
 ### Every action the driver takes has to be in the trace
 
-`dst_run` records `{step, Id}` and `{op, Op}`. For a while it didn't record its
+`eta_run` records `{step, Id}` and `{op, Op}`. For a while it didn't record its
 third action, advancing the clock, on the reasoning that the clock is a function
 of the timers and the timers are a function of the schedule, so a replay would
 advance in the same places by itself.
@@ -296,7 +313,7 @@ advance in the same places by itself.
 It doesn't, because `replay/3` walks only the entries it's given. A trace from a
 system with timers replayed against a clock that never moved. Nothing became
 runnable, every recorded step was refused, and a strict replay failed at entry 0.
-`dst_shrink` reported "nothing to shrink" for a failure that had just happened,
+`eta_shrink` reported "nothing to shrink" for a failure that had just happened,
 because it replays the trace to classify it and got a clean run back.
 
 `{clock, Ms}` is an entry type now. What's transferable is why it survived so
@@ -320,12 +337,12 @@ it's given, so a saved trace survives a rewritten workload entirely.
 
 ```erlang
 %% once, from a shrink whose `verified` was true
-{ok, _Outcome} = dst_run:save_fixture("test/fixtures/atomicity.dst",
+{ok, _Outcome} = eta_run:save_fixture("test/fixtures/atomicity.eta",
                                       my_harness, Trace, Opts),
 
 %% in the test, forever after
 #{outcome := {violation, #{property := atomicity}}} =
-    dst_run:replay_fixture("test/fixtures/atomicity.dst").
+    eta_run:replay_fixture("test/fixtures/atomicity.eta").
 ```
 
 `save_fixture/4` replays the trace strictly before writing anything and refuses
@@ -431,7 +448,7 @@ still reproduces under 3, and that trace is 38 entries.
 
 ### Give your violations a property key
 
-`dst_shrink`'s default test for "the same failure" is the violation's `property`
+`eta_shrink`'s default test for "the same failure" is the violation's `property`
 key when there is one, and any violation at all when there isn't. With more than
 one invariant, the fallback will cheerfully shrink one bug into a different one,
 which is worse than no shrink because it looks like progress.

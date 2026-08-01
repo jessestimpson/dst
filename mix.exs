@@ -1,9 +1,9 @@
-defmodule Dst.MixProject do
+defmodule Eta.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :dst,
+      app: :eta,
       version: "0.1.0",
       elixir: "~> 1.15",
       erlc_paths: erlc_paths(Mix.env()),
@@ -14,7 +14,7 @@ defmodule Dst.MixProject do
       dialyzer: dialyzer(),
       deps: deps(),
       package: package(),
-      name: "dst",
+      name: "eta",
       description:
         "Deterministic simulation testing for the BEAM: a serializing scheduler, " <>
           "a virtual clock, and a driver that turns a seed into a replayable run.",
@@ -28,8 +28,8 @@ defmodule Dst.MixProject do
   defp erlc_paths(:test), do: ["src", "test/support"]
   defp erlc_paths(_), do: ["src"]
 
-  # The `DST` define is the contract `include/dst.hrl` hangs on: with it, the
-  # header brings the parse transform and the `?DST_LOG` macros; without it, it
+  # The `DST` define is the contract `include/eta.hrl` hangs on: with it, the
+  # header brings the parse transform and the `?ETA_LOG` macros; without it, it
   # brings nothing. This project's own test suite is a simulation build, so it
   # sets it — the same line every adopter writes.
   defp erlc_options(:test), do: [:debug_info, {:d, :DST}]
@@ -49,14 +49,25 @@ defmodule Dst.MixProject do
   defp package do
     [
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => "https://github.com/jessestimpson/dst"},
-      files: ["src", "include", "mix.exs", "rebar.config", "README.md", "LICENSE.md", "docs"]
+      links: %{"GitHub" => "https://github.com/jessestimpson/eta"},
+      files: [
+        "src",
+        "include",
+        "assets",
+        "mix.exs",
+        "rebar.config",
+        "README.md",
+        "LICENSE.md",
+        "docs"
+      ]
     ]
   end
 
   defp docs do
     [
       main: "readme",
+      logo: "assets/eta.svg",
+      assets: %{"assets" => "assets"},
       extras: [
         "README.md",
         "LICENSE.md",

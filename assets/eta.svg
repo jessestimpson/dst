@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="eta">
+  <title>eta</title>
+  <style>
+    .ink    { stroke: #16181d; }
+    .rule   { stroke: #16181d; opacity: .30; }
+    .accent { stroke: #c2762b; }
+    .plate  { fill: none; stroke: #16181d; opacity: .13; }
+    @media (prefers-color-scheme: dark) {
+      .ink    { stroke: #eceff4; }
+      .rule   { stroke: #eceff4; opacity: .34; }
+      .accent { stroke: #e8a860; }
+      .plate  { stroke: #eceff4; opacity: .17; }
+    }
+  </style>
+
+  <rect class="plate" x="8.5" y="8.5" width="183" height="183" rx="42" stroke-width="1"/>
+
+  <!-- The baseline, graduated. An etalon is the artifact a measurement is read
+       against, and every other stroke on this page stops at the line. -->
+  <g class="rule" stroke-linecap="round" stroke-width="2.5">
+    <path d="M40 112 H154"/>
+    <g>
+      <path d="M48 112 v11"/>
+      <path d="M64 112 v7"/>
+      <path d="M80 112 v11"/>
+      <path d="M96 112 v7"/>
+      <path d="M112 112 v11"/>
+    </g>
+  </g>
+
+  <!-- Eta, above the line. -->
+  <path class="ink" d="M64 112 V60 C64 37 132 37 132 60 V112"
+        fill="none" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- And below it. The descender is the one stroke that crosses the baseline and
+       keeps going, which is as good a picture of the idea as a letter gets. -->
+  <path class="accent" d="M132 112 V158"
+        fill="none" stroke-width="15" stroke-linecap="round"/>
+</svg>
