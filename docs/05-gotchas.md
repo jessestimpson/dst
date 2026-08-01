@@ -215,6 +215,26 @@ step budget, which is reported as an error, so every run looks like a failure.
 That's what `settle_steps` is for, and the phase isn't dead time. It's the only
 part of a run where the invariants are checked with no client traffic at all.
 
+### A timer outlives the scheduler's ownership of its process
+
+A timer belongs to a process, and the scheduler is not obliged to own that
+process. When it doesn't, the timer is still in the wheel, and a driver that
+advances to the earliest deadline moves the clock on behalf of something that can
+never take a step. 2 runs of one seed then differ by an inserted `{clock, Ms}`
+with no step behind it, hundreds of entries in.
+
+2 ordinary ways to get one. A process killed while blocked in a rewritten
+`receive ... after` never reaches the clause head that disarms it, so its
+deadline outlives it. And a process spawned before the scheduler existed, which
+means anything your system starts during `init/2`, is outside the schedule by
+construction.
+
+`dst` steps over such deadlines rather than advancing to them, so this no longer
+changes a schedule, and reports the count as `stray_timers` in the run result.
+`audit/1` checks it. A non-zero count still means something worth fixing: a
+process holding a timer that nothing will ever schedule. Either hand it to
+`processes/1` so it becomes part of the run, or don't start it in `init/2`.
+
 ### Timeouts outside the transform boundary are on the real clock
 
 If you deliberately leave a client-facing module untransformed, its

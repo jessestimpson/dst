@@ -374,4 +374,79 @@ defmodule DstTimeTest do
       0 -> n
     end
   end
+
+  describe "schedulable deadlines" do
+    setup do
+      :ok = :dst_time.start()
+      on_exit(&:dst_time.stop/0)
+    end
+
+    test "advance_to_next/1 steps over a deadline its predicate rejects" do
+      mine = self()
+      other = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(other, :kill) end)
+
+      :dst_time.send_after(500, other, :theirs)
+      :dst_time.send_after(1000, mine, :mine)
+
+      assert :dst_time.next_deadline() == 500
+
+      only_mine = fn dest -> dest == mine end
+      assert :dst_time.next_deadline(only_mine) == 1000
+
+      assert :dst_time.advance_to_next(only_mine)
+      assert :dst_time.now_ms() == 1000
+      assert_received :mine
+    end
+
+    test "stepping over one is not cancelling it" do
+      # The rejected timer must still be delivered when the clock passes it for
+      # another reason, or refusing to advance *to* a stray would quietly turn
+      # into never firing it at all.
+      mine = self()
+      other = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(other, :kill) end)
+
+      :dst_time.send_after(500, other, :theirs)
+      :dst_time.send_after(1000, mine, :mine)
+
+      assert :dst_time.advance_to_next(fn dest -> dest == mine end)
+
+      assert :dst_time.pending() == 0, "the stepped-over timer should have fired on the way"
+      assert :dst_time.stats().fired == 2
+    end
+
+    test "strays/0 counts each stepped-over timer once" do
+      mine = self()
+      other = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(other, :kill) end)
+
+      assert :dst_time.strays() == 0
+
+      :dst_time.send_after(500, other, :theirs)
+      :dst_time.send_after(1000, mine, :first)
+      :dst_time.send_after(2000, mine, :second)
+
+      only_mine = fn dest -> dest == mine end
+
+      # Two advances, and the same stray is the earliest deadline for the first
+      # of them only — but the count is by ref, so a stray skipped repeatedly
+      # would still read 1.
+      assert :dst_time.advance_to_next(only_mine)
+      assert :dst_time.advance_to_next(only_mine)
+
+      assert :dst_time.strays() == 1
+    end
+
+    test "advance_to_next/0 accepts everything, for driving by hand" do
+      other = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(other, :kill) end)
+
+      :dst_time.send_after(500, other, :theirs)
+
+      assert :dst_time.advance_to_next()
+      assert :dst_time.now_ms() == 500
+      assert :dst_time.strays() == 0
+    end
+  end
 end

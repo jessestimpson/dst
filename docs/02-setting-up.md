@@ -238,6 +238,8 @@ added:
   Fix by spawning through `dst_run:spawn_op/1`.
 - `sched.timeouts` - steps that ended without the process reaching a receive, so
   it was suspended wherever it happened to be.
+- `stray_timers` - timers held by a process the scheduler doesn't own, or that
+  has died. See [page 5](05-gotchas.md).
 
 It answers `{suspect, Reasons}` rather than an error, because the run happened
 and its violation, if any, is real. What you can't do is trust the seed to give

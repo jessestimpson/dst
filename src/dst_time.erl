@@ -93,9 +93,12 @@ concurrently in the same node.
 -export([
     now_ms/0,
     next_deadline/0,
+    next_deadline/1,
     advance_to_next/0,
+    advance_to_next/1,
     advance/1,
     pending/0,
+    strays/0,
     set_faults/1,
     stats/0
 ]).
@@ -105,6 +108,10 @@ concurrently in the same node.
 -define(STATE, dst_time_state).
 -define(TIMERS, dst_time_timers).
 -define(REFS, dst_time_refs).
+
+%% Refs of timers `next_deadline/1` has stepped over — see `advance_to_next/1`. A
+%% set, so a stray skipped on 20 successive idle calls counts once.
+-define(STRAYS, dst_time_strays).
 
 -type fault_opts() :: #{
     drop_p => float(),
@@ -141,6 +148,7 @@ start(Opts) ->
     ?STATE = ets:new(?STATE, [named_table, public, set]),
     ?TIMERS = ets:new(?TIMERS, [named_table, public, ordered_set]),
     ?REFS = ets:new(?REFS, [named_table, public, set]),
+    ?STRAYS = ets:new(?STRAYS, [named_table, public, set]),
     StartMs = maps:get(start_ms, Opts, 0),
     Seed = maps:get(seed, Opts, 0),
     ets:insert(?STATE, [
@@ -173,7 +181,7 @@ stop() ->
                 error:badarg -> ok
             end
         end,
-        [?STATE, ?TIMERS, ?REFS]
+        [?STATE, ?TIMERS, ?REFS, ?STRAYS]
     ),
     ok.
 
@@ -464,9 +472,59 @@ roll_uniform(N) ->
 -endif.
 -spec next_deadline() -> integer() | infinity.
 next_deadline() ->
-    case ets:first(?TIMERS) of
-        '$end_of_table' -> infinity;
-        {Deadline, _Seq} -> Deadline
+    next_deadline(fun(_Dest) -> true end).
+
+-if(?DOCATTRS).
+-doc """
+The earliest pending deadline whose destination `Schedulable` accepts.
+
+Timers it rejects are stepped over and **left in the wheel**. They no longer
+decide *when* the clock moves, but if it reaches them for some other reason they
+still fire. See `advance_to_next/1` for why that distinction matters.
+""".
+-endif.
+-spec next_deadline(fun((pid() | atom()) -> boolean())) -> integer() | infinity.
+next_deadline(Schedulable) ->
+    scan(ets:first(?TIMERS), Schedulable).
+
+scan('$end_of_table', _Schedulable) ->
+    infinity;
+scan(Key = {Deadline, _Seq}, Schedulable) ->
+    case ets:lookup(?TIMERS, Key) of
+        [{Key, Ref, Dest, _Msg, _Kind, _Drop}] ->
+            case Schedulable(Dest) of
+                true ->
+                    Deadline;
+                false ->
+                    %% This deadline would have moved the clock on behalf of a
+                    %% process that cannot take a step. Record it once and keep
+                    %% looking; `strays/0` is what reports it.
+                    _ = ets:insert(?STRAYS, {Ref}),
+                    scan(ets:next(?TIMERS, Key), Schedulable)
+            end;
+        [] ->
+            scan(ets:next(?TIMERS, Key), Schedulable)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+How many distinct timers the clock has refused to advance to — see
+`advance_to_next/1`.
+
+Counted at the moment one is stepped over rather than by scanning what is still
+pending, because a stray is usually gone by the end: some other timer advances
+the clock past it and `fire_due/1` delivers it on the way. The damage is done
+when it is *considered*, not when it fires.
+
+`dst_run` reports this as `stray_timers`, and `audit/1` treats a non-zero count
+as a system holding a timer the scheduler does not own.
+""".
+-endif.
+-spec strays() -> non_neg_integer().
+strays() ->
+    case ets:info(?STRAYS, size) of
+        undefined -> 0;
+        N -> N
     end.
 
 -if(?DOCATTRS).
@@ -481,7 +539,37 @@ idle callback.
 -endif.
 -spec advance_to_next() -> boolean().
 advance_to_next() ->
-    case next_deadline() of
+    advance_to_next(fun(_Dest) -> true end).
+
+-if(?DOCATTRS).
+-doc """
+Advances to the earliest deadline whose destination `Schedulable` accepts.
+
+**A timer is owned by a process, and the scheduler is not obliged to own that
+process.** A deadline belonging to one it does not own cannot make anything
+runnable, so advancing to it moves the clock and records an entry on behalf of
+something that can never take a step. Two runs of one seed then differ by an
+inserted `{clock, Ms}` with no step behind it, which is a schedule decided by
+something other than the seed.
+
+There are 2 ordinary ways to get such a timer. A process killed while blocked in
+a rewritten `receive ... after` never reaches the clause head that disarms it, so
+its deadline outlives it. And a process spawned before the scheduler existed —
+anything a system starts during `init/2` — is outside the schedule by
+construction.
+
+Rejected timers are **skipped, not cancelled**. Cancelling would silently
+disarm a live process's timer, and the goal is only that a stray stops deciding
+when the clock moves. If time passes far enough for another reason, `fire_due/1`
+delivers it as before.
+
+`advance_to_next/0` accepts everything, which is what you want when driving the
+clock by hand with no scheduler to ask.
+""".
+-endif.
+-spec advance_to_next(fun((pid() | atom()) -> boolean())) -> boolean().
+advance_to_next(Schedulable) ->
+    case next_deadline(Schedulable) of
         infinity ->
             false;
         Deadline ->
@@ -565,7 +653,8 @@ stats() ->
         now_ms => now_ms(),
         pending => pending(),
         fired => fired_count(),
-        dropped => ets:lookup_element(?STATE, dropped, 2)
+        dropped => ets:lookup_element(?STATE, dropped, 2),
+        strays => strays()
     }.
 
 -spec fired_count() -> non_neg_integer().

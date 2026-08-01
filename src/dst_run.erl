@@ -90,6 +90,9 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
     %% Modules that were loaded *while the run was in progress*. Should be
     %% empty. See `run/2`.
     modules_loaded := [module()],
+    %% Timers the clock refused to advance to because nothing schedulable owned
+    %% them. Should be 0. See `dst_time:advance_to_next/1`.
+    stray_timers := non_neg_integer(),
     sched := #{atom() => non_neg_integer()}
 }.
 
@@ -176,6 +179,13 @@ Options, all with defaults:
   next. Loading your application up front warms all of it.
 
 ## Fields that mean the run was not deterministic
+
+`stray_timers` counts timers held by a process the scheduler does not own, or
+that has died. A deadline like that cannot make anything runnable, so advancing
+to it would move the clock on behalf of something that can never take a step. The
+driver steps over them, and reports how many it found — a non-zero count means
+your system holds a timer outside the schedule, usually from a process spawned in
+`init/2` or one killed while blocked in a `receive ... after`.
 
 `sched.adopted_late` counts processes that ran before the scheduler owned them,
 and `sched.timeouts` counts steps that ended without the process reaching a
@@ -357,11 +367,12 @@ simulation suite after the determinism gate itself.
 """.
 -endif.
 -spec audit(result()) -> ok | {suspect, [{atom(), term()}]}.
-audit(#{modules_loaded := Modules, sched := Sched}) ->
+audit(Result = #{modules_loaded := Modules, sched := Sched}) ->
     Checks = [
         {modules_loaded, Modules, []},
         {adopted_late, maps:get(adopted_late, Sched, 0), 0},
-        {timeouts, maps:get(timeouts, Sched, 0), 0}
+        {timeouts, maps:get(timeouts, Sched, 0), 0},
+        {stray_timers, maps:get(stray_timers, Result, 0), 0}
     ],
     case [{What, Found} || {What, Found, Clean} <- Checks, Found =/= Clean] of
         [] -> ok;
@@ -653,7 +664,7 @@ roll(R = #r{rand = Rand}) ->
 %% original trace to classify it, got a clean run, and reported "nothing to shrink"
 %% for a failure that had just happened.
 idle(R = #r{ops_left = OpsLeft, trace = Trace}) ->
-    case dst_time:advance_to_next() of
+    case dst_time:advance_to_next(schedulable(R#r.sched)) of
         true ->
             Now = dst_time:now_ms(),
             _ = dst_log:log({clock, Now}),
@@ -744,7 +755,10 @@ replay_loop(R, [{op, Op} | Rest]) ->
 %% reason it skips an unrunnable step — a shrink candidate has had entries removed,
 %% so its wheel is legitimately not the original's.
 replay_loop(R = #r{lenient = Lenient, skipped = Skipped, trace = Trace}, [{clock, Ms} | Rest]) ->
-    case dst_time:advance_to_next() of
+    %% The same schedulability rule `idle/1` used to record the entry. Replaying
+    %% under a laxer one would advance to a deadline the generating run stepped
+    %% over, so a trace from a system carrying a stray timer would not replay.
+    case dst_time:advance_to_next(schedulable(R#r.sched)) of
         true ->
             Now = dst_time:now_ms(),
             case Lenient orelse Now =:= Ms of
@@ -844,6 +858,7 @@ finish(Outcome, R) ->
     #r{mod = Mod, sut = Sut, sched = Sched, trace = Trace} = R,
     Stats = dst_sched:stats(Sched),
     ClockMs = dst_time:now_ms(),
+    Strays = dst_time:strays(),
     %% Before `release/1` and `terminate/1`, so that teardown's own loading is
     %% not blamed on the run.
     Modules = loaded_since(R#r.loaded),
@@ -870,5 +885,24 @@ finish(Outcome, R) ->
         clock_ms => ClockMs,
         skipped => R#r.skipped,
         modules_loaded => Modules,
+        stray_timers => Strays,
         sched => Stats
     }.
+
+%% Whether a deadline addressed to `Dest` can produce a scheduling event.
+%%
+%% Two conditions, and both are load-bearing. The process has to be one the
+%% scheduler owns, because a deadline for anything else moves the clock on behalf
+%% of something that can never take a step. And it has to be **alive**, because
+%% `dst_sched:procs/1` deliberately remembers processes that have exited so that a
+%% trace can name one — a dead owner's timer is exactly the stray this guards
+%% against, not a reason to advance.
+schedulable(Sched) ->
+    Owned = maps:from_keys(maps:values(dst_sched:procs(Sched)), []),
+    fun(Dest) -> is_map_key(resolve_dest(Dest), Owned) andalso alive(Dest) end.
+
+resolve_dest(Pid) when is_pid(Pid) -> Pid;
+resolve_dest(Name) when is_atom(Name) -> whereis(Name).
+
+alive(Pid) when is_pid(Pid) -> is_process_alive(Pid);
+alive(Name) when is_atom(Name) -> whereis(Name) =/= undefined.

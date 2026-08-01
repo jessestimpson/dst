@@ -10,13 +10,18 @@ defmodule DstStrayTest do
       B: step: 5, step: 8, clock: 6500, clock: 8000, step: 7, step: 4
 
   `dst_stray` reproduces that shape in eighty lines. See its moduledoc for the
-  mechanism; this file states what it costs.
+  mechanism.
+
+  **This was a real defect and it is fixed.** The driver now advances only to a
+  deadline belonging to a process the scheduler owns and that is still alive; see
+  `dst_time:advance_to_next/1`. These tests were written against the broken
+  library and asserted the damage, so what they assert now is its absence. The
+  reproduction itself is unchanged, which is the point — it still constructs a
+  stray timer both ways, and the run no longer cares.
 
   The reproduction is deliberately **not** a flaky test. In the system it came
   from, whether the stray existed was decided by a real-scheduler race during
-  startup, which is what made it take a day to find. Here it is a config key. That
-  makes the same claim — a run's schedule depends on something that is not the
-  seed — while failing the same way every time.
+  startup, which is what made it take a day to find. Here it is a config key.
   """
   use ExUnit.Case, async: false
 
@@ -43,9 +48,10 @@ defmodule DstStrayTest do
       assert r.outcome == :ok
       assert :dst_run.audit(r) == :ok
       assert r.ops == 12
+      assert r.stray_timers == 0
 
       # Non-vacuity for everything below: the driver has to be advancing the clock
-      # routinely, or an extra advance would not be hiding among anything.
+      # routinely, or an extra advance would not have been hiding among anything.
       period = :dst_stray.heartbeat()
       assert length(clocks(r.trace)) > 10
       assert Enum.all?(clocks(r.trace), &(rem(&1, period) == 0))
@@ -57,70 +63,54 @@ defmodule DstStrayTest do
     describe "a #{mode} process's timer" do
       @mode mode
 
-      test "diverges the schedule of a run with the same seed" do
+      test "does not change the schedule of a run with the same seed" do
         clean = run(1, :none)
         strayed = run(1, @mode)
 
-        refute clean.trace == strayed.trace,
-               "the stray made no difference, so this no longer reproduces anything"
+        # What the defect cost: these were equal for hundreds of entries and then
+        # differed by one inserted advance. A seed has to name the whole
+        # execution, and a timer nobody owns is not part of the seed.
+        assert clean.trace == strayed.trace
       end
 
-      test "stays invisible until it becomes the earliest deadline" do
+      test "never becomes the deadline the clock advances to" do
+        strayed = run(1, @mode)
+
+        refute {:clock, @deadline} in strayed.trace,
+               "the clock advanced to a deadline whose owner can never take a step"
+      end
+
+      test "leaves the clock advances identical to the clean run" do
         clean = run(1, :none)
         strayed = run(1, @mode)
 
-        prefix = Enum.find_index(Enum.zip(clean.trace, strayed.trace), fn {a, b} -> a != b end)
-
-        # The property that made the original expensive. A stray deadline changes
-        # nothing while some other timer is due sooner, so the two runs agree for
-        # a long time and then stop — which reads like a bug in whatever the system
-        # happened to be doing at that entry, and is not.
-        assert prefix > 20,
-               "diverged at entry #{prefix}; the stray should sit in the wheel doing " <>
-                 "nothing until the clock reaches it"
+        assert clocks(strayed.trace) == clocks(clean.trace)
       end
 
-      test "inserts exactly one advance and changes nothing else" do
-        clean = run(1, :none)
+      test "does not stop the clock from passing it" do
+        # Skipped, not cancelled. The stray sits at 2500 and the heartbeats carry
+        # the clock over it. Refusing to advance *to* a deadline must not turn
+        # into refusing to advance *past* it, or a stray would freeze the run.
         strayed = run(1, @mode)
 
-        assert clocks(strayed.trace) -- clocks(clean.trace) == [@deadline]
-
-        # The whole defect in one line: the strayed run *is* the clean run with a
-        # single entry inserted. Nothing the system computed differed. Both traces
-        # are truncated at the step budget, so the comparison runs to the shorter.
-        deleted = List.delete(strayed.trace, {:clock, @deadline})
-        n = min(length(deleted), length(clean.trace))
-
-        assert Enum.take(deleted, n) == Enum.take(clean.trace, n)
+        assert Enum.max(clocks(strayed.trace)) > @deadline
       end
 
-      test "advances time on behalf of a process that can never take a step" do
-        strayed = run(1, @mode)
-        i = Enum.find_index(strayed.trace, &(&1 == {:clock, @deadline}))
-
-        # Every `{step, _}` names a process the scheduler owns. The stray is not
-        # one — dead in one mode, never adopted in the other — so nothing can
-        # follow its deadline. An advance that makes nothing runnable is the
-        # signature to recognise in a real trace.
-        refute match?({:step, _}, Enum.at(strayed.trace, i + 1)),
-               "something took a step after the stray fired: " <>
-                 inspect(Enum.slice(strayed.trace, i..(i + 2)))
-      end
-
-      test "is invisible to audit/1" do
+      test "is reported by audit/1" do
         strayed = run(1, @mode)
 
-        # `audit/1` is the framework's own statement that a run was deterministic,
-        # and it is the right thing to assert in a suite. It checks late adoption,
-        # module loads and scheduler timeouts — every one of them a property of the
-        # *schedule*. A timer nobody owns is none of those.
-        #
-        # If this test ever fails, the library grew a check for this and the news
-        # is good: delete the test.
-        assert :dst_run.audit(strayed) == :ok
+        # The framework's own statement that a run was deterministic. It used to
+        # check only properties of the *schedule* — late adoption, module loads,
+        # scheduler timeouts — and a timer nobody owns is none of those.
+        assert strayed.stray_timers >= 1
+        assert {:suspect, suspect} = :dst_run.audit(strayed)
+        assert {:stray_timers, strayed.stray_timers} in suspect
+
+        # And nothing else is wrong with the run, which is what made this so hard
+        # to see: every other signal is clean.
         assert strayed.sched.adopted_late == 0
         assert strayed.modules_loaded == []
+        assert strayed.outcome == :ok
       end
 
       test "produces a trace that replays strictly against itself" do
@@ -133,9 +123,9 @@ defmodule DstStrayTest do
             Map.merge(@opts, %{seed: 1, config: %{stray: @mode}})
           )
 
-        # Self-consistent, which is the last reason this survives: there is no
-        # check the framework performs that a strayed run fails. It is only wrong
-        # relative to a run whose wheel was different, and nothing compares those.
+        # Replay has to apply the same schedulability rule the run did. Under a
+        # laxer one it would advance to a deadline the run stepped over and report
+        # `{:clock_diverged, 3000, 2500}` against a trace that is perfectly good.
         assert replayed.outcome == :ok
         assert replayed.skipped == 0
         assert replayed.trace == strayed.trace
