@@ -25,7 +25,7 @@ couple of microseconds, regardless of mailbox depth.
 -ifdef(DST).
 -compile({parse_transform, dst_transform}).
 -endif.
--dst_observe([leader, epoch]).
+-dst_observe({state, [leader, epoch]}).
 ```
 
 ```erlang
@@ -56,10 +56,23 @@ attribute itself is inert — an ordinary module attribute the compiler ignores.
 
 ## What to declare
 
-`-dst_observe(all)` publishes the whole state record, which costs nothing to write
-but makes every `read/1` copy the entire state to the reader. Naming fields is
-usually better: `read/1` is called after every step of a simulation, and a state
-holding an inverted index or a queue is not something to copy thousands of times.
+Two forms, and neither guesses.
+
+`{RecordName, Fields}` publishes those fields of that record as a map. **Name the
+record.** It is not inferred, so a state record called `#st{}` works the same as
+one called `#state{}`, and a field that does not exist is a compile error rather
+than a silently wrong `element/2` offset. This is the form to prefer.
+
+`all` publishes whatever the callback returned, whatever its shape, including a
+map or a bare term. It costs nothing to write and makes every `read/1` copy the
+entire state to the reader, which is usually the wrong trade: `read/1` is called
+after every step of a simulation, and a state holding an inverted index or a
+queue is not something to copy thousands of times.
+
+There used to be a third form, a bare field list, which meant "these fields of
+`#state{}`". It is gone. A module whose record was named anything else failed at
+compile time complaining about a record it had never declared, and a reader had
+to know the convention to see why.
 """.
 -endif.
 

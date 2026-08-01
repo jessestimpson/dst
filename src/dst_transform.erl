@@ -20,9 +20,9 @@ controlled by attributes rather than by naming another transform:
 2. **Receive timeouts** — puts `receive ... after T` on the virtual clock.
    Applied unless the module declares `-dst_after(false)`; see below.
 3. **State observability** — applied only to a module declaring
-   `-dst_observe(...)`, which republishes the named state fields on every
-   `gen_server` callback return so a simulation can read them while the process
-   is suspended. See `dst_observe`.
+   `-dst_observe(all)` or `-dst_observe({Record, Fields})`, which republishes the
+   state on every `gen_server` callback return so a simulation can read it while
+   the process is suspended. See `dst_observe`.
 
 They live here rather than in modules of their own for a build reason, and it is
 worth recording because it cost a broken CI run to find. **Mix does not reliably
@@ -389,13 +389,23 @@ field_name({record_field, _, {atom, _, Name}}) -> Name;
 field_name({record_field, _, {atom, _, Name}, _Default}) -> Name;
 field_name({typed_record_field, Inner, _Type}) -> field_name(Inner).
 
-%% `all`, a field list (assuming `#state{}`), or an explicit `{Record, Fields}`.
+%% Two forms, and neither of them guesses a record name.
+%%
+%% `all` publishes whatever state the callback returned, whatever its shape.
+%% `{Record, Fields}` publishes named fields, and is guarded on the record tag so
+%% a callback returning something else publishes nothing rather than a wrong
+%% `element/2` offset.
+%%
+%% There used to be a third form, a bare field list, which assumed the record was
+%% called `state`. It is gone: a module whose record is `#st{}` got a compile
+%% error naming a record it had never declared, and the reader has to know the
+%% convention to understand why.
 resolve(all, _Records) ->
-    {state, all};
+    {any, all};
 resolve({Record, Fields}, Records) when is_atom(Record), is_list(Fields) ->
     {Record, positions(Record, Fields, Records)};
-resolve(Fields, Records) when is_list(Fields) ->
-    {state, positions(state, Fields, Records)}.
+resolve(Spec, _Records) ->
+    error({dst_observe, {bad_spec, Spec, "expected all or {RecordName, [Field]}"}}).
 
 positions(Record, Fields, Records) ->
     Declared =
@@ -480,8 +490,20 @@ publish_fun(Anno) ->
     ],
     {function, Anno, ?PUBLISH_FUN, 1, [{clause, Anno, [Ret], [], Body}]}.
 
-%% '$dst_observe_put'(S) when is_record(S, Record) -> put(Key, Observed), ok;
-%% '$dst_observe_put'(_) -> ok.
+%% For `all`, one unguarded clause:
+%%
+%%     '$dst_observe_put'(S) -> put(Key, S), ok.
+%%
+%% For named fields, guarded on the record tag, with a fallback that publishes
+%% nothing:
+%%
+%%     '$dst_observe_put'(S) when element(1, S) =:= Record -> put(Key, #{...}), ok;
+%%     '$dst_observe_put'(_) -> ok.
+put_fun(Anno, _Record, all) ->
+    S = {var, Anno, 'S'},
+    {function, Anno, ?PUT_FUN, 1, [
+        {clause, Anno, [S], [], [put_call(Anno, S), {atom, Anno, ok}]}
+    ]};
 put_fun(Anno, Record, Fields) ->
     S = {var, Anno, 'S'},
     Guard = [
@@ -492,21 +514,17 @@ put_fun(Anno, Record, Fields) ->
         ]
     ],
     Observed =
-        case Fields of
-            all ->
-                S;
-            _ ->
-                {map, Anno, [
-                    {map_field_assoc, Anno, {atom, Anno, F},
-                        {call, Anno, {atom, Anno, element}, [{integer, Anno, N}, S]}}
-                 || {F, N} <- Fields
-                ]}
-        end,
-    Put =
-        {call, Anno, {remote, Anno, {atom, Anno, erlang}, {atom, Anno, put}}, [
-            {atom, Anno, dst_observe:key()}, Observed
+        {map, Anno, [
+            {map_field_assoc, Anno, {atom, Anno, F},
+                {call, Anno, {atom, Anno, element}, [{integer, Anno, N}, S]}}
+         || {F, N} <- Fields
         ]},
     {function, Anno, ?PUT_FUN, 1, [
-        {clause, Anno, [S], Guard, [Put, {atom, Anno, ok}]},
+        {clause, Anno, [S], Guard, [put_call(Anno, Observed), {atom, Anno, ok}]},
         {clause, Anno, [{var, Anno, '_'}], [], [{atom, Anno, ok}]}
+    ]}.
+
+put_call(Anno, Term) ->
+    {call, Anno, {remote, Anno, {atom, Anno, erlang}, {atom, Anno, put}}, [
+        {atom, Anno, dst_observe:key()}, Term
     ]}.

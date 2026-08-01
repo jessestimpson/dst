@@ -1,17 +1,20 @@
 # A worked example: two-phase commit
 
 `dst` ships with a small two-phase commit implementation as an example system
-under test. It lives in `test/support/dst_2pc*.erl`, it's about 170 lines of
-protocol plus 150 lines of harness, and it has a bug planted in it that only an
-unlucky interleaving reveals. This page walks through the whole thing.
+under test. It lives in `test/support/dst_2pc*.erl`: about 170 lines of protocol
+plus 150 of harness, with a bug planted in it that only an unlucky interleaving
+reveals.
+
+This page reads that example. If you'd rather build something from scratch,
+[A Journey Through DST](06-a-journey-through-dst.md) does that instead.
 
 ## The protocol
 
 A coordinator wants a group of participants to agree on a transaction. It asks
 each one to *prepare*, and each votes `yes` or `no`. If every vote is `yes` the
-coordinator decides `commit`, otherwise `abort`, and it tells everyone the
-decision. The property that has to hold is **atomicity**: no 2 participants may
-reach opposite conclusions about the same transaction.
+coordinator decides `commit`, otherwise `abort`, and it tells everyone. The
+property that has to hold is **atomicity**: no 2 participants may reach opposite
+conclusions about the same transaction.
 
 3 processes vote, 1 decides, and a client waits for the answer.
 
@@ -32,36 +35,29 @@ handle_cast({prepare, TxId, Coordinator}, St = #{tab := Tab, index := Index}) ->
     end;
 ```
 
-A participant's *plan*, meaning what it will vote for a given transaction,
-isn't decided by the participant. The driver writes it into a shared ETS table
-before the transaction starts and the participant looks it up. That makes the
-workload part of the seeded, replayable state rather than something each
-process invents for itself.
+A participant's *plan*, meaning what it will vote for a given transaction, isn't
+decided by the participant. The driver writes it into a shared ETS table before
+the transaction starts and the participant looks it up, which makes the workload
+part of the seeded, replayable state rather than something each process invents
+for itself.
 
 `stall` means the participant never votes. That case exists to put the virtual
-clock on the critical path of a run. With one participant silent, the only
-thing that can resolve the transaction is the coordinator's prepare timeout.
+clock on the critical path: with one participant silent, the only thing that can
+resolve the transaction is the coordinator's prepare timeout.
 
-Everything the participant decides also goes into that shared table rather than
-into its `gen_server` state, because the atomicity invariant has to read it
-while every one of these processes is suspended.
-
-`dst_observe` would also make that state readable, and choosing between the two
-comes up on every system. The table wins here because the driver has to write
-plans into it before each transaction anyway. Once it exists, recording
-outcomes in the same place costs nothing and gives the invariant one thing to
-read. `dst_observe` is the better tool when what you need is a process's
-*current* state, like who it believes the leader is or what epoch it's on, and
-there's no natural place that already lives. It republishes named fields on
-every callback return and `read/1` copies whatever was published, so an
-accumulating history of every transaction is the wrong shape for it. Our rule
-of thumb: if the system already keeps the state somewhere readable, read it
-there. If the state exists only inside a process, publish it.
+Everything the participant decides also goes into that table rather than into
+its `gen_server` state, because the atomicity invariant has to read it while
+every one of these processes is suspended. `dst_observe` would also make that
+readable, and choosing between the 2 comes up on every system. Our rule of
+thumb: **if the system already keeps the state somewhere readable, read it
+there. If the state exists only inside a process, publish it.** The table wins
+here because the driver has to write plans into it anyway, and because an
+accumulating history is the wrong shape for `dst_observe`, which publishes a
+snapshot of current fields.
 
 ## The coordinator, and the timer
 
-The coordinator is where the header is needed, for exactly one line, the
-timer:
+The coordinator is where the header is needed, for exactly one line:
 
 ```erlang
 -include_lib("dst/include/dst.hrl").
@@ -76,9 +72,9 @@ handle_call({run_tx, TxId}, From, St) ->
     ...
 ```
 
-Including `dst.hrl` is the whole opt-in. Under a simulation build it brings the
-parse transform, so that `erlang:send_after/3` becomes `dst_time:send_after/3`;
-under a release build it brings nothing and the line ships as written.
+Under a simulation build the header brings the parse transform, so that
+`erlang:send_after/3` becomes `dst_time:send_after/3`. Under a release build it
+brings nothing and the line ships as written.
 
 30 seconds is long enough that the timeout never fires by accident and short
 enough to be interesting, and it costs nothing because it's virtual. When every
@@ -100,12 +96,11 @@ on_vote(TxId, _Index, Vote, _Tx, St = #{mode := first_vote_wins}) ->
     {noreply, decide(TxId, Decision, St)};
 ```
 
-Most of the time this behaves correctly. If a `no` happens to arrive first the
-transaction aborts, everybody agrees, and nothing looks wrong. If every vote is
-`yes` the transaction commits, and again nothing looks wrong. The defect is
-visible only when a `yes` wins the race and a `no` arrives afterwards, and even
-then only because a participant that voted `no` refuses to commit regardless of
-what it's told:
+Most of the time this behaves correctly. If a `no` arrives first the transaction
+aborts. If every vote is `yes` it commits. Either way everybody agrees. The
+defect is visible only when a `yes` wins the race and a `no` arrives afterwards,
+and even then only because a participant that voted `no` refuses to commit
+regardless of what it's told:
 
 ```erlang
 Final =
@@ -121,14 +116,14 @@ Without it the coordinator would be quietly wrong and every participant would
 agree with it, which is a nastier class of bug and one this example doesn't try
 to model.
 
-So reaching the defect requires at least one `no` vote in a transaction, plus a
+So reaching the defect needs at least one `no` vote in a transaction, plus a
 schedule in which a `yes`-voting participant is stepped before the `no`-voting
-one. The workload generator draws `no` about a fifth of the time per
-participant. The rest is the scheduler's job.
+one. The generator draws `no` about a fifth of the time per participant. The
+rest is the scheduler's job.
 
 ## The harness
 
-6 required callbacks, `init/2` through `terminate/1`, and one optional one.
+6 required callbacks, `init/2` through `terminate/1`, and one optional.
 
 ### init/2
 
@@ -145,15 +140,15 @@ init(Seed, Config) ->
            clients => [], next_tx => 1, plan => maps:get(plan, Config, random)}}.
 ```
 
-The table is `public` because 3 different kinds of process touch it. The driver
-writes plans into it, the participants write their states, and the invariant
-reads all of it.
+The table is `public` because 3 different kinds of process touch it: the driver
+writes plans, the participants write their states, and the invariant reads all
+of it.
 
-`init/2` has to return with the system quiescent. Not merely started, and not
-merely ready, but idle. Anything still in flight when the driver takes over ran
-on the real scheduler, outside the schedule. For two-phase commit that's free,
-since `start_link` returns once `init/1` has run. For a real cluster it isn't,
-and [page 4](04-writing-a-system-under-test.md) covers what it takes.
+**`init/2` has to return with the system quiescent.** Not merely started, and
+not merely ready, but idle. Anything still in flight when the driver takes over
+ran on the real scheduler, outside the schedule. For two-phase commit that's
+free, since `start_link` returns once `init/1` has run. For a real cluster it
+isn't, and [page 4](04-writing-a-system-under-test.md) covers what it takes.
 
 ### processes/1
 
@@ -163,13 +158,13 @@ processes(#{coordinator := C, participants := Ps, clients := Clients}) ->
 ```
 
 The driver consults this after every operation, so processes an operation
-creates get picked up. Pids it already knows are ignored, which means returning
-the whole set every time is both correct and expected.
+creates get picked up. Pids it already knows are ignored, so returning the whole
+set every time is both correct and expected.
 
-The order this list comes back in is part of the contract. `dst_sched` assigns
-ids in registration order and the trace records ids, so a list that comes out
-differently between runs makes the same seed pick different processes. The
-resulting trace difference looks exactly like a scheduling bug.
+**The order is part of the contract.** `dst_sched` assigns ids in registration
+order and the trace records ids, so a list that comes out differently between
+runs makes the same seed pick different processes. The resulting trace
+difference looks exactly like a scheduling bug.
 
 ### generate/2
 
@@ -215,19 +210,18 @@ execute({run_tx, TxId, Plan}, Sut = #{tab := Tab, coordinator := Coordinator}) -
     Sut#{clients := [Client | maps:get(clients, Sut)], next_tx := TxId + 1}.
 ```
 
-`execute/2` must not block. Every process the scheduler owns is suspended, so a
-synchronous call from the driver into one of them is never answered and the
-driver sits there until something times out. Operations are issued by spawning
-a process to perform them. That process is picked up by the next `processes/1`
-call and interleaved like everything else, which is the right model anyway,
-since the client is part of the concurrent system.
+**`execute/2` must not block.** Every process the scheduler owns is suspended,
+so a synchronous call from the driver into one of them is never answered.
+Operations are issued by spawning a process to perform them, which is the right
+model anyway: the client is part of the concurrent system, and the next
+`processes/1` call picks it up and interleaves it like everything else.
 
 The spawn goes through `dst_run:spawn_op/1` rather than `spawn/1`. The driver
-isn't traced, so a process it creates isn't adopted by the scheduler until the
-driver registers it, and in that window the new process runs free. 2 clients
-created by operations injected close together will race each other to the
-coordinator's mailbox, and the order they arrive in is decided by wall clock.
-`spawn_op/1` parks the process on a handshake until registration is done.
+isn't traced, so a process it creates isn't adopted until the driver registers
+it, and in that window the new process runs free. 2 clients created by
+operations injected close together race each other to the coordinator's mailbox,
+and the order they arrive in is decided by wall clock. `spawn_op/1` parks the
+process on a handshake until registration is done.
 
 Note `infinity` on the call. A client under simulation should never be waiting
 on the real clock.
@@ -253,15 +247,15 @@ first_violation([TxId | Rest], Tab) ->
 
 Nothing in there sends a message or waits for anything. It's an `ets:tab2list`
 and some list operations. An invariant that calls into a suspended process
-either hangs or, worse, receives a plausible answer from an API that swallowed
-its own timeout and then passes while checking nothing.
+either hangs or, worse, gets a plausible answer from an API that swallowed its
+own timeout, and then passes while checking nothing.
 
-The violation carries a `property` key. `dst_shrink` uses it to tell "the same
+**Give the violation a `property` key.** `dst_shrink` uses it to tell "the same
 failure" from "a different failure that also happens to be a failure". Without
 it, a shrinker with more than one invariant to choose from will reduce one bug
 into another and report the result as progress.
 
-### labels/1, the optional one, for the processes that can't speak for themselves
+### labels/1, the optional one
 
 ```erlang
 labels(#{coordinator := C, participants := Ps, clients := Clients}) ->
@@ -272,32 +266,23 @@ labels(#{coordinator := C, participants := Ps, clients := Clients}) ->
     ).
 ```
 
-Without a name a step reads `p3`; with one, `participant-2`.
+Without a name a step reads `p3`; with one, `participant-2`. Names are ordinary
+terms; `dst_log` renders `{participant, 2}` as `participant-2`.
 
 Note what's doing the work here and what isn't. The coordinator and the
-participants call `?DST_LABEL` in their own `init/1`, so **this callback isn't
-what names them** — a self-reported label wins, precisely so a process's step
-lines can't disagree with the events underneath them. They appear here only
-because listing them costs nothing.
+participants call `?DST_LABEL` in their own `init/1`, and a self-reported label
+wins, so this callback isn't what names them.
 
-The clients are the reason the callback exists. They're anonymous funs handed to
+**The clients are the reason it exists.** They're anonymous funs handed to
 `dst_run:spawn_op/1`, with no module to put a `?DST_LABEL` in, so the harness is
-the only thing that knows one of them is transaction 3. That's the general shape:
-**reach for `labels/1` when the process can't name itself** — something from a
-library you don't own, or a module you deliberately kept `dst.hrl` out of.
+the only thing that knows one of them is transaction 3. That's the general
+shape: reach for `labels/1` when the process can't name itself, whether it's a
+fun like this, something from a library you don't own, or a module you
+deliberately kept `dst.hrl` out of.
 
-Called **once**, after the run, which is why it takes the whole state rather
-than one pid at a time. A harness already holds its processes in lists and maps,
-so building this forwards is a comprehension; answering "what is this pid
-called" one at a time means writing reverse lookups you would otherwise never
-need. Ids are handed out as processes register, so the mapping cannot exist
-before the run is over.
-
-Name what you care about and leave the rest out. Names are ordinary terms:
-`dst_log` renders `{participant, 2}` as `participant-2`.
-
-Six lines that decide whether a failure report is readable. See the section
-below.
+It's called once, after the run, which is why it takes the whole state rather
+than one pid at a time. Ids are handed out as processes register, so the mapping
+can't exist before the run is over.
 
 ### terminate/1
 
@@ -310,10 +295,10 @@ terminate(Sut = #{coordinator := C, participants := Ps, tab := Tab}) ->
     ok.
 ```
 
-Clients first, and by killing rather than asking. By the time `terminate/1`
-runs the driver has released the scheduler, so anything still in flight is
-running again, and a client that reaches its `ets:insert` after the table has
-been deleted crashes with a `badarg` that has nothing to do with the run.
+Clients first, and by killing rather than asking. By the time `terminate/1` runs
+the driver has released the scheduler, so anything still in flight is running
+again, and a client that reaches its `ets:insert` after the table has been
+deleted crashes with a `badarg` that has nothing to do with the run.
 
 ## Running it
 
@@ -333,7 +318,7 @@ dst_run:run(dst_2pc, #{seed => 1, max_ops => 25, max_steps => 20000,
                        config => #{mode => first_vote_wins}}).
 ```
 
-and seed 1 fails after 19 steps:
+Seed 1 fails after 19 steps:
 
 ```erlang
 #{outcome := {violation, #{property := atomicity,
@@ -347,16 +332,16 @@ and seed 1 fails after 19 steps:
 
 Participant 1 voted `no` and refused to commit. Participant 3 committed. The
 coordinator had already decided `commit` on participant 2's `yes`, which is why
-participant 2 is still at `{prepared, yes}`; the decision hasn't reached it
-yet. The run stopped after 7 of its 25 operations, because `dst_run` ends on
-the first violation.
+participant 2 is still at `{prepared, yes}`; the decision hasn't reached it yet.
+The run stopped after 7 of its 25 operations, because `dst_run` ends on the
+first violation.
 
 ## Making the failure readable
 
-The trace is the list of everything the driver did, in order: `{step, Id}`,
-`{op, Op}` and `{clock, Ms}` entries. For this failure it's 26 of them, which
-is small only because the failure happened early. On a larger system a first
-trace runs to 1000s.
+The trace is everything the driver did, in order: `{step, Id}`, `{op, Op}` and
+`{clock, Ms}` entries. For this failure it's 26 of them, which is small only
+because the failure happened early. On a larger system a first trace runs to
+1000s.
 
 ```erlang
 #{outcome := {violation, _}, trace := Trace} =
@@ -366,8 +351,7 @@ trace runs to 1000s.
     dst_shrink:shrink(dst_2pc, Trace, Opts).
 ```
 
-26 entries down to 8, in 142 candidate replays and 24 msec. Here's the whole
-result:
+26 entries down to 8, in 142 candidate replays and 24 msec:
 
 ```erlang
 [{op,   {run_tx, 2, [{1, yes}, {2, yes}, {3, yes}]}},
@@ -380,11 +364,11 @@ result:
  {step, 1}]
 ```
 
-If that means little to you, that's the right reaction. **A trace is a
-scheduler artifact, not an explanation.** `{step, 5}` records which process the
-scheduler chose and says nothing about what that process did, and the ids are
-anonymous positions assigned in registration order. Turning one into a story
-means reconstructing every mailbox state by hand.
+If that means little to you, that's the right reaction. **A trace is a scheduler
+artifact, not an explanation.** `{step, 5}` records which process the scheduler
+chose and says nothing about what that process did, and the ids are anonymous
+positions assigned in registration order. Turning one into a story means
+reconstructing every mailbox state by hand.
 
 What shrinking gives you is a trace short enough to be worth narrating.
 `dst_log` is what narrates it.
@@ -411,38 +395,32 @@ Line 42 is the bug: the coordinator decided on one vote. Line 53 is the `no`
 arriving too late, and line 55 is the participant refusing, which is what makes
 the disagreement visible.
 
-The names come from `labels/1`. Without it those rows read `p0` and `p2`, and
-the events come from `?DST_LOG` calls in the participant and coordinator —
-about one per protocol decision. `dst_log:analyze(#{until => N})` stops the
-output where the story does, which matters because everything after the run
-proper is the scheduler releasing the system during teardown.
+The events come from `?DST_LOG` calls in the participant and coordinator, about
+one per protocol decision. `dst_log:analyze(#{until => N})` stops the output
+where the story does, which matters because everything after the run proper is
+the scheduler releasing the system during teardown.
 
 ### What the shrinker couldn't remove
 
-Transaction 2 contributes nothing, and its survival illustrates the shrinker's
-one real limitation. Step ids are positional, so removing that leading
-operation renumbers every process created after it, the surviving `{step, Id}`
-entries stop naming what they named, the candidate runs clean, and the removal
-is reverted as unsafe. The trace is still a genuine reproduction. It's the
+Transaction 2 contributes nothing, and its survival shows the shrinker's one
+real limitation. Step ids are positional, so removing that leading operation
+renumbers every process created after it, the surviving `{step, Id}` entries
+stop naming what they named, the candidate runs clean, and the removal is
+reverted as unsafe. The trace is still a genuine reproduction. It's the
 minimality that's approximate.
 
-2 aspects of how the shrinker works matter when you read a result.
+2 things about how the shrinker works matter when you read a result.
 
-Its oracle has 3 answers rather than 2. A candidate trace is tested by
-replaying it, and the outcome is the same violation, a clean run, or a
-*divergence*, meaning the candidate isn't a valid schedule and is evidence of
-nothing. Treating divergence as "did not fail" produces a shrinker that appears
-to work while quietly reverting safe removals. Here divergence is avoided
-rather than classified. Candidates replay in a lenient mode that skips a step
-naming a process which isn't currently runnable, which is necessary because
-removing an operation strands the steps belonging to the process that operation
-created.
+**Its oracle has 3 answers rather than 2.** Replaying a candidate gives the same
+violation, a clean run, or a *divergence*, meaning the candidate isn't a valid
+schedule and is evidence of nothing. Treating divergence as "did not fail"
+produces a shrinker that appears to work while quietly reverting safe removals.
 
-And the result is re-recorded before it's verified. A lenient replay silently
-dropped entries, so the surviving candidate is a recipe rather than an
-artifact. What the run actually executed is the artifact, and `shrink/3`
-finishes by replaying that under strict rules. If it doesn't reproduce you get
-`verified => false` and the original trace back.
+**The result is re-recorded before it's verified.** Candidates replay leniently,
+skipping entries, so a surviving candidate is a recipe rather than an artifact.
+`shrink/3` finishes by replaying what the run actually executed, under strict
+rules. If that doesn't reproduce you get `verified => false` and the original
+trace back.
 
 ## What this example leaves out
 

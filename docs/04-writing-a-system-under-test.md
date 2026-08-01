@@ -6,8 +6,7 @@ making the system observable and getting the invariants right.
 
 The examples below come from `dgen_registry`: several nodes each holding a
 replica of a `name -> pid` map, with one elected leader through which all
-changes pass. Where a detail of that system matters we explain it where it
-appears.
+changes pass.
 
 ## The contract
 
@@ -25,9 +24,9 @@ appears.
 
 `state()` is whatever you want it to be. A map is conventional.
 
-A harness is not the system under test — your `gen_server`s and protocol code
-are that. It's the adapter that starts the system, declares which processes to
-schedule, drives it with a workload, and judges it.
+A harness is not the system under test. Your `gen_server`s and protocol code are
+that. The harness is the adapter that starts the system, declares which
+processes to schedule, drives it with a workload, and judges it.
 
 That distinction decides which modules include `dst.hrl` and use `?DST_LOG`: the
 ones that ship, where emitting nothing in a release build matters. A harness
@@ -42,19 +41,18 @@ The system has to be handed over idle. Whatever is still in flight when the
 driver takes control ran on the real scheduler, and its effects land at a point
 in the schedule that nothing chose.
 
-That's a stronger condition than the one most systems already offer. A
-cluster's startup helper typically waits until every node reports itself ready,
-meaning a leader elected and an initial sync completed. That's the right
-definition for a client and the wrong one here. Ready means the system can
-accept work. Idle means it isn't currently doing any. A member can be ready
-with an unanswered call still sitting in its mailbox, and about 1 start in 5 of
-the registry was.
+That's a stronger condition than the one most systems already offer. A cluster's
+startup helper typically waits until every node reports itself ready, meaning a
+leader elected and an initial sync completed. That's the right definition for a
+client and the wrong one here. Ready means the system *can* accept work. Idle
+means it isn't currently doing any. A member can be ready with an unanswered
+call still sitting in its mailbox, and about 1 start in 5 of the registry was.
 
 What that costs you is a run whose first few steps are decided by wall clock,
 and it's unusually hard to diagnose from state alone. Leader, epoch, applied
-version and even the whole timer wheel can be identical between 2 runs that
-then diverge. The difference shows up in mailboxes and process status, which is
-what the check has to look at:
+version and even the whole timer wheel can be identical between 2 runs that then
+diverge. The difference shows up in mailboxes and process status, which is what
+the check has to look at:
 
 ```elixir
 defp await_quiescent(cluster, attempts) do
@@ -102,9 +100,9 @@ def processes(%{cluster: cluster, clients: clients}) do
 end
 ```
 
-The `Enum.sort_by(..., & &1.index)` is load-bearing. That map is keyed by
-member names which embed a unique integer, so iterating it directly orders by
-atom, and the atoms differ between runs.
+The `Enum.sort_by(..., & &1.index)` is load-bearing. That map is keyed by member
+names which embed a unique integer, so iterating it directly orders by atom, and
+the atoms differ between runs.
 
 Leave out processes that can never do anything. This workload registers names
 against dummy processes that block forever, and scheduling those would only add
@@ -131,11 +129,11 @@ and resolve it in `execute/2`.
 
 ## execute/2
 
-Covered on the [previous page](03-two-phase-commit.md). The short version:
-every process the scheduler owns is suspended, so a synchronous call into one
-from the driver is never answered. Operations are issued by spawning, and the
-spawn goes through `dst_run:spawn_op/1` so the new process can't act before the
-scheduler owns it.
+Covered on the [previous page](03-two-phase-commit.md). The short version: every
+process the scheduler owns is suspended, so a synchronous call into one from the
+driver is never answered. Operations are issued by spawning, and the spawn goes
+through `dst_run:spawn_op/1` so the new process can't act before the scheduler
+owns it.
 
 ## check/1
 
@@ -143,8 +141,8 @@ An invariant runs against a frozen system, so anything that sends a message and
 waits can't be served.
 
 The loud version of getting this wrong is a hang, which `dst_run` bounds and
-reports as `check_blocked`. The quiet version is worse and nothing can catch
-it. Consider a status API written the way most of them are:
+reports as `check_blocked`. The quiet version is worse and nothing can catch it.
+Consider a status API written the way most of them are:
 
 ```erlang
 status(Name) ->
@@ -164,19 +162,22 @@ without anybody touching it.
 So invariants read state out of band. There are 2 ways to arrange that, and the
 choice comes up on every system.
 
-If the state already lives somewhere readable, read it there. The registry's
+**If the state already lives somewhere readable, read it there.** The registry's
 members keep their replicas in ETS because the replication protocol needs them
 there anyway, so the invariant that compares replicas is an `ets:tab2list` per
 member.
 
-If the state exists only inside a process, publish it.
-`-dst_observe([leader, epoch])` makes the transform republish those fields into
-the process dictionary on every callback return, and `dst_observe:read/1` reads
-them from outside. That works on a suspended process, in a couple of
-microseconds, whatever the mailbox depth. Publishing on every return is what
-makes staleness impossible, since there's no assignment site anybody can
-forget. Name the fields you need rather than using `-dst_observe(all)`, because
-`read/1` copies what was published and gets called after every step.
+**If the state exists only inside a process, publish it.**
+`-dst_observe({state, [leader, epoch]})` makes the transform republish those
+fields into the process dictionary on every callback return, and
+`dst_observe:read/1` reads them from outside. That works on a suspended process,
+in a couple of microseconds, whatever the mailbox depth. Publishing on every
+return is what makes staleness impossible, since there's no assignment site
+anybody can forget.
+
+Name the record and the fields rather than using `-dst_observe(all)`. `read/1`
+copies what was published and gets called after every step, and naming the
+fields is what makes a typo a compile error instead of a wrong offset.
 
 ## Deciding when a property holds
 
@@ -190,9 +191,9 @@ fencing token, and there's no instant at which it may be false.
 
 **True at rest.** These need a definition of "rest". The registry's example is
 that 2 members reporting the same version must hold the same map. That isn't
-true continuously, and not because of a bug. Members write optimistically,
-ahead of the replicated stream, so a member legitimately holds different
-content from its peers at the same version while an operation is in flight.
+true continuously, and not because of a bug: members write optimistically, ahead
+of the replicated stream, so a member legitimately holds different content from
+its peers at the same version while an operation is in flight.
 
 The scheduler can answer whether the system is at rest, since it's the thing
 that knows:
@@ -208,15 +209,14 @@ end
 
 Both halves of that condition are necessary. "Nothing runnable" alone isn't
 quiescence, because a system can have nothing runnable in the middle of an
-operation. A commit parked on a worker leaves every other process idle while
-the write it will confirm is still speculative. The window a speculative write
-lives in is bounded by its operation, not by the scheduler going quiet. Stated
-generally: a property that only holds at rest needs the system's own definition
-of rest, and "no process wants to run" isn't it.
+operation. A commit parked on a worker leaves every other process idle while the
+write it will confirm is still speculative. Stated generally: **a property that
+only holds at rest needs the system's own definition of rest, and "no process
+wants to run" isn't it.**
 
 **True after convergence.** Heal every injected fault, drain the network, wait
-for agreement, then assert. Some properties genuinely need this, but healing
-can also destroy what you were trying to observe. In the registry, converging
+for agreement, then assert. Some properties genuinely need this, but healing can
+also destroy what you were trying to observe. In the registry, converging
 delivers a `nodeup` to every member, each re-announces itself, and a
 re-announcement makes the leader send that member a fresh snapshot, repairing
 exactly the inconsistency under investigation. A permanent, undetectable
@@ -241,28 +241,27 @@ system-under-test state. Use a public ETS table or a counter ref.
 
 The same applies to workloads. A test asserting that a batch is applied
 atomically should also assert that a batch of more than one operation actually
-occurred, or a change in batching behavior will turn it into a tautology that
+occurred, or a change in batching behaviour will turn it into a tautology that
 keeps passing.
 
 ## Assert the property, not the schedule
 
 2 rules that look contradictory and aren't.
 
-The first is not to weaken a failing test without proving the race is real. A
-test in this project failed intermittently and the tempting fix was to make the
-assertion wait for the value it wanted. That would have been wrong. Both
-operations rode the same durable queue, and FIFO ordering guarantees the read
-observes the earlier write. The failure was a real bug in the storage layer,
-and weakening the test would have hidden it and left a weaker test behind.
+**Don't weaken a failing test without proving the race is real.** A test in this
+project failed intermittently and the tempting fix was to make the assertion
+wait for the value it wanted. That would have been wrong. Both operations rode
+the same durable queue, and FIFO ordering guarantees the read observes the
+earlier write. The failure was a real bug in the storage layer, and weakening
+the test would have hidden it and left a weaker test behind.
 
-The second is to fix a test that asserts the schedule instead of the property.
-Another test flipped 150 registrations at once and asserted that a sampler only
-ever observed 0 or 150 of them, which pinned it to a batch boundary the test
-doesn't control. When the leader split the work 1-then-149 instead, both
-batches were applied perfectly whole and the test reported 1000s of torn reads.
-It now derives the legal counts at runtime from the batches the follower
-actually received, which holds under any split and rejects a genuinely torn
-read under all of them.
+**Do fix a test that asserts the schedule instead of the property.** Another
+test flipped 150 registrations at once and asserted that a sampler only ever
+observed 0 or 150 of them, which pinned it to a batch boundary the test doesn't
+control. When the leader split the work 1-then-149 instead, both batches were
+applied perfectly whole and the test reported 1000s of torn reads. It now
+derives the legal counts at runtime from the batches the follower actually
+received, which holds under any split and still rejects a genuinely torn read.
 
 The distinction is whether the thing being asserted is guaranteed by the system
 or merely produced by it most of the time.
@@ -272,10 +271,10 @@ or merely produced by it most of the time.
 2 clean runs isn't evidence that an intermittent bug is fixed. What is evidence
 is a test that fails deterministically before the fix and passes after it.
 
-The stronger form is to break something on purpose and confirm the test
-notices. `dst`'s own acceptance criteria are that idea at a larger scale: plant
-a known defect behind a compile flag and require the framework to find it again
-from a cold start.
+The stronger form is to break something on purpose and confirm the test notices.
+`dst`'s own acceptance criteria are that idea at a larger scale: plant a known
+defect behind a compile flag and require the framework to find it again from a
+cold start.
 
 ## Next
 
