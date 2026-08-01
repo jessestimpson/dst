@@ -1,39 +1,35 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="eta">
   <title>eta</title>
   <style>
-    .ink    { stroke: #16181d; }
-    .rule   { stroke: #16181d; opacity: .30; }
-    .accent { stroke: #c2762b; }
+    .ink    { fill: #16181d; }
+    .accent { fill: #c2762b; }
     .plate  { fill: none; stroke: #16181d; opacity: .13; }
     @media (prefers-color-scheme: dark) {
-      .ink    { stroke: #eceff4; }
-      .rule   { stroke: #eceff4; opacity: .34; }
-      .accent { stroke: #e8a860; }
+      .ink    { fill: #eceff4; }
+      .accent { fill: #e8a860; }
       .plate  { stroke: #eceff4; opacity: .17; }
     }
   </style>
 
+  <defs>
+    <!-- The lowercase Greek eta as a mathematician reads it, outlined from
+         STIXGeneral Italic (SIL Open Font License). Its left stroke ends exactly
+         on the baseline, which is what lets the two-tone split below be a clean
+         cut rather than a guess. -->
+    <path id="eta-glyph" d="M148 228 150 227Q283 441 371 441Q402 441 422.0 426.5Q442 412 442 384Q442 360 432 321L345 0Q315 -109 315 -171Q315 -186 323 -205H250Q239 -192 239 -161Q239 -111 272 9L347 283Q361 330 361 355Q361 390 336 390Q296 390 223.0 296.5Q150 203 121 106L89 0H14L96 305Q110 355 110 367Q110 384 96 384Q92 384 87.5 382.0Q83 380 78.0 375.5Q73 371 68.5 367.0Q64 363 58.5 356.5Q53 350 49.5 345.5Q46 341 40.5 334.5Q35 328 33 326L21 336Q34 358 50 377Q99 438 147 438Q187 438 187 393Q187 352 148 228Z"/>
+    <clipPath id="above"><rect x="0" y="0" width="200" height="126.4"/></clipPath>
+    <clipPath id="below"><rect x="0" y="126" width="200" height="74"/></clipPath>
+  </defs>
+
   <rect class="plate" x="8.5" y="8.5" width="183" height="183" rx="42" stroke-width="1"/>
 
-  <!-- The baseline, graduated. An etalon is the artifact a measurement is read
-       against, and every other stroke on this page stops at the line. -->
-  <g class="rule" stroke-linecap="round" stroke-width="2.5">
-    <path d="M40 112 H154"/>
-    <g>
-      <path d="M48 112 v11"/>
-      <path d="M64 112 v7"/>
-      <path d="M80 112 v11"/>
-      <path d="M96 112 v7"/>
-      <path d="M112 112 v11"/>
-    </g>
+  <!-- Above the baseline the letter is ink. Below it, the descender is the one
+       stroke that crosses the line and keeps going, which is as good a picture
+       of the idea as a letter gets. -->
+  <g clip-path="url(#above)">
+    <g transform="translate(49.8 126) scale(0.22 -0.22)"><use href="#eta-glyph" class="ink"/></g>
   </g>
-
-  <!-- Eta, above the line. -->
-  <path class="ink" d="M64 112 V60 C64 37 132 37 132 60 V112"
-        fill="none" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
-
-  <!-- And below it. The descender is the one stroke that crosses the baseline and
-       keeps going, which is as good a picture of the idea as a letter gets. -->
-  <path class="accent" d="M132 112 V158"
-        fill="none" stroke-width="15" stroke-linecap="round"/>
+  <g clip-path="url(#below)">
+    <g transform="translate(49.8 126) scale(0.22 -0.22)"><use href="#eta-glyph" class="accent"/></g>
+  </g>
 </svg>

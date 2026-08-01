@@ -135,3 +135,8 @@ that consumer exercises.
 - **Shrinking is bounded by positional step ids.** Deleting an operation
   renumbers every process created after it, so operations that contributed
   nothing often survive a shrink. See [docs/05](docs/05-gotchas.md).
+
+---
+
+The eta in the logo is outlined from [STIX](https://www.stixfonts.org) General
+Italic, used under the SIL Open Font License.
