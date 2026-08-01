@@ -22,7 +22,7 @@ start_link(Tab, Index) ->
 init({Tab, Index}) ->
     %% Names this process for `dst_log`. One call, at startup, and every event it
     %% records afterwards is attributed without any API having to carry a label.
-    ok = ?DST_ROLE({participant, Index}),
+    ok = ?DST_LABEL({participant, Index}),
     {ok, #{tab => Tab, index => Index}}.
 
 handle_call(_Request, _From, St) ->

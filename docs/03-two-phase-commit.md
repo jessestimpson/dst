@@ -261,7 +261,7 @@ failure" from "a different failure that also happens to be a failure". Without
 it, a shrinker with more than one invariant to choose from will reduce one bug
 into another and report the result as progress.
 
-### labels/1, the optional one
+### labels/1, the optional one, for the processes that can't speak for themselves
 
 ```erlang
 labels(#{coordinator := C, participants := Ps, clients := Clients}) ->
@@ -272,7 +272,19 @@ labels(#{coordinator := C, participants := Ps, clients := Clients}) ->
     ).
 ```
 
-Without it a step reads `p3`; with it, `participant-2`.
+Without a name a step reads `p3`; with one, `participant-2`.
+
+Note what's doing the work here and what isn't. The coordinator and the
+participants call `?DST_LABEL` in their own `init/1`, so **this callback isn't
+what names them** — a self-reported label wins, precisely so a process's step
+lines can't disagree with the events underneath them. They appear here only
+because listing them costs nothing.
+
+The clients are the reason the callback exists. They're anonymous funs handed to
+`dst_run:spawn_op/1`, with no module to put a `?DST_LABEL` in, so the harness is
+the only thing that knows one of them is transaction 3. That's the general shape:
+**reach for `labels/1` when the process can't name itself** — something from a
+library you don't own, or a module you deliberately kept `dst.hrl` out of.
 
 Called **once**, after the run, which is why it takes the whole state rather
 than one pid at a time. A harness already holds its processes in lists and maps,

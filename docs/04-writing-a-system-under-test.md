@@ -31,7 +31,7 @@ schedule, drives it with a workload, and judges it.
 
 That distinction decides which modules include `dst.hrl` and use `?DST_LOG`: the
 ones that ship, where emitting nothing in a release build matters. A harness
-never ships, so it can go either way, and calling `dst_log:role/1` and
+never ships, so it can go either way, and calling `dst_log:label/1` and
 `dst_log:log/1` directly buys it something the macros can't. The macros are
 Erlang, and so is `dst_transform`, so **the harness is the one part of a
 simulated system you can write in Elixir.**

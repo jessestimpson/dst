@@ -1,47 +1,50 @@
-# A journey through DST
+# A Journey Through DST
 
-The rest of this manual explains `dst`. This page is the part where you use it.
-We start with an empty directory and finish with a minimized, replayable
-counterexample to a real distributed systems bug.
+This page guides you through the `dst` features. We start from scratch and build
+an [ABD Quorum Register](https://scholar.google.com/citations?view_op=view_citation&hl=en&user=eoMK92MAAAAJ&citation_for_view=eoMK92MAAAAJ:d1gkVwhDpl0C) in Erlang. `dst` requires you to build
+your distributed system-under-test in a specific manner, to avoid leaking
+nondeterminism. This walkthrough explains those requirements through an actual
+implementation.
 
-The system we'll build is an **ABD quorum register**: a single shared value,
-replicated across 3 nodes, that stays correct while clients read and write it
-concurrently. It's about 100 lines of Erlang. ABD is a good subject for this
-because the bug we're going to find is one that people really make, the
-invariant that catches it is a single line, and the counterexample needs a
-genuine interleaving rather than an unlucky input.
+An **ABD Quorum Register** is a simple distributed system that shares a single value,
+replicated across 3 nodes. The value is meant to stay correct while clients read
+and write concurrently. It's designed for message-passing systems, like the BEAM,
+and so its implementation is fairly simple. It also features a counter-intuitive
+step that leads to an inconsistency bug whem omitted, making it a good example
+for demonstrating DST's bug-finding capabilities.
 
-You should have read [page 1](01-what-dst-is.md). Everything else you need is
-explained here.
+We recommend you have read [What DST Is](01-what-dst-is.md) to establish a baseline
+for the technique.
 
 ## What ABD is
 
-3 replicas, each holding a `{Timestamp, Value}` pair. A quorum is 2 of them,
-so any 2 quorums overlap in at least one replica. That overlap is the whole
-mechanism.
+We'll start 3 processes, each one is labeled as a "replica", and they all particpate
+in message passing to each other. Each process holds a `{Timestamp, Value}` tuple in
+its state. For a quorum to be achieved, 2 of the 3 must agree on the tuple contents.
 
-- **Write(V)**: ask a quorum for their timestamps, take the highest, then
-  write `{Highest + 1, V}` to a quorum.
+The system provides the following API:
+
+- **Write(V)**: ask a quorum (a set of processes) for their timestamps, take the
+  highest, then write `{Highest + 1, V}` to a quorum (not necessarily the same
+  process set).
 - **Read()**: ask a quorum, take the pair with the highest timestamp, **write
   that pair back to a quorum**, then return the value.
 
-The write-back in the read path is the part everyone leaves out. It looks
-redundant. You're writing back a value you just read, and nothing has changed.
-We'll write it correctly first, delete it later, and let `dst` explain why it
-was there.
+The write-back in the read path is the counter-intuitive part. It may look
+redundant: you're writing back a value you just read a couple nanonseconds ago.
+But it turns out to be critical to the consistency of the system, and we'll
+demonstrate exactly that over the course of this document.
 
 ## Step 1: create the project
 
 We'll put the project beside your `dst` checkout so the dependency can be a
-plain relative path.
+plain relative path. We're using `mix` because the tooling makes for a simpler
+walkthough, but `rebar` could just as well be used, with some modification.
+We'll write the ABD register itself in Erlang - we're going to use `parse_transform`.
 
 ```bash
-cd ~/dev && mix new abd
+mix new abd
 ```
-
-Mix is a comfortable build system for an Erlang project, and using it means
-`dst`'s own examples transfer without translation, since `dst` is arranged the
-same way. Nothing here needs Elixir, and you can add some later if you want it.
 
 ## Step 2: build configuration
 
@@ -56,77 +59,52 @@ Then edit `mix.exs`. In `project/0`, add 3 keys:
 ```elixir
       erlc_paths: erlc_paths(Mix.env()),
       erlc_options: erlc_options(Mix.env()),
-      elixirc_paths: [],
 ```
 
 Replace the commented-out examples in `deps/0` with:
 
 ```elixir
       {:dst, path: "../dst", runtime: false}
+      # --- or ---
+      {:dst, git: "https://github.com/jessestimpson/dst.git", runtime: false}
 ```
 
 and add 2 private function pairs at the bottom:
 
 ```elixir
-  # The register itself is ordinary Erlang in src/. The dst harness lives in
+  # The ABD register itself is ordinary Erlang in src/. The dst harness lives in
   # test/support and only exists for the test env, so a release never sees it.
   defp erlc_paths(:test), do: ["src", "test/support"]
   defp erlc_paths(_), do: ["src"]
 
-  # DST is what the parse transform hides behind.
+  # The DST define is required for `dst` to engage
   defp erlc_options(:test), do: [:debug_info, {:d, :DST}]
   defp erlc_options(_), do: [:debug_info]
 ```
 
-Leave `application/0` and the generated `elixir:` version alone. Then:
+Then:
 
 ```bash
 mix deps.get && MIX_ENV=test mix compile
 ```
 
-`src/` is empty, so anything that fails here is the configuration rather than
-your code. That's why we run it now.
+If the compile fails, double-check your configuration.
 
-### The 3 decisions in that file
+### Project configuration details
 
-**`elixirc_paths: []`.** There's no Elixir source to compile. Test files stay
-`.exs` because ExUnit loads them at runtime rather than compiling them through
-`elixirc_paths`, so you keep ExUnit without keeping an Elixir codebase.
-
-**`runtime: false` rather than `only: :test`.** `-include_lib` is resolved by
-the preprocessor before any `-ifdef` inside the header is considered, so the
-header has to be findable in *every* environment — a `only: :test` dependency
-fails a plain `mix compile` with `can't find include lib`. `runtime: false`
-makes `dst` available to the compiler everywhere and keeps it out of your
-release: it isn't added to your application's `applications` list, so
-`mix release` doesn't ship it.
+**`runtime: false` rather than `only: :test`.** `dst` requires the inclusion
+of an hrl file in the ABD code. For the preprocessor to find the hrl, the `dst`
+project must be findable in all compilations. The `DST` define is what disables
+all `dst` features in your production code.
 
 **`{:d, :DST}` for the whole test env, not a dedicated simulation profile.**
 `dst_time` falls back to the real `erlang` functions whenever no virtual clock
 is running, so a transformed module behaves normally outside a simulation.
-Compiling your ordinary test suite with the transform on means every test you
-write is continuously demonstrating that inertness. A separate profile only
-demonstrates it for the tests you remember to run under it.
 
 **No `mod:` in `application/0`.** ABD is small enough not to need one, and this
 keeps the walkthrough short.
 
-**This is not a rule that a simulated system can't be an OTP application.** It
-can, and yours probably should be. The rule is narrower: *the simulation* has to
-start the processes it schedules, because `init/2` must hand the driver a system
-that is **idle**, and a supervision tree started by the application is already
-running before your harness gets control. How you start the same processes in
-production is entirely your business — a harness that builds its own cluster and
-a release that boots one under a supervisor are both fine, and most real
-adoptions have both.
-
-For a project that doesn't have `dst` checked out beside it, the dep is:
-
-```elixir
-{:dst, git: "https://github.com/jessestimpson/dst.git", runtime: false}
-```
-
-## Step 3: the replica
+## Step 3: the replica `gen_server`
 
 `src/abd_replica.erl`:
 
@@ -184,7 +162,7 @@ store(Ts, Val, St) when Ts > St#st.ts -> St#st{ts = Ts, val = Val};
 store(_Ts, _Val, St) -> St.
 ```
 
-Drive it by hand:
+Let's try it out in the `iex` shell:
 
 ```bash
 MIX_ENV=test iex -S mix
@@ -202,37 +180,26 @@ RESULT: `{{0, 0}, :undefined}`, a `write_ack`, then `{{1, 7}, :hello}`.
 
 ### 3 things worth calling out
 
-**Casts, not `gen_server:call`.** This is the load-bearing decision of the
-whole example. 3 sequential calls would collect all 3 answers in a fixed order
-every time. Casts let a client take the first 2 that arrive, which makes
-*quorum composition* a scheduling choice. That's precisely what puts our
-counterexample in reach of `dst_sched` without injecting a single fault.
+**Casts, not `gen_server:call`.** ABD is based on fully non-blocking message
+passing. Blocking calls would collect answers in a fixed order. Casts let
+a client take the first set that arrive, which makes the quorum set a scheduling
+choice, which would typically be a source of nondeterminism.
 
 **Timestamps are `{Seq, WriterId}`, not integers.** 2 concurrent writers can
-read the same maximum and both pick `Seq + 1`. Without a tiebreak they'd leave
-different values at the same timestamp, which is a second, unrelated bug that
-would muddy the one we're hunting. 1 extra tuple element buys a total order.
+read the same maximum and both pick `Seq + 1`. Including a another identifier
+gets us a total order. This is an ABD implementation detail that you are free
+to ignore for the purposes of the demo.
 
-**`get/1` is a trap, and we've labeled it.** It's genuinely useful for poking
-at a replica in `iex`, and it's exactly the shape of call that silently
-switches an invariant off (see [page 4](04-writing-a-system-under-test.md)).
-Having it present with a warning attached teaches better than a rule in the
-abstract. When we write `check/1`, notice that we don't use it.
+**`get/1` is a trap, and we'll see why later.** `get/1` is useful for poking
+at a replica in `iex`. When we write `check/1`, you'll notice we don't use it.
+This is because the process will be suspended during the check and unable to
+respond to any incoming requests. `check/1` must read shared memory rather than
+do message passing.
 
-### One include, and it does nothing yet
+### The `dst.hrl` include
 
-`-include_lib("dst/include/dst.hrl")` is the entire opt-in. Under a simulation
-build it brings the parse transform and the `?DST_LOG` and `?DST_ROLE` macros;
-under a release build it brings nothing at all, so this module has no
-relationship to `dst` and could ship exactly as written.
-
-Right now it does nothing either way, because the replica has no timers, no
-spawns and no logging. That is the inertness claim from step 2, demonstrated
-rather than asserted, and it costs one line to have it in place before you need
-it.
-
-Worth confirming while it is cheap: a parse transform arriving through `deps/`
-is found by `erlc` with no extra configuration.
+Technically you can leave this out at this step, but if you do, remember to add it
+back in later, where it will be needed.
 
 ## Step 4: the client
 
@@ -307,39 +274,39 @@ RESULT: `{{0, 0}, :undefined}`, `{1, 1}`, `{{1, 1}, :v1}`, `{2, 2}`,
 
 ### What to notice
 
-**There's nothing framework-shaped in this file.** No `dst_` call, no harness
-hook, nothing conditional on being under simulation. That's the pitch. The
-thing you test is your real client, not a simulation-only copy of it. The
-transform attribute is there for later and currently rewrites nothing.
+**The `dst` project is still not really involved.** We've defined the distributed
+system with normal Erlang code, and we'll only need to tweak it to make it compatible
+with `dst`. The code that you ship to production is the same code that is under test.
 
-**`abd_client` is protocol code, not a process.** It runs inside whatever
+**`abd_client` does not start a process.** It runs inside whatever
 process calls it, which right now is your `iex` shell. In a moment the harness
 will spawn a process per operation and run these same functions there. Keeping
 the 2 things separate is what lets a client be a schedulable participant in the
 concurrency without the protocol knowing anything about it.
 
-**`make_ref()` is fine here, and that isn't obvious.** Refs differ between
+**`make_ref()` is nondeterministic, but not harmful to the test.** Refs differ between
 runs, and unseeded identity is a genuine source of nondeterminism. It's
-harmless in this case because the ref never decides anything. It only matches a
-client's own replies. The rule is that refs and pids break replay when they
-influence *control flow*, and matching your own mailbox isn't that.
+harmless in this case because the value of the ref never decides anything. It only matches a
+client's own replies. Refs and pids break replay when their values
+influence *control flow*, which would be very atypical for conventional Erlang.
 
-**Watch what happens to the 3rd ack.** A quorum is 2, so after `collect_reads`
+**Some messages can get stuck in the mailbox.** A quorum is 2, so after `collect_reads`
 returns there's still a `read_ack` sitting in the mailbox, and the next phase's
 `receive` scans straight past it on a different ref. That's what real ABD code
 looks like, and it exercises the trickiest part of `dst_sched`: a process
-blocked in a selective receive *with a non-empty mailbox*, which is the case
-the scheduler's blocked-at-queue-length tracking exists for.
+blocked in a selective receive *with a non-empty mailbox*. `dst` can handle this
+just fine. Your actual code will probably want to flush these out, but we
+skip that here.
 
-**And the read does a write-back.** Right now it looks redundant, which is the
-point. We'll delete it later and it'll take 3 lines.
+**And the read does a write-back.** Right now it looks redundant, but it's not.
+We'll delete it later and observe the result.
 
 ## Step 5: the harness
 
-Everything so far has been the register. This is the harness: the 6 callbacks
-`dst_run` drives it through, and the only file that names `dst` at runtime. The
-register modules reference it too, through the header and the macros, but
-nothing in them survives a release build.
+Everything so far has been the actual ABD register. Next is the harness: a
+behaviour implementation that `dst_run` will exercise. This module could
+be in Elixir, if you want. As written, it doesn't use Erlang compile-time
+features.
 
 `test/support/abd_harness.erl`:
 
@@ -444,140 +411,59 @@ RESULT: compiles clean.
 ### `init/2` hands over an idle system
 
 `start_link` returns once `init/1` has run, and a fresh replica has an empty
-mailbox, so this system is quiescent the moment it's built. That's free here
-and it isn't free in general. A real cluster is *ready* long before it's
-*idle*, and the difference is unanswered messages sitting in mailboxes when the
-scheduler takes over. [Page 4](04-writing-a-system-under-test.md) covers what
-that costs and how to wait for it properly.
+mailbox, so this system is quiescent - the replicas are at a steady-state. It's
+important to maintain this property, because `dst_run` will suspend all processes.
+If it suspends a busy process, then the actual moment in time of that suspend action
+is nondeterministic. Make sure the system's processes are idle.
 
-The table is `public` rather than `protected` because 3 different kinds of
-process touch it: client processes write results, the invariant reads them, and
-`check/1` runs in a fresh process of its own each time.
+The ets table is `ordered_set`, which is a determinism decision, because `set`
+does not specify a term order in the API contract.
 
-It's an `ordered_set`, which is a determinism decision rather than a
-performance one. `ets:tab2list/1` on a `set` returns rows in whatever order the
-hash table happens to hold them. That's stable enough in practice to pass a
-replay check and fragile enough to break when the table grows or the OTP
-version changes. Term order costs nothing here and can't surprise us. We sort
-in `check/1` as well, which is belt and braces.
-
-### `processes/1` and why the `lists:reverse` is load-bearing
+### `processes/1` and `lists:reverse`
 
 `dst_sched` assigns ids in registration order, and the trace records ids, so
 the order this callback returns is part of the contract. We prepend new clients
 to the list because that's cheap, which means the list itself is in reverse
 chronological order, so we reverse it here to hand them over oldest first.
 
-With one new client per operation you could get away without this, since only
-one pid is ever unknown at a time. It's still wrong to rely on that. The moment
-an operation creates 2 processes, registration order starts depending on list
-order, and the symptom is a trace difference at a very early index that reads
-exactly like a scheduling bug.
-
 ### `generate/2` draws from the state it's handed
 
 40% writes, 60% reads, drawn from the `rand` state `dst_run` passes in and
 returning the advanced state. Drawing from anywhere else, `rand:uniform/1` or
-the clock or `erlang:unique_integer/0`, breaks replay silently.
+the clock or `erlang:unique_integer/0`, breaks replay silently. Again, we're
+always on the lookout for nondeterminism leaks.
 
-Both operations carry their own number, and the value written is derived from
-it. That's what makes an operation mean the same thing on a replay against a
-freshly started system. An operation carrying a pid, a ref or a generated name
-would not.
+#### Why generating and executing are separate
 
-#### Why generating and executing are 2 callbacks
+`dst` will help us both run new seeds and replay old ones. The replay will avoid
+calling generate, but must still call execute.
 
-Because replay never calls `generate/2`. It runs only when `dst_run` is
-generating a run. On a replay the operation comes out of the trace instead, and
-goes straight to `execute/2`.
+### `execute/2` spawns using a special `dst` function
 
-That split is what makes an operation a **value** rather than a position in an
-RNG stream, and 3 things depend on it.
+Every process is suspended, and `dst_sched` is the only entity allowed to
+progress the system. A special `dst_run:spawn_op/1` function must be used. It
+prevents the newly spawned process from executing any real code. The pid is
+handed over to `dst_run` and `dst_sched` to progress.
 
-Shrinking would be impossible otherwise. `dst_shrink` works by deleting entries
-from the trace, and deleting `{op, {read, 7}}` is meaningful only because the
-surviving operations still mean what they meant. If a trace recorded "the
-generator ran here", removing one entry would shift every later draw and
-produce a different workload rather than a smaller version of the same one.
+### `check/1` is for defining the rules
 
-The trace would also be unreadable, which you'll care about the moment you have
-a counterexample in front of you. Operations that are terms can be read
-straight off the trace. A recorded RNG position can't.
+Our invariant is known as "regularity", sometimes called *no new-old inversion*:
 
-And because operations are ordinary terms, you can write a trace by hand and
-feed it to `replay/3` to test a scenario you already have in mind.
+> Once a read has returned a value, no read that starts later may return an older one.
 
-The split also localizes the entropy requirement to exactly one function.
-`generate/2` is the only place randomness may enter a workload, which is why
-"draw from the `rand` state you're handed" is a rule about `generate/2` and
-about nothing else. `execute/2` is effectful, but deterministic given its
-operation.
+Our `check/1` confirms that the system's timestamps make sense in the context of this
+invariant. Every operation gets a start and finish stamp from a simple logical clock
+(`ets:update_counter`). Since only one process is ever running at a time, the
+counter reliably represents the total order of operations.
 
-It's the same generator/runner split property-based testing libraries use, for
-the same reason. Shrinking needs values, not seeds.
-
-### `execute/2` spawns, and it has to
-
-Every process the scheduler owns is suspended between steps, so a synchronous
-call from the driver into the system can never be answered. Operations are
-issued by spawning a process to carry them out, and that process is picked up
-by the next `processes/1` call and interleaved like everything else.
-
-That isn't a workaround. A client *is* part of the concurrent system, and this
-is what makes it schedulable. It's also why `abd_client` was written as plain
-functions rather than as a process: the harness decides where the protocol
-runs.
-
-The spawn goes through `dst_run:spawn_op/1` rather than `spawn/1`. The driver
-isn't traced, so a process it creates isn't owned by the scheduler until the
-driver registers it, and in that window the process runs on the real scheduler.
-2 clients created by operations injected close together would race each other
-to the replicas' mailboxes, and the winner would be decided by wall clock.
-`spawn_op/1` parks the process until registration is done.
-
-### `check/1` is where the real work is
-
-Our invariant is regularity, sometimes called *no new-old inversion*: once a
-read has returned a value, no read that starts later may return an older one.
-
-Making that precise needs a notion of "later", and the logical clock in the
-table provides it. Every operation stamps a start and a finish from the same
-`ets:update_counter`. Under the scheduler exactly one process runs at a time,
-so that counter is a faithful total order of the events, and it's completely
-deterministic. 2 reads are *sequential* when one's finish precedes the other's
-start, and that's the only case where the property has to hold. Reads that
-overlap in time are allowed to disagree, because they're concurrent, and
-nothing about a quorum register promises otherwise.
-
-The check itself is a pairwise scan, which is O(n²) in completed reads and gets
-evaluated after every action. At the scale we're running that's nothing. If a
-workload ever makes it hurt, `check_every` is the lever.
-
-Notice what `check/1` does *not* do. It never calls `abd_replica:get/1`, even
-though that function exists and would be the obvious way to look at the system.
-Under the scheduler every replica is suspended, so that call would hang, and
-`dst_run` would report `check_blocked` after bounding it. The quieter and worse
-version of the same mistake is an API that catches its own timeout and returns
-something plausible, which leaves the invariant computing over nothing and
-passing. Invariants read state out of band, and here that means ETS.
-
-### The harness does not include the header
-
-`abd_harness` has no `-include_lib`, and that distinction is worth holding on
-to: **a harness is not the system under test.** Your replica and your client are
-that. The harness starts them, declares which processes to schedule, drives them
-with a workload and judges them.
-
-Only the system ships, so only the system needs its instrumentation to
-disappear in a release build. The harness never leaves your test directory, so
-it calls `dst_log` directly and skips the macros. It also has no business being
-transformed: it runs in the driver process, which the scheduler doesn't own, so
-rewriting its spawns and timers would point them at machinery that isn't
-managing it.
+As mentioned earlier, we can't call `abd_replica:get/1`. We can't do any message
+passing to the system under test. Currently, we're reading from a client-driven
+ets table. The last step of this guide will explain how to probe the
+hidden state of your system.
 
 ## Step 6: the first run
 
-Everything is in place. A run is one call.
+Everything is in place. We're ready to do our first deterministic run.
 
 ```bash
 MIX_ENV=test iex -S mix
@@ -607,71 +493,38 @@ RESULT:
 
 and `:ok` from `audit/1`.
 
-`summary/1` is the result with the trace swapped for its length. Use it rather
-than printing a result whole: a run of 20 operations produces a few hundred
-trace entries, so your shell renders the schedule and elides the fields you
-wanted underneath it. The trace is for later, once you have a failure worth
-shrinking.
+`summary/1` reduces the rendered size of `result` so that you can read it on
+the `iex` shell. The `trace` entries can get quite long, so we simply
+report the length of the trace in the summary. We'll make the trace easier to
+read later.
 
-**If `steps` comes back suspiciously close to `ops`** — say 20 steps for 20
-operations, with nothing exited — don't puzzle over it. Check `modules_loaded`
-and skip ahead to step 7. You have hit the code-server problem early, and it can
-end a run at what looks exactly like quiescence.
+**`steps` is the number of scheduler steps taken by `dst_sched`** If you see
+20 steps for 20 operations, and nothing `exited`, check `modules_loaded`. A
+module being lazily loaded during runtime can break determinism. We'll handle
+this in step 7. It will always be something to look out for during all your runs.
 
-Look at 6 fields before anything else.
+Otherwise, let's inspect the other fields a little more closely.
 
 **`outcome`** is `:ok`, `{:violation, Detail}`, or `{:error, Reason}`. We expect
-`:ok`, and we want to see it before we go looking for bugs. A run that passes
-proves the harness is wired up. If you turn a defect on first, you can't tell a
-real violation from a broken `check/1`.
+`:ok`. If it's anything else, go back and check your code. At this point we
+should have a fully functional and safe ABD register.
 
-**`ops`** should be 20. If it's lower the run ended early, which for a passing
-run means it hit quiescence with operations left over.
+**`ops`** should be 20. If it's lower the run ended early, which indicates a bug.
 
 **`clock_ms`** is 0, because our system has no timers at all. Nothing ever
-armed one, so the virtual clock never had a reason to move. That's worth
-noticing now so that it's obviously different later.
+armed one, so the virtual clock never had a reason to move. Later, we'll add
+in virtual time via `dst_time`.
 
 **`modules_loaded`** must be empty, and **`sched.adopted_late`** and
-**`sched.timeouts`** must be 0. Rather than remembering that list, ask:
-
-```elixir
-:dst_run.audit(result)
-```
-
-`:ok` means the seed means something. `{:suspect, reasons}` names what got in.
-It's the assertion to put next to your invariants, and it keeps checking as more
-counters get added.
+**`sched.timeouts`** must be 0. These are the properties that `audit/1` looks for.
+`:ok` is what we want here.
 
 `adopted_late` counts processes that ran before the
 scheduler owned them, and every one of them is a piece of the interleaving
-decided by wall clock rather than by the seed. A nonzero count here means the
-seed won't reproduce, and it's the first thing to check when one doesn't.
+decided by wall clock rather than by the seed (nondeterminism). A nonzero count
+here means the seed won't reproduce.
 
-**`skipped`** is 0. It only ever becomes nonzero during a lenient replay, which
-is a shrinking thing. On a generated run it's a sanity check.
-
-And `trace` is the whole run: every `{step, Id}`, `{op, Op}` and `{clock, Ms}`
-in order.
-
-2 things about reading one from Elixir. The entries are 2-tuples with atom
-heads, so Elixir prints them in keyword-list style: `{:step, 3}` shows up as
-`step: 3`. And the ids are positional. 0 through 2 are the replicas, registered
-by `init/2` in the order `processes/1` returned them, and everything from 3 up
-is a client, one per operation, numbered in injection order. So this:
-
-```
-op: {:read, 1},
-step: 3,
-```
-
-is read 1 being injected, then its client taking its first step.
-
-You can also watch the driver's 3-way choice in the trace. 2 `op:` entries back
-to back are operations injected with no step in between, and a long run of
-`step:` entries is the system being left alone to make progress.
-
-### Now make it a test
+### Make it a permanent test
 
 Create `test/abd_test.exs`:
 
@@ -699,7 +552,7 @@ mix test
 
 RESULT: green.
 
-`async: false` is not optional. `dst_time` keeps its state in named ETS tables,
+`async: false` is required. `dst_time` keeps its state in named ETS tables,
 so exactly one virtual clock exists per node, and 2 simulations running
 concurrently will corrupt each other. Every test that drives `dst_run` has to
 be serial.
@@ -707,26 +560,19 @@ be serial.
 Asserting on `adopted_late` in the same loop is a habit worth forming. It costs
 one line and it turns a silent loss of determinism into a failing test.
 
-### The run ended on its own
+## Step 7: Confirm that a seed is reliable
 
-Notice we never touched `settle_steps`. This system has no periodic timers, so
-after the last client exits there's nothing runnable and nothing pending, and
-`dst_run` recognizes that as a finished run.
+The entire goal of this endeavor is to define a single RNG seed that can drive
+our system the same way every time. If we don't get that, then we've failed,
+so it's worth spending some time to confirm.
 
-Not every system does that. Anything with a heartbeat never reaches "nothing
-runnable and nothing pending", so a run can only end by exhausting its step
-budget, which gets reported as an error and makes every run look like a
-failure. That's what `settle_steps` is for, and if you add a timer to this
-system later you'll need it.
+There is one failure mode in particular that we should call out: the `code_server`.
 
-## Step 7: does a seed name an execution?
-
-This is the gate. Nothing downstream means anything until it passes, because a
-seed that doesn't reproduce makes the shrinker useless, a counterexample
-unshareable, and a regression test a coin flip.
-
-Start a **fresh** VM and make this the first thing you run. The first run in a
+Start a **fresh** `iex` shell and make this the first thing you run. The first run in a
 new VM is a special case and we want it in the sample.
+
+This experiment will group traces that match each other. Notice that we're giving the
+same seed on each of 5 runs. We hope to end up with identical traces each time.
 
 ```elixir
 traces = for _ <- 1..5, do: :dst_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000}).trace
@@ -739,32 +585,32 @@ traces
 |> Map.values()
 ```
 
-The count is the assertion. **1** means the seed names an execution.
+RESULT: `2` and `[[1], [2, 3, 4, 5]]`.
 
-The grouping is the diagnostic, and it's why we group rather than count.
-*Which* runs differ tells you far more than how many distinct traces came out:
+If this is the first thing you run in an `iex` shell, you will see that there are 2 unique traces,
+instead of 1.
+
+The grouping shows us that run #1 is the odd-man-out. Runs #2-#5 all match each other. This is
+the clue - something is different about that first run on the VM. Hint: it's the `code_server`.
+
+Here are some potential outputs and what they might mean.
 
 | Grouping | Meaning |
 |---|---|
 | `[[1, 2, 3, 4, 5]]` | Clean. |
-| `[[1], [2, 3, 4, 5]]` | The **first run** is special. Warm-up or first-touch state, nearly always on-demand module loading. |
-| `[[1, 3], [2], [4, 5]]` | A coin flip on every run. A live leak in the system. |
+| `[[1], [2, 3, 4, 5]]` | The **first run** is special. Warm-up or first-touch state. Usually means something is lazily-loaded. |
+| `[[1, 3], [2], [4, 5]]` | A coin flip on every run. A live leak in the system. Something to debug. |
 
-RESULT: `2` and `[[1], [2, 3, 4, 5]]`.
+### Diagnosing the `code_server` problem
 
-### Diagnosing it
+Modules are loaded lazily, by a single `code_server` process on the node. `dst_sched`
+has scheduled a process to run. That process reaches a module the system hasn't loaded yet,
+and sends a message to the `code_server` process, which isn't tracked by `dst_sched`.
+Our process waits on a reply, which `dst_sched` picks up as a yeild, and an opportunity
+for something else to be scheduled. On future runs, this specific yield doesn't exist,
+so we end up with a different trace.
 
-We got the middle row, on a 100-line system, inside the first hour.
-
-Modules are loaded lazily, by a single `code_server` process on the node. A
-scheduled process that reaches a module it hasn't touched yet therefore sends a
-message to a process the scheduler doesn't own, and waits for the reply. That
-reply arrives when wall clock says so, not when the schedule says so, and every
-choice after it shifts. On the second run everything is loaded and it never
-happens again.
-
-**`modules_loaded` names the culprit.** Start a *fresh* VM again — the one from
-the gate above has already loaded everything, so it will tell you nothing:
+**`modules_loaded` tell you when this happens.** Start a *fresh* `iex` again.
 
 ```bash
 MIX_ENV=test iex -S mix
@@ -774,49 +620,32 @@ MIX_ENV=test iex -S mix
 :dst_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000}).modules_loaded
 ```
 
-The rule that usually identifies the culprit without any of this: **the module
-that bites is the one only reachable from a scheduled process.** `abd_harness`
-and `abd_replica` are both reached from `init/2`, which runs in the driver
-process before the scheduler exists, so they load early. `abd_client` is first
-called from *inside* a spawned client, mid-run.
-
-The rest of what this failure looks like in the wild is worth knowing, because
-none of it points anywhere: `adopted_late` was 0, no scheduler warning fired,
-nothing was logged, and the correct-mode suite was green throughout. Not every
-determinism leak has a counter aimed at it, which is why the grouping
-diagnostic above still earns its place. [Page 5](05-gotchas.md) has the longer
-version, including a worse failure this can cause.
+This should show you the modules that were loaded during the run. This is an
+indicator of nondeterminism, not because the sytem is nondeterministic, but because
+it changes `dst_sched`'s scheduling choices.
 
 ### The fix
 
-One option:
+Add the `preload` option (which is what we had already done in our test file):
 
 ```elixir
 opts = %{seed: 1, max_ops: 20, max_steps: 20_000, preload: [:abd]}
 ```
 
-`preload` loads every module of the named applications before the run starts,
-while there is still no scheduler to be outside of. `kernel`, `stdlib` and `dst`
-are always included, so naming your own application is all there is to it.
+`preload` loads every module of the named applications before the run starts. It
+also always loads the modules of `kernel`, `stdlib` and `dst`. If your code has
+other modules, you will have to add them here.
 
-Put it in the options map you pass everywhere from here on.
-
-**Running a seed twice is not a substitute**, and this is the part worth
-remembering. Warming is per *code path*, not per VM: a seed that first reaches a
-timeout handler runs a branch no earlier seed touched and loads code no earlier
-seed needed. Warming up fixes the seed you warmed and leaves the next one
-exposed.
+**Prewarming is not good enough** A prewarming run will only execute a subset of
+codepaths. Some other seed may enter a path with a new module call. Only you know
+the full set of modules that's relevant to preload.
 
 Now go back to **"does a seed name an execution?"** at the top of this step and
 run the 5-trace grouping again, on yet another fresh VM.
 
 RESULT: `1` and `[[1, 2, 3, 4, 5]]`.
 
-`init/2` is called by the driver rather than by you beforehand for the same
-family of reasons. Its contract isn't "start the system", it's "hand over a
-system that won't do anything the schedule didn't ask for".
-
-### Make it a test
+### Add this assertion to our tests
 
 Add to `test/abd_test.exs`:
 
@@ -833,19 +662,21 @@ test "a seed names an execution" do
 end
 ```
 
-Run it early, run it on several seeds, and run it again whenever you touch
-anything.
+Provide enough input seeds to have a high likeihood of covering all codepaths. This
+test will start failing if you add code that calls a new module that is not preloaded.
 
-## Step 8: teach the model to crash a writer
+## Step 8: fault injection
 
-Before we introduce the bug, the workload needs to be able to express the
-failure that makes the bug visible. This step is here because getting it wrong
-costs you a fruitless search, and the reasoning generalizes past ABD.
+Before we purposefully introduce a bug, the workload needs to be able to express the
+failure that makes the bug visible.
 
-### Why scheduling alone isn't enough
+For example, your network can experience a failure
+that causes one of the ABD writers to crash. Right now our system can't
+express this failure mode, because the network is always reliable. Forcing the matter
+is called fault injection. Defining the system faults is your responsibility. `dst` gives
+you the entrypoint for making those faults deterministic.
 
-The natural expectation is that a partially-applied write is just a transient
-the scheduler can freeze. It isn't, and the reason is worth following.
+### What our reliable network looks like in code
 
 A client sends to all 3 replicas inside a **single scheduler step**:
 
@@ -853,26 +684,12 @@ A client sends to all 3 replicas inside a **single scheduler step**:
 [abd_replica:write(Pid, Ref, self(), Ts, Val) || Pid <- Replicas],
 ```
 
-A step runs until the process blocks, so all 3 messages are queued before
-anything else runs. A replica that hasn't applied the write also hasn't been
-stepped, so it hasn't answered any read either. Mailboxes are FIFO, so when the
-scheduler does step it, the `gen_server` drains the write and *then* answers
-the read.
-
-Follow that through and the register is effectively linearizable in this model.
-Any read sent after a write's send-step sees that write at every replica that
-answers it, so a later read's quorum has seen a superset of an earlier read's.
-No inversion is reachable, at any seed.
-
-Sending to every replica in one step models a network that delivers everywhere
-simultaneously, which is stronger than any real network. **A simulation is only
-as faithful as the concurrency it models, and a fault your model can't express
-is a bug your search can't find.** [Page 5](05-gotchas.md) warns against
-injecting faults the system could never see. This is the mirror image, and it
-fails silently rather than loudly: you burn seeds and conclude the code is
-fine.
+All replicas will always get every write. Perfectly reliable network, and not realistic!
 
 ### The crashed writer
+
+Fault injection is itself a deep topic. For this walkthrough, we'll model it as a
+new operation on the client.
 
 Add to `src/abd_client.erl`, and put `partial_write/4` in the export list:
 
@@ -921,30 +738,29 @@ run_op({partial_write, N, Value, Targets}, Tab, Replicas) ->
 ```
 
 Put it alongside the `write` and `read` clauses you already have. The stamps
-still come from `tick/1`; that changes at step 11.
+still come from `tick/1`. (Note: that will change in Step 11)
 
-The target replica is drawn in `generate/2` and carried in the operation, so
-it's part of the recorded trace and replays identically. A crashed writer that
-picked its victim at execution time would be a fault schedule that drifts
-between runs, which is its own section on [page 5](05-gotchas.md).
+The target replica is selected in `generate/2`, using the seed, and carried
+in the operation, so that it is part of the recorded trace.
 
-### The sweep should still be green
+### All tests are still green
 
 RESULT: still green over 40 seeds.
 
-That's the point of doing this step separately. **A crashed writer is harmless
-under correct ABD.** Reader A queries a quorum, finds the orphaned value at the
-1 replica that received it, and writes it back to a quorum before returning.
-Reader B's quorum of 2 intersects A's write-back quorum of 2, so B can't miss
-it.
-
-That's the write-back's whole job, stated as a test. It still looks like belt
-and braces. Next step we delete it, change nothing else, and the same workload
-starts failing.
+Even with network faults, a properly implemented ABD register still works.
+That's the power of correct distributed systems, and not a function of
+`dst`. We've increased our confidence that we've properly implemented the
+ABD Quorum Register. Next, we'll introduce a bug on purpose and discover
+it via `dst`.
 
 ## Step 9: delete the write-back
 
-One variable changes. In `src/abd_client.erl`:
+Remember that odd-looking write on the read path earlier? Let's pretend someone came
+along and deleted that, thinking it was superfluous. You could just delete the line
+of code, but for demo purposes, we'll make the bug a configurable property of our
+app.
+
+Let's introduce `Mode` to define the buggy behavior. In `src/abd_client.erl`:
 
 ```erlang
 read(Replicas) ->
@@ -953,26 +769,27 @@ read(Replicas) ->
 read(Replicas, Mode) ->
     {Ts, Val} = query_phase(Replicas),
     case Mode of
-        correct -> ok = write_phase(Replicas, Ts, Val);
-        no_writeback -> ok
+        correct ->
+            ok = write_phase(Replicas, Ts, Val);
+        no_writeback ->
+            ok
     end,
     {Ts, Val}.
 ```
 
-with `read/2` added to the export list. **That's the whole bug**: one `case` in
-one function, and the deleted branch is the one that looked redundant.
+and add `read/2` added to the export list.
 
-The rest is threading `mode` from `Config` down to the call. Four small edits in
-`test/support/abd_harness.erl`.
+The rest of the changes are to thread `mode` from `Config` down to the call.
+Four edits in `test/support/abd_harness.erl`.
 
-`init/2`'s returned map gains a key:
+`init/2`'s returned map gains a `mode` key:
 
 ```erlang
     {ok, #{tab => Tab, replicas => Replicas, clients => [], next_op => 1,
            mode => maps:get(mode, Config, correct)}}.
 ```
 
-`execute/2` picks it up and passes it on:
+`execute/2` pattern-matches it and plumbs it into `run_op`.
 
 ```erlang
 execute(Op, Sut = #{tab := Tab, replicas := Replicas, clients := Clients, mode := Mode}) ->
@@ -981,8 +798,7 @@ execute(Op, Sut = #{tab := Tab, replicas := Replicas, clients := Clients, mode :
     Sut#{clients := [Client | Clients], next_op := N + 1}.
 ```
 
-and all three `run_op` clauses gain a fourth argument, which only the read
-clause uses:
+All three `run_op` clauses gain a fourth argument; only the read clause uses it:
 
 ```erlang
 run_op({write, N, Value}, Tab, Replicas, _Mode) ->
@@ -999,11 +815,7 @@ run_op({read, N}, Tab, Replicas, Mode) ->
     ets:insert(Tab, {{read, N}, Start, tick(Tab), Ts, Val}).
 ```
 
-Nothing in `check/1` changes. The invariant never knew which mode it was
-checking, which is the point of it being a property of the system rather than
-of the implementation.
-
-Then search:
+Start a new `iex`, and let's conduct a search:
 
 ```elixir
 opts = %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :no_writeback}}
@@ -1016,12 +828,12 @@ opts = %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :no_wr
   end)
 ```
 
-RESULT: **200 seeds in 949 ms**, ~4.7 ms per run. **21 of 200 fail.** The first
-is **seed 6**, so about 30 milliseconds of searching to a counterexample.
+RESULT: **200 seeds in ~1 sec**, **21 of 200 fail.** The first failure
+is **seed 6**, which means it only took 30 msec to find the bug.
 
-A 10% hit rate is worth pausing on. It's frequent enough that the search feels
-instant, and rare enough that it would be annoying to pinpoint by hand. That band is
-where this technique earns its keep.
+A 10% hit rate: It's frequent enough that the search feels instant,
+and rare enough that it would be annoying to pinpoint by hand. That's why
+we think DST is useful.
 
 The violation:
 
@@ -1034,13 +846,15 @@ The violation:
 }}
 ```
 
-Read those as `{start, finish, timestamp}`. The earlier read finished at 11,
-the later one started at 12, so they're genuinely sequential with no overlap.
-And `{0,0}` is the *initial* timestamp: the second read didn't just go stale,
-it reported the register as never written, having watched the previous read
-return a value.
+Those tuples are `{start, finish, timestamp}`. `start` and `finish` define the
+scheduler steps - they point back to items of the trace to aide in debugging.
+The timestamps show the ordering violation - 1 ia earlier than 0.
 
-## Step 10: shrink it
+## Step 10: We have the trace of the bug, now let's print it out
+
+The trace can potentially be very long. One advantage of having a replayable
+system is that we can conduct a search to find the shortest possible trace
+that reproduces the same violation. (Note: global minimization is not guaranteed)
 
 ```elixir
 opts6 = Map.put(opts, :seed, 6)
@@ -1049,34 +863,17 @@ shrunk = :dst_shrink.shrink(:abd_harness, result.trace, opts6)
 :dst_run.summary(shrunk)
 ```
 
-**Pass the same options.** `opts6` carries `config: %{mode: :no_writeback}`,
-and the shrinker starts a fresh system for every candidate. Hand it the
-defaults and it builds a *correct* register, gets a clean run on the first
-candidate, and reports that there's nothing to shrink for a failure that just
-happened.
+**Use the same options.** `opts6` has `config: %{mode: :no_writeback}`,
+and the shrinker starts a fresh system for every candidate.
 
 RESULT: `original: 35, shrunk: 19, tests: 393, verified: true`, in 457 ms.
 
-`verified: true` is the field that decides whether the other 3 mean anything. A
-shrunk candidate is only a recipe, replayed in lenient mode where steps that no
-longer apply get skipped. `true` means `dst_shrink` took what that run actually
+`verified: true` tells you that the search was successful. During the search, a
+candidate is only a recipe, replayed in lenient mode where some steps  get skipped.
+`verified: true` means `dst_shrink` took what that run actually
 executed and replayed it again strictly, and it still failed. `false` means the
 search found something smaller that doesn't reproduce, and you get the original
 back.
-
-### What the shrinker couldn't remove
-
-The 19 surviving entries include 7 operations, and **4 of them never run at
-all.** No `{step, Id}` entry ever names their clients.
-
-That's the positional-id bound. `dst_sched` assigns ids in registration order,
-so deleting an operation renumbers every process created after it, the
-surviving `{step, Id}` entries stop naming what they named, the candidate stops
-failing, and ddmin reverts the removal as unsafe.
-
-So read the result honestly: it's a genuine, verified reproduction, and its
-*minimality* is approximate. The real story is 3 operations, and the next step
-is what makes that visible.
 
 ## Step 11: make the failure readable
 
@@ -1090,27 +887,18 @@ Here is the shrunk trace:
  {step, 3}, {step, 1}, {step, 2}, {step, 3}, {step, 8}, {step, 1}, ...]
 ```
 
-If that means nothing to you, that's the correct reaction, and it's the most
-important thing on this page.
+If that means nothing to you, that's the correct reaction.
 
-**A trace is a scheduler artifact, not an explanation.** `{step, 8}` records
-which process the scheduler chose. It says nothing about what that process did,
-what it read, what it sent, or what state anything was in, and the ids are
-anonymous positions assigned by registration order. Turning it into an
-explanation means reconstructing every mailbox state by hand.
+Remember that we're still working with replayable `dst_sched` actions. Even in
+this minimized state, the shrunk trace is an artifact of the `dst` library,
+and it tells you little about the specifics of the ABD Register. Let's bridge
+that gap.
 
-The schedule tells you what the *scheduler* did. Nothing in `dst` tells you
-what your *system* did, and you need both on one timeline.
+### Using `dst_log`
 
-### `dst_log`, which the library ships for exactly this
-
-> **Note for the rebuild.** The `RESULT` blocks in this step came from a
-> hand-built version of `dst_log` that predates the library one, so the shape is
-> right but the exact lines will differ — the library interleaves `$dst` step
-> entries that the hand-built version never had. Re-record them.
-
-3 phases, deliberately shaped like `fprof`. Don't try to run them yet: our ABD
-system doesn't record any events worth reading until we add the calls below.
+`dst_log` uses a global table. It's API is modeled after `fprof` and other built-in
+Erlang analysis tools. Don't execute these yet; we need to instrument the ABD
+code first.
 
 ```erlang
 dst_run:run(abd_harness, Opts),   %% 1. collect  (automatic)
@@ -1118,25 +906,21 @@ dst_log:profile(),                %% 2. correlate
 dst_log:analyze().                %% 3. present
 ```
 
-Collection is on by default. The middle phase is not ceremony: process names
-**cannot** be resolved during a run, because ids are handed out as processes
-register and only your harness can name them. So the raw log stays dumb, no
-callbacks on the hot path, and correlation happens afterwards.
-
 ### What you add to your system
 
-Two files, seven lines between them. Both already include `dst.hrl` from step 3,
-so the macros are available.
+We'll use `?DST_LABEL` and `?DST_LOG` in our system code. Both of these macros
+expand to no-ops when `DST` is undefined. In production code, this instrumentation
+simply does not exist.
 
-**`src/abd_replica.erl`.** Name the process in `init/1`:
+**`src/abd_replica.erl`.** Label the process in `init/1`:
 
 ```erlang
 init(Index) ->
-    ok = ?DST_ROLE({replica, Index}),
+    ok = ?DST_LABEL({replica, Index}),
     {ok, #st{index = Index}}.
 ```
 
-and log what it answers, in both `handle_cast` clauses:
+and log what it does (with `?DST_LOG`), in the `handle_cast` clauses:
 
 ```erlang
 handle_cast({read, Ref, From}, St = #st{index = I, ts = Ts, val = Val}) ->
@@ -1151,11 +935,11 @@ handle_cast({write, Ref, From, Ts, Val}, St = #st{index = I}) ->
 ```
 
 The boolean on `applied_write` is whether the write actually took. A replica
-that already holds a higher timestamp ignores it, and knowing which is which is
-the difference between reading a failure and guessing at it.
+that already holds a higher timestamp ignores it, and knowing which is which
+will help us troubleshoot.
 
-**`src/abd_client.erl`**, at the 4 points where the protocol decides something.
-In `query_phase/1`, around the collection:
+**`src/abd_client.erl`**, instrument where the protocol decides something, still
+using `?DST_LOG`. In `query_phase/1`, surrounding the collection:
 
 ```erlang
 query_phase(Replicas) ->
@@ -1173,7 +957,7 @@ in `write_phase/3`, before the sends:
     _ = ?DST_LOG({write_sent, Ts, length(Replicas)}),
 ```
 
-in `partial_write/4`, after them:
+in `partial_write/4`, after the sends:
 
 ```erlang
     _ = ?DST_LOG({crashed_after_writing, Ts, Targets}),
@@ -1182,98 +966,38 @@ in `partial_write/4`, after them:
 and in `read/2`'s `no_writeback` branch, which is the one that names the bug:
 
 ```erlang
-        no_writeback -> ?DST_LOG({returned_without_writeback, Ts})
+        no_writeback ->
+            _ = ?DST_LOG({returned_without_writeback, Ts})
 ```
 
-Seven lines in total. They are the difference between a failure you can read and
-one you have to reconstruct, and you choose where they go — nothing here writes
-your narrative for you. Shortly we'll see how that narrative renders alongside
-a trace.
-
-### Macros, not `dst_log` directly
-
-Under a release build `?DST_LOG` expands to nothing at all: no call, no ETS
-lookup, nothing to pay for and nothing to carry. `dst_log:log/1` is inert at
-runtime when no collection is running, but inert still costs a function call and
-a table lookup on every event, and it means your release has to ship `dst` to
-satisfy the call.
-
-The macros are what let instrumentation stay in the source of something that
-ships. Taking it out again is how a system ends up unreadable when it fails.
-
-The argument is **not evaluated** in a release build, so a logged term must be
-free of side effects, and a variable used only inside a `?DST_LOG` will be
-reported unused.
-
-Your harness is the exception, and the next section is about it.
+This instrumentation requires knowledge of the system under test, ABD in this case,
+to be useful. `dst` can't do that for you. Choosing the right instrumentation means
+the trace will be readable. Luckily, since traces are replayable, the instrumentation
+can be decided upon post-fact. You will be able to hone your instrumentation over time
+using real bugs to define the narrative.
 
 ### What you add to your harness
 
 `test/support/abd_harness.erl` never ships, so it can go either way: include
 `dst.hrl` and use the macros, or call `dst_log` directly. We call directly.
 
-The reason is worth knowing even if you don't want it here. **The macros are
-Erlang**, so a harness that calls the functions can be written in Elixir
-instead — which the rest of a simulated system cannot, because `dst_transform`
-is an Erlang parse transform and never reaches an Elixir module. Your harness is
-the one part with that freedom. (You'd want a non-empty `elixirc_paths` for it,
-which step 2 deliberately emptied.)
+The reason: **The macros are Erlang**. A harness that calls the functions instead
+could be written in Elixir, or another BEAM language. The system under test cannot,
+because `dst_transform` is an Erlang parse transform and never reaches an Elixir
+module. Your harness does not have special compile-time requirements, so write it
+in Elixir if you want.
 
-First, one function that decides what every process is called, so that the
-harness and the processes themselves cannot disagree:
-
-```erlang
-role_for({write, N, _Value}) -> {writer, N};
-role_for({partial_write, N, _Value, _Targets}) -> {crasher, N};
-role_for({read, N}) -> {reader, N}.
-```
-
-`execute/2` remembers it, in a new `roles` map beside `clients`:
+First, one function that decides what every client is called. Each one calls it
+on itself, which we wire up in a moment:
 
 ```erlang
-execute(Op, Sut = #{tab := Tab, replicas := Replicas, clients := Clients,
-                    roles := Roles, mode := Mode}) ->
-    N = op_number(Op),
-    Client = dst_run:spawn_op(fun() -> run_op(Op, Tab, Replicas, Mode) end),
-    Sut#{
-        clients := [Client | Clients],
-        roles := Roles#{Client => role_for(Op)},
-        next_op := N + 1
-    }.
+label_for({write, N, _Value}) -> {writer, N};
+label_for({partial_write, N, _Value, _Targets}) -> {crasher, N};
+label_for({read, N}) -> {reader, N}.
 ```
 
-with `roles => #{}` added to `init/2`'s returned map. Then the optional 7th
-callback is a merge:
-
-```erlang
-labels(#{replicas := Replicas, roles := Roles}) ->
-    maps:merge(
-        maps:from_list([{Pid, {replica, I}} || {I, Pid} <- lists:enumerate(Replicas)]),
-        Roles
-    ).
-```
-
-Add `labels/1` to the export list.
-
-**One source, and that is the point.** A process names itself with `role/1` and
-your harness names it with `labels/1`, and those are 2 different mechanisms
-reaching the same output: `labels/1` names the `{step, Id}` lines, `role/1` names
-everything the process logs. Let them disagree and the same process appears
-under 2 names in the same report, which is worse than no names at all. Deriving
-both from `role_for/1` makes that impossible.
-
-It's called **once**, after the run, which is why it takes the whole state
-rather than one pid at a time. Your harness already holds its processes in
-lists, so building the map forwards is a comprehension; being asked "what is
-this pid called" one at a time would mean writing reverse lookups you otherwise
-never need. And ids are handed out as processes register, so this mapping cannot
-exist until the run is over.
-
-Name what you care about and leave the rest out. Names are ordinary terms:
-`dst_log` renders any `{Kind, N}` as `kind-n`, so `{replica, 2}` prints as
-`replica-2` and `{reader, 6}` as `reader-6`. There is no special case for short
-names, which is why `{r, 2}` would print as `r-2` and sit awkwardly next to
-`reader-6` in a long column.
+There is an optional `labels/1` callback on `dst_harness`, but we don't need it here
+because each process names itself.
 
 ### Use one clock, and only one
 
@@ -1295,11 +1019,11 @@ tick(Tab) ->                               %% delete this function
 ```
 
 **In each of the 3 `run_op/4` clauses**, name the process and replace both
-`tick(Tab)` calls. Every clause follows the same shape, so here are all three:
+`tick(Tab)` calls. Provided here in full for easy copying.
 
 ```erlang
 run_op(Op, Tab, Replicas, Mode) ->
-    ok = dst_log:role(role_for(Op)),
+    ok = dst_log:label(label_for(Op)),
     Start = dst_log:log(started),
     run_op(Op, Tab, Replicas, Mode, Start).
 
@@ -1314,27 +1038,7 @@ run_op({read, N}, Tab, Replicas, Mode, Start) ->
     ets:insert(Tab, {{read, N}, Start, dst_log:log({finished, Ts}), Ts, Val}).
 ```
 
-Naming and stamping happen once, in the `run_op/4` head, which is the same
-`role_for/1` your `labels/1` uses. The `role/1` call belongs here rather than in
-`execute/2` because `execute/2` runs in the *driver* process, and the role
-belongs to the client that `spawn_op/1` created.
-
-**Why bother.** 2 counters would give you a violation reporting
-`earlier: {8, 11, ...}` and no way to look up event 8. With 1, **the violation
-indexes into the narrative**: read the numbers, jump to those lines. That is the
-difference between a log you search and a failure report that points at itself.
-
-### 2 things you no longer have to get right
-
-**The teardown boundary.** `dst_run` releases every suspended process before
-tearing the system down, so anything they had left to do runs on the *real*
-scheduler. In our hand-built version that produced 26 trailing events with no
-marker, and a reader would have tried to make sense of them. `dst_log` records
-a release marker and `analyze/0` hides everything after it by default.
-
-**The perturbation check.** ETS operations don't block, and a step ends when a
-process blocks in a receive, so logging can't move a step boundary. That's the
-argument; `dst_log`'s own suite asserts it. Confirm it for your own logging:
+It can be helpful to confirm that the log does not influence trace replayability:
 
 ```elixir
 a = :dst_run.run(:abd_harness, Map.put(opts, :seed, 6)).trace
@@ -1342,23 +1046,16 @@ b = :dst_run.run(:abd_harness, Map.put(opts, :seed, 6) |> Map.put(:log, false)).
 a == b
 ```
 
-RESULT: `true`, at 35 entries each.
+`log => false` suppresses the *events*, but still allows the sequence numbers.
 
-`log => false` suppresses the *events* and not the sequence numbers `log/1`
-hands out. That distinction is load-bearing here: your harness stamps every
-operation from `log/1`, so stamps that all read 0 would make `check/1`'s
-"finished before started" test compare `0 < 0`, hold for no pair, and quietly
-check nothing. The run would sail past the violation and the traces would differ
-— `a` a strict prefix of `b`, because only one of them stopped at the bug.
-
-**Observability that changes the schedule is worse than none**, because every
+**Observability that changes the trace is not worth it**, because every
 failure you then investigate is a different failure from the one you set out to
 investigate.
 
 ### Read the failure
 
 Four files have changed since step 10, so start a **fresh shell** and rebuild
-`shrunk` from scratch. The old binding is stale and so are the beams behind it.
+`shrunk` from scratch.
 
 ```bash
 MIX_ENV=test iex -S mix
@@ -1375,10 +1072,9 @@ shrunk = :dst_shrink.shrink(:abd_harness, result.trace, opts6)
 
 Use whichever seed your own step 9 sweep turned up; 6 was ours.
 
-**Then replay the shrunk trace, and don't skip this.** Collection resets at the
-start of every run, and `shrink/3` just did several hundred of them. Right now
-the log holds whatever its *last* candidate did, which is not your failure.
-Replaying puts the trace you care about in the log and nothing else:
+**Don't skip this: replay the shrunk trace** Collection resets at the
+start of every run, and `shrink/3` just did several hundred of them. Make
+sure the system can collect the log events you care about.
 
 ```elixir
 :dst_run.replay(:abd_harness, shrunk.trace, opts6)
@@ -1386,10 +1082,6 @@ Replaying puts the trace you care about in the log and nothing else:
 {:violation, %{later: {_start, finish, _ts}}} = shrunk.outcome
 :dst_log.analyze(%{until: finish})
 ```
-
-The stamps in that violation are `dst_log` sequence numbers now, not the
-`tick/1` counter they came from at step 10, so expect different values from the
-ones you saw there. That is the point of the change: they are line numbers.
 
 RESULT:
 
@@ -1439,14 +1131,9 @@ RESULT:
    43  reader-7       {finished,{0,0}}
 ```
 
-A `{step, _}` line and the events under it always carry the same name, which is
-what `role_for/1` bought. If you ever see one process appear under 2 names, your
-`labels/1` and your `role/1` calls have drifted apart.
-
 ### How to read 40 lines
 
-You don't. The violation tells you which ones matter, and that is what the
-single clock bought:
+Don't! The violation tells you which ones matter.
 
 ```
 earlier: {19, 30, {1, 1}}
@@ -1457,6 +1144,11 @@ Those are **line numbers**. Read 19 to 30 for how the earlier read saw `{1,1}`,
 32 to 43 for how the later one missed it, and the `crashed_after_writing` line
 above them for why there was anything to miss. Everything else is context you
 can skip until you need it.
+
+Still, to make sense of this rendering, you will need to have knowledge and
+understanding of the ABD system itself. Don't be alarmed if the trace remains
+confusing even at this stage. When you write your system, you will be the expert,
+and as the expert you will be able to parse this information.
 
 `dst_log:analyze(%{until: finish, driver: false})` drops the `$dst` lines
 entirely if you want only what the system did.
@@ -1470,26 +1162,24 @@ reads are sequential, and the register went backwards.
 
 The counterintuitive part, and the reason this bug survives code review:
 reader-6's quorum was `{replica-2, replica-3}` and reader-7's was
-`{replica-3, replica-1}`. **They do intersect, at replica-3.** Quorum intersection worked exactly as advertised. It didn't
-help, because `{1,1}` only ever existed at 1 replica, which is less than a
-quorum, and intersection only guarantees you see what was written to a quorum.
+`{replica-3, replica-1}`. **They do intersect, at replica-3.** Quorum intersection worked exactly as advertised. But it didn't help, because `{1,1}` only ever existed at 1 replica.
 
 Reader-6 got lucky enough to observe a value that was never durable, and by
 returning it, published something the system could no longer produce. **The
 write-back is what turns "I observed this" into "this is durable at a quorum"
 before the value escapes.** With it, reader-6 writes `{1,1}` to 2 replicas
-before returning, and reader-7's quorum of 2 cannot miss it. Not "probably
-won't". Cannot, by counting.
+before returning, and reader-7's quorum of 2 cannot miss it.
 
-### One thing that looks wrong and isn't
+One other item to note. There are entries in this trace that are a result of
+old messages in the process mailboxes that eventually get picked up. They
+exist because we were lazy about maintaining a clean mailbox in the implementation.
 
-Lines 37 to 39 are replica-1 answering 3 reads in a row off a single step. It had never
-been stepped before, so it drained a mailbox holding queries from crasher-1,
-reader-6 and reader-7 in one go, and 2 of those replies went to processes that
-had already exited. That is a `gen_server` running until it blocks, which is
-exactly what a step is.
+## (Optional) Step 12: confirm the bug and the patch in formal assertions
 
-## Step 12: lock it in
+Optional step. This illustrates how the same seed can experience different codepaths
+using different configuration options. Because we made the buggy behavior a configurable
+mode, we can test the same seed under two different codepaths. One asserts the violation,
+and one asserts system health.
 
 ```elixir
   @buggy %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :no_writeback}}
@@ -1505,51 +1195,21 @@ exactly what a step is.
   end
 ```
 
-That pair is the standard [page 4](04-writing-a-system-under-test.md) asks for
-and that almost nobody manages: **a test that fails deterministically before
-the fix and passes after it.** Not "we ran it a few times and it stopped
-happening". The same seed, the same schedule, 1 line of protocol different.
 
-## Step 13: put the clock on the critical path
+## Step 13: a virtual clock
 
 Every run so far has reported `clock_ms: 0`. The system has no timers, so
-`dst_time` has never done anything and the transform we put on `abd_replica`
-back at step 3 has never rewritten a line. This step fixes both, by letting a
-replica become unreachable and letting a client give up.
+`dst_time` has never done anything and the parse transform we put on `abd_replica`
+back at step 3 has never rewritten a line. However, time is a very typical
+component of distributed systems, and usually shows up as timeouts.
 
-### Two ways to write a timeout, and the simple one works
+`dst_transform` rewrites `receive-after` language constructs and `erlang:send_after`.
+Both become deterministic with `dst_time`'s virtual clock.
 
-The obvious version:
+### Another fault injection - a replica that dies
 
-```erlang
-receive
-    {read_ack, Ref, _Index, Ts, Val} -> ...
-after ?PHASE_TIMEOUT ->
-    give_up()
-end
-```
-
-`after` is a language construct rather than a call, so it looks as though a
-transform that rewrites calls can't reach it. It can. `receive Cs after T -> B
-end` is an abstract form like any other, and `dst_transform` rewrites it into a
-receive whose timeout arrives as an ordinary message on the virtual clock.
-
-**It's on by default**, because `after` is the one real-time dependence a system
-can hold without naming a function. `-dst_after(false).` opts a module out.
-`after 0` is never rewritten, since it's a mailbox poll rather than a wait.
-
-So write the obvious version. It costs a timer armed and cancelled per receive,
-which is worth knowing about before putting it on a hot loop and not worth
-thinking about here.
-
-The one thing to be deliberate about is what the deadline *means*. `after T`
-inside a collection loop restarts on every message, so this is "give up if no
-replica answers for T", not "give up if the whole phase takes longer than T".
-For a quorum read that's a reasonable liveness policy. If you wanted a
-whole-phase deadline you'd arm one `erlang:send_after/3` before the loop and
-match its message as a clause, which the transform handles the same way.
-
-### A replica that goes away
+Here's another fault injection site. This time, we'll allow the replica to become
+busy, preventing timely responses. This fault simulates high network latency.
 
 In `src/abd_replica.erl`, add a `paused` field, a `pause/2` cast, and 3 clauses
 **above** the existing `handle_cast`s:
@@ -1576,7 +1236,12 @@ handle_info(resume, St) ->
 ```
 
 That `erlang:send_after/3` is the first line in the project the transform
-actually rewrites.
+actually rewrites. If it feels nondeterministic to you, you're right, it should!
+What you don't see is that `dst_transform` will rewrite things at compile time
+(when `DST` is defined). That rewrite replaces the wall clock with a virtual one,
+and removes the nondeterminism.
+
+TODO - JMS - continue here
 
 ### A client that gives up
 
@@ -1649,14 +1314,14 @@ generate(#{next_op := N, replicas := Replicas}, Rand0) ->
 4% is deliberate and the reasoning is below, under "why the tuning is
 bimodal". Our first attempt used 10% and broke the workload.
 
-`op_number/1` and `role_for/1` each gain a clause:
+`op_number/1` and `label_for/1` each gain a clause:
 
 ```erlang
 op_number({pause, N, _Index, _Ms}) -> N;
 ```
 
 ```erlang
-role_for({pause, N, _Index, _Ms}) -> {pauser, N};
+label_for({pause, N, _Index, _Ms}) -> {pauser, N};
 ```
 
 And `run_op/5` gains a clause for the new operation. Naming and the start stamp
@@ -1749,7 +1414,7 @@ executes is exactly the kind of thing that looks tested and isn't.
 
 ```elixir
 :dst_log.profile()
-|> Enum.reject(&(&1.role == :"$dst"))
+|> Enum.reject(&(&1.label == :"$dst"))
 |> Enum.map(fn %{what: what} -> if is_tuple(what), do: elem(what, 0), else: what end)
 |> Enum.frequencies()
 ```

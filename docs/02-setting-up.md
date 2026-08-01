@@ -38,7 +38,7 @@ Every module that takes part in a simulation includes one header:
 ```
 
 That's the whole opt-in. Under a simulation build it brings the parse transform
-and the `?DST_LOG` and `?DST_ROLE` macros; under a release build it brings
+and the `?DST_LOG` and `?DST_LABEL` macros; under a release build it brings
 nothing at all, so a module carrying it has no relationship to this library and
 can ship unchanged.
 

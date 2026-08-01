@@ -22,7 +22,7 @@ start_link(Tab, Participants, Mode) ->
     gen_server:start_link(?MODULE, {Tab, Participants, Mode}, []).
 
 init({Tab, Participants, Mode}) ->
-    ok = ?DST_ROLE(coordinator),
+    ok = ?DST_LABEL(coordinator),
     {ok, #{tab => Tab, participants => Participants, mode => Mode, pending => #{}}}.
 
 handle_call({run_tx, TxId}, From, St) ->

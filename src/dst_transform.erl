@@ -105,7 +105,7 @@ Include the header, which carries the attribute behind the `DST` define:
 
 and compile the simulation build with `{d, 'DST'}`. Per-module and opt-in, so
 there is no way to ship it by accident and no runtime cost when it is off. The
-same header defines `?DST_LOG` and `?DST_ROLE`; see `dst_log`.
+same header defines `?DST_LOG` and `?DST_LABEL`; see `dst_log`.
 
 Even when it *is* on, `dst_time` delegates to `erlang` unless a virtual clock is
 running — so a module built with the transform behaves normally outside a

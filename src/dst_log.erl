@@ -36,7 +36,7 @@ Not these functions directly. Include the header and use the macros:
 -include_lib("dst/include/dst.hrl").
 
 init(Index) ->
-    ok = ?DST_ROLE({replica, Index}),
+    ok = ?DST_LABEL({replica, Index}),
     {ok, #st{index = Index}}.
 
 handle_cast({read, Ref, From}, St = #st{ts = Ts}) ->
@@ -56,7 +56,7 @@ presentation — and are called from tests and shells rather than from a module
 that ships.
 
 A harness may use either. It never ships, so the macros buy it nothing, and
-calling `role/1` and `log/1` directly means a harness can be written in Elixir:
+calling `label/1` and `log/1` directly means a harness can be written in Elixir:
 the macros are Erlang, and so is `dst_transform`, so the harness is the one part
 of a simulated system with that freedom.
 
@@ -108,11 +108,12 @@ would be a different failure from the one you set out to investigate.
     trace/1,
     running/0,
     stop/0,
-    role/1,
+    label/1,
+    self_labels/0,
     log/1,
     seq/0,
     events/0,
-    labels/1,
+    register_labels/1,
     profile/0,
     analyze/0,
     analyze/1
@@ -121,9 +122,13 @@ would be a different failure from the one you set out to investigate.
 -export_type([event/0, entry/0]).
 
 -define(TAB, dst_log_events).
--define(ROLE, '$dst_log_role').
+-define(LABEL, '$dst_log_label').
 
-%% Reserved role for entries written by the framework rather than by the system
+%% Key prefix for the pid-to-label rows `label/1` writes. A tuple, so it cannot
+%% collide with the integer sequence numbers the events are keyed on.
+-define(SELF, '$self').
+
+%% Reserved label for entries written by the framework rather than by the system
 %% under test. Rendered as `$dst` so a reader can tell the driver's decisions
 %% from the system's behaviour at a glance.
 -define(DRIVER, '$dst').
@@ -131,7 +136,7 @@ would be a different failure from the one you set out to investigate.
 -type event() :: {non_neg_integer(), term(), term()}.
 -type entry() :: #{
     seq := non_neg_integer(),
-    role := term(),
+    label := term(),
     name := binary(),
     what := term(),
     step := non_neg_integer() | undefined,
@@ -203,21 +208,81 @@ stop() ->
 -doc """
 Names the calling process for the log.
 
-Call `?DST_ROLE(Role)` rather than this, so a release build strips it. See the
+Call `?DST_LABEL(Label)` rather than this, so a release build strips it. See the
 module doc.
 
 Kept in the process dictionary, so logging costs nothing at the call sites and
 no API has to carry a label around. Call it once, wherever the process starts:
 in a `gen_server`'s `init/1`, or at the top of whatever an operation spawns.
 
-This is the *self-reported* name. `dst_harness`'s optional `labels/1` is the
-harness naming processes from outside, and it wins when both exist.
+## A label is permanent
+
+The first call wins. A second call with a different label is ignored and
+warned about, because a label is a property of a *process*, not of its current
+state. A replica that becomes leader has not become a different process, and
+saying so would rewrite the name on every step it took beforehand. Log the
+transition as an event instead — that is what events are for, and it keeps the
+before and the after both readable.
+
+## It also names the step lines
+
+Registering here is what lets a `{step, Id}` line carry the same name as the
+events underneath it. The process cannot know its own scheduler id — it is
+labelled in `init/1`, before `dst_sched` has assigned one — so the pid is
+recorded and `dst_run` joins it against the scheduler's id-to-pid map at
+teardown.
+
+**That join is why the self-reported name wins** over `dst_harness`'s optional
+`labels/1`. Two sources naming one process is how the same process ends up under
+2 names in one report, and one of those sources is the process itself. Use
+`labels/1` for the processes that never labelled themselves: something from a
+library you do not own, or a module you kept the header out of.
 """.
 -endif.
--spec role(term()) -> ok.
-role(Role) ->
-    _ = put(?ROLE, Role),
-    ok.
+-spec label(term()) -> ok.
+label(Label) ->
+    case get(?LABEL) of
+        undefined ->
+            _ = put(?LABEL, Label),
+            remember(Label);
+        Label ->
+            %% Idempotent, and re-registering matters: a process that outlives a
+            %% `trace/1` reset would otherwise be missing from the new table.
+            remember(Label);
+        Existing ->
+            logger:warning(
+                "dst_log: ~p is already labelled ~p, ignoring the relabel to ~p. "
+                "A label is a permanent property of a process; represent a change "
+                "of state as a logged event instead.",
+                [self(), Existing, Label]
+            ),
+            ok
+    end.
+
+remember(Label) ->
+    case ets:whereis(?TAB) of
+        undefined ->
+            ok;
+        _ ->
+            true = ets:insert(?TAB, {{?SELF, self()}, Label}),
+            ok
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Every label a process gave itself this run, as `#{pid() => term()}`.
+
+`dst_run` joins this against the scheduler's id-to-pid map; a harness has no
+reason to call it.
+""".
+-endif.
+-spec self_labels() -> #{pid() => term()}.
+self_labels() ->
+    try ets:match_object(?TAB, {{?SELF, '_'}, '_'}) of
+        Rows -> maps:from_list([{Pid, Label} || {{_, Pid}, Label} <- Rows])
+    catch
+        error:badarg -> #{}
+    end.
 
 -if(?DOCATTRS).
 -doc """
@@ -241,7 +306,7 @@ log(What) ->
         _ ->
             Seq = ets:update_counter(?TAB, '$seq', 1),
             case ets:lookup_element(?TAB, '$record', 2) of
-                true -> true = ets:insert(?TAB, {Seq, get(?ROLE), What});
+                true -> true = ets:insert(?TAB, {Seq, get(?LABEL), What});
                 false -> ok
             end,
             Seq
@@ -264,7 +329,7 @@ seq() ->
 -spec events() -> [event()].
 events() ->
     try
-        [E || E = {Seq, _Role, _What} <- ets:tab2list(?TAB), is_integer(Seq)]
+        [E || E = {Seq, _Label, _What} <- ets:tab2list(?TAB), is_integer(Seq)]
     catch
         error:badarg -> []
     end.
@@ -272,14 +337,19 @@ events() ->
 -if(?DOCATTRS).
 -doc """
 Records the id-to-name mapping for this run. Called by `dst_run` at teardown,
-once the harness can finally name the processes it created.
+once ids can finally be joined to names.
+
+The plural of `label/1` in subject, not in object: `label/1` is a process naming
+*itself*, this is the finished map for the whole run — every self-reported label
+plus whatever `dst_harness:labels/1` added for the processes that never reported
+one.
 
 Stored beside the events rather than resolved into them, so the raw log stays a
 record of facts and naming stays a presentation concern.
 """.
 -endif.
--spec labels(#{non_neg_integer() => term()}) -> ok.
-labels(Map) ->
+-spec register_labels(#{non_neg_integer() => term()}) -> ok.
+register_labels(Map) ->
     case running() of
         false ->
             ok;
@@ -309,12 +379,12 @@ profile() ->
     Labels = stored_labels(),
     {Entries, _Step, _Sim} =
         lists:foldl(
-            fun({Seq, Role, What}, {Acc, Step, Sim}) ->
-                {Step1, Sim1} = advance(Role, What, Step, Sim),
+            fun({Seq, Label, What}, {Acc, Step, Sim}) ->
+                {Step1, Sim1} = advance(Label, What, Step, Sim),
                 Entry = #{
                     seq => Seq,
-                    role => Role,
-                    name => name(Role, What, Labels),
+                    label => Label,
+                    name => name(Label, What, Labels),
                     what => What,
                     step => Step1,
                     simulated => Sim1
@@ -327,19 +397,19 @@ profile() ->
     lists:reverse(Entries).
 
 %% A driver `step` entry opens a new step; the release marker closes the
-%% simulation and everything after it is teardown. Dispatching on the role
+%% simulation and everything after it is teardown. Dispatching on the label
 %% rather than the payload means a system that logs its own `{step, _}` term
 %% cannot be mistaken for the driver.
 advance(?DRIVER, {step, Id}, _Step, Sim) -> {Id, Sim};
 advance(?DRIVER, released, Step, _Sim) -> {Step, false};
-advance(_Role, _What, Step, Sim) -> {Step, Sim}.
+advance(_Label, _What, Step, Sim) -> {Step, Sim}.
 
 %% A driver step is rendered under the name of the process it chose, which is
 %% what makes the timeline read as one story rather than two interleaved ones.
 name(?DRIVER, {step, Id}, Labels) -> label_for(Id, Labels);
 name(?DRIVER, _What, _Labels) -> <<"$dst">>;
 name(undefined, _What, _Labels) -> <<"?">>;
-name(Role, _What, _Labels) -> format(Role).
+name(Label, _What, _Labels) -> format(Label).
 
 label_for(Id, Labels) ->
     case maps:get(Id, Labels, undefined) of
@@ -347,7 +417,7 @@ label_for(Id, Labels) ->
         Name -> format(Name)
     end.
 
-%% Names are ordinary terms, from `role/1` or from a harness's `labels/1`, and
+%% Names are ordinary terms, from `label/1` or from a harness's `labels/1`, and
 %% rendering them is this module's job rather than the caller's. A harness
 %% returning `{participant, 2}` is saying something clearer than one returning
 %% a preformatted string, so the tuple form gets first-class treatment and
@@ -419,10 +489,10 @@ analyze(Opts) ->
     Driver = maps:get(driver, Opts, true),
     Selected = [
         E
-     || E = #{seq := Seq, role := Role, simulated := Sim} <- profile(),
+     || E = #{seq := Seq, label := Label, simulated := Sim} <- profile(),
         Until =:= infinity orelse Seq =< Until,
         Teardown orelse Sim,
-        Driver orelse Role =/= ?DRIVER
+        Driver orelse Label =/= ?DRIVER
     ],
     Text = [render(E) || E <- Selected],
     case maps:get(dest, Opts, []) of

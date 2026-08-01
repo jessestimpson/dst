@@ -87,7 +87,7 @@ application's `applications` list, so nothing here ships or runs in production.
 ## Your system under test has to be Erlang
 
 `dst_transform` is an Erlang parse transform, so it never reaches an Elixir
-module, and `?DST_LOG` and `?DST_ROLE` are Erlang macros. A system written in
+module, and `?DST_LOG` and `?DST_LABEL` are Erlang macros. A system written in
 Elixir gets none of it: its timers stay on the real clock, its spawns aren't
 gated by the scheduler, and it can't record into `dst_log`.
 
@@ -112,7 +112,9 @@ that consumer exercises.
   scheduler step, so a partially-delivered broadcast isn't a state the scheduler
   can produce, and you have to model that fault in your workload instead.
   Partial delivery, per-link reordering and partitions are all out of reach.
-  This is the largest gap.
+  This is the largest gap. Idea: `dst`'s responsibility is to inject a seed
+  into the system under test, via the harness, and fault injection is the
+  developer's.
 - **Elixir systems can't be transformed.** See above.
 - **One simulation per VM.** `dst_time` and `dst_log` keep state in named ETS
   tables, so runs must be serial. Keep the tests `async: false`.

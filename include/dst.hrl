@@ -33,18 +33,18 @@
 -compile({parse_transform, dst_transform}).
 
 %% Name the calling process for `dst_log`. Call once, where the process starts.
--define(DST_ROLE(Role), dst_log:role(Role)).
+-define(DST_LABEL(Label), dst_log:label(Label)).
 
 %% Record an event, returning its sequence number. See `dst_log`.
 -define(DST_LOG(Event), dst_log:log(Event)).
 
 -else.
 
-%% Release build. `Event` and `Role` are **not evaluated**, so anything you log
+%% Release build. `Event` and `Label` are **not evaluated**, so anything you log
 %% must be free of side effects — and a variable used *only* inside one of these
 %% will be reported unused. Bind it with a leading underscore, or log something
 %% the function already needs.
--define(DST_ROLE(Role), ok).
+-define(DST_LABEL(Label), ok).
 -define(DST_LOG(Event), 0).
 
 -endif.

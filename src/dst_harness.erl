@@ -62,9 +62,17 @@ rule.
 `terminate(State)` — tear down. Called however the run ends, including on
 violation.
 
-`labels(State)` — **optional.** A `#{pid() => Name}` map, used when
-`dst_log:analyze/0` renders a run. Without it a step reads `p7`; with it,
-`participant-2`.
+`labels(State)` — **optional, and the fallback rather than the main road.** A
+`#{pid() => Name}` map, used when `dst_log:analyze/0` renders a run. Without a
+name a step reads `p7`; with one, `participant-2`.
+
+Prefer `?DST_LABEL(Name)` in the process itself. A process that labels itself is
+named in one place, so its step lines and its own events cannot disagree, and a
+self-reported name wins here. What this callback is for is the processes that
+*cannot* name themselves: something from a library you do not own, or a module
+you deliberately kept `dst.hrl` out of. `dst_2pc`'s clients are the example —
+they are anonymous funs handed to `dst_run:spawn_op/1`, so the harness is the
+only thing that knows what each one is.
 
 Called **once**, after the run, which is why it takes the whole state rather
 than one pid at a time: a harness already holds its processes in lists and maps,

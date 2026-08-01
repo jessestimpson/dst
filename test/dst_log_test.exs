@@ -28,10 +28,10 @@ defmodule DstLogTest do
     test "is on by default and records both streams" do
       :dst_run.run(@harness, Map.put(@opts, :seed, 1))
 
-      roles = for %{role: r} <- :dst_log.profile(), do: r
+      labels = for %{label: r} <- :dst_log.profile(), do: r
 
-      assert :"$dst" in roles, "the driver's own decisions are missing"
-      assert Enum.any?(roles, &match?({:participant, _}, &1)), "the system's events are missing"
+      assert :"$dst" in labels, "the driver's own decisions are missing"
+      assert Enum.any?(labels, &match?({:participant, _}, &1)), "the system's events are missing"
     end
 
     test "log => false collects nothing but keeps the clock" do
@@ -147,11 +147,63 @@ defmodule DstLogTest do
       # Driven by hand rather than through a run, which is both the tighter test
       # and the only coverage of the manual `trace/1` path.
       :ok = :dst_log.trace(:start)
-      :ok = :dst_log.role(:"$dst")
+      :ok = :dst_log.label(:"$dst")
       :dst_log.log({:step, 0})
       :dst_log.log({:step, 7})
 
       assert step_names() == ["p0", "p7"]
+    end
+
+    test "a process that labels itself needs no harness callback" do
+      :ok = :dst_log.trace(:start)
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :ok = :dst_log.label({:worker, 1})
+          send(parent, :labelled)
+          receive do: (:stop -> :ok)
+        end)
+
+      assert_receive :labelled
+      assert :dst_log.self_labels() == %{pid => {:worker, 1}}
+      send(pid, :stop)
+    end
+
+    test "self-reported and harness-supplied names merge" do
+      # The discriminating case, because 2PC uses both. Participants and the
+      # coordinator include the header and name themselves; clients are
+      # anonymous funs handed to `spawn_op/1`, so only `labels/1` knows them.
+      :dst_run.run(@harness, Map.put(@opts, :seed, 1))
+
+      self_reported = Map.values(:dst_log.self_labels())
+
+      assert :coordinator in self_reported
+      assert Enum.any?(self_reported, &match?({:participant, _}, &1))
+
+      refute Enum.any?(self_reported, &match?({:client, _}, &1)),
+             "clients cannot label themselves, which is what `labels/1` is for"
+
+      assert Enum.any?(step_names(), &String.starts_with?(&1, "client-")),
+             "the harness's names must survive the merge"
+    end
+
+    test "a label is permanent, and a relabel is refused loudly" do
+      :ok = :dst_log.trace(:start)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          :ok = :dst_log.label(:follower)
+          :ok = :dst_log.label(:leader)
+        end)
+
+      assert log =~ "already labelled"
+      :dst_log.log(:promoted)
+
+      assert [%{label: :follower}] = :dst_log.profile()
+
+      assert :dst_log.self_labels() == %{self() => :follower},
+             "the first label is the one that reaches the step lines"
     end
 
     test "a harness that never defines labels/1 still profiles" do
@@ -168,7 +220,7 @@ defmodule DstLogTest do
   end
 
   defp step_names do
-    for %{role: :"$dst", what: {:step, _}, name: n} <- :dst_log.profile(), do: n
+    for %{label: :"$dst", what: {:step, _}, name: n} <- :dst_log.profile(), do: n
   end
 
   describe "presentation" do

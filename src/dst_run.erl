@@ -501,7 +501,7 @@ drive(Mod, Opts, Source) ->
     %% the record too. The driver names itself once, here, and every entry it
     %% writes from now on is tagged as the framework's rather than the system's.
     ok = start_log(maps:get(log, Opts, true)),
-    ok = dst_log:role('$dst'),
+    ok = dst_log:label('$dst'),
     %% Before the system, always — see the module doc.
     ok = dst_time:start(#{seed => Seed}),
     try
@@ -782,33 +782,37 @@ loaded_since(Before) ->
     Known = maps:from_keys(Before, []),
     lists:sort([M || M <- erlang:loaded(), not is_map_key(M, Known)]).
 
-%% `labels/1` is optional, and a harness that does not define it gets `p0`, `p1`
-%% and so on. Called once and joined against the scheduler's id-to-pid map here,
-%% so the harness never has to think in ids.
+%% Two sources, joined against the scheduler's id-to-pid map here so that neither
+%% one has to think in ids. A process that labelled itself wins: it is the source
+%% closest to the truth, and letting the harness override it is how one process
+%% ends up under 2 names in the same report.
 %%
+%% Both are optional. A run where nobody names anything gets `p0`, `p1` and so on.
+collect_labels(Mod, Sut, Sched) ->
+    ByPid = maps:merge(harness_labels(Mod, Sut), dst_log:self_labels()),
+    maps:fold(
+        fun(Id, Pid, Acc) ->
+            case maps:find(Pid, ByPid) of
+                {ok, Name} -> Acc#{Id => Name};
+                error -> Acc
+            end
+        end,
+        #{},
+        dst_sched:procs(Sched)
+    ).
+
 %% Wrapped because this runs during teardown, after a run that may already have
 %% failed: a harness whose labelling crashes should not turn a reported violation
 %% into a teardown error.
-collect_labels(Mod, Sut, Sched) ->
+harness_labels(Mod, Sut) ->
     case erlang:function_exported(Mod, labels, 1) of
         false ->
             #{};
         true ->
-            ByPid =
-                case catch Mod:labels(Sut) of
-                    Map when is_map(Map) -> Map;
-                    _ -> #{}
-                end,
-            maps:fold(
-                fun(Id, Pid, Acc) ->
-                    case maps:find(Pid, ByPid) of
-                        {ok, Name} -> Acc#{Id => Name};
-                        error -> Acc
-                    end
-                end,
-                #{},
-                dst_sched:procs(Sched)
-            )
+            case catch Mod:labels(Sut) of
+                Map when is_map(Map) -> Map;
+                _ -> #{}
+            end
     end.
 
 %% Bounded, and in a process of its own, so a `check/1` that calls into a
@@ -847,7 +851,7 @@ finish(Outcome, R) ->
     %% the mapping does not exist until the run is over, and only the harness can
     %% supply it — with its own state in hand. Doing it here keeps every callback
     %% off the hot path.
-    ok = dst_log:labels(collect_labels(Mod, Sut, Sched)),
+    ok = dst_log:register_labels(collect_labels(Mod, Sut, Sched)),
     %% Everything logged after this ran on the *real* scheduler, because
     %% `release/1` resumes every suspended process. It is real, it is
     %% nondeterministic, and it is not part of the run. `dst_log` hides it by
