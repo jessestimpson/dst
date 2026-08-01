@@ -13,6 +13,9 @@
 # Temporary files, for example, from tests.
 /tmp/
 
+# Dialyzer PLTs, cached by CI rather than committed.
+/priv/plts/
+
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
 

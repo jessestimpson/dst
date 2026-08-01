@@ -116,7 +116,10 @@ defmodule DstObserveTest do
       tokens
       |> Enum.chunk_while([], &chunk_form/2, fn acc -> {:cont, Enum.reverse(acc), []} end)
       |> Enum.reject(&(&1 == []))
-      |> Enum.map(fn f -> {:ok, form} = :erl_parse.parse_form(f); form end)
+      |> Enum.map(fn f ->
+        {:ok, form} = :erl_parse.parse_form(f)
+        form
+      end)
 
     try do
       :compile.forms(forms, [:return_errors, {:parse_transform, :dst_transform}])

@@ -341,7 +341,7 @@ once ids can finally be joined to names.
 
 The plural of `label/1` in subject, not in object: `label/1` is a process naming
 *itself*, this is the finished map for the whole run — every self-reported label
-plus whatever `dst_harness:labels/1` added for the processes that never reported
+plus whatever `c:dst_harness:labels/1` added for the processes that never reported
 one.
 
 Stored beside the events rather than resolved into them, so the raw log stays a

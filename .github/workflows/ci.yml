@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch cancels the first. The suite is slow enough
+# that overlapping runs are just waste.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OTP_VERSION: "28.3"
+  ELIXIR_VERSION: "1.19.4"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          rebar3-version: "3.24"
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build/dev
+          key: lint-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+
+      # The PLT depends on OTP, Elixir and the deps, and not on our source, so it
+      # survives every commit that doesn't touch mix.lock. Building one from cold
+      # costs about 35s; restoring it costs a couple of seconds.
+      - name: Cache dialyzer PLT
+        uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: plt-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+
+      - run: mix deps.get
+
+      # Every check below runs even if an earlier one failed, so one push
+      # surfaces every problem rather than one per round trip.
+      - name: Elixir format
+        if: ${{ !cancelled() }}
+        run: mix format --check-formatted
+
+      - name: Erlang format
+        if: ${{ !cancelled() }}
+        run: rebar3 fmt --check
+
+      - name: Unused deps
+        if: ${{ !cancelled() }}
+        run: mix deps.unlock --check-unused
+
+      - name: Dialyzer
+        if: ${{ !cancelled() }}
+        run: mix dialyzer --format github
+
+      - name: Docs
+        if: ${{ !cancelled() }}
+        run: mix docs --warnings-as-errors
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build/test
+          key: test-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+
+      - run: mix deps.get
+
+      # `--warnings-as-errors` on the compile only. The suite itself is timing
+      # sensitive: one test does 1000 runs of a supervision tree, so it needs
+      # room on a shared runner.
+      - name: Compile
+        run: mix compile --warnings-as-errors
+        env:
+          MIX_ENV: test
+
+      - name: Test
+        run: mix test
+        timeout-minutes: 10

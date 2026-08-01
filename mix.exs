@@ -11,6 +11,7 @@ defmodule Dst.MixProject do
       elixirc_paths: [],
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
+      dialyzer: dialyzer(),
       deps: deps(),
       package: package(),
       name: "dst",
@@ -71,6 +72,15 @@ defmodule Dst.MixProject do
         Walkthrough: ~r{docs/0\d},
         Design: ~r{docs/design}
       ]
+    ]
+  end
+
+  # A stable PLT path outside `_build`, so CI can cache it on its own key: the
+  # PLT depends on OTP, Elixir and the deps, and not on our source at all.
+  defp dialyzer do
+    [
+      plt_local_path: "priv/plts",
+      plt_core_path: "priv/plts"
     ]
   end
 
