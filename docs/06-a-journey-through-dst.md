@@ -1235,15 +1235,13 @@ handle_info(resume, St) ->
     {noreply, St#st{paused = false}}.
 ```
 
-That `erlang:send_after/3` is the first line in the project the transform
+That `erlang:send_after/3` is the first line in the project the parse transform
 actually rewrites. If it feels nondeterministic to you, you're right, it should!
-What you don't see is that `dst_transform` will rewrite things at compile time
+The reason it's ok is that `dst_transform` will rewrite things at compile time
 (when `DST` is defined). That rewrite replaces the wall clock with a virtual one,
 and removes the nondeterminism.
 
-TODO - JMS - continue here
-
-### A client that gives up
+### Defining a timeout in the client
 
 Add near the top of `src/abd_client.erl`:
 
@@ -1281,15 +1279,15 @@ collect_writes(Ref, N) ->
     end.
 ```
 
-Nothing else in either phase changes: no ref to arm, no timer to cancel, no
-stale message to flush.
+Here we're execising `dst_transform`'s rewrite of the `receive-after` construct
+instead of an `erlang:send_after` call.
 
-**Giving up has to mean failing, not proceeding with what you have.** A client
+**The timeout is a client failure, so we throw.** A client
 that returns a value backed by 1 replica instead of 2 has broken the quorum
 property, and you'd have introduced a second bug while demonstrating the first.
 That's why this throws rather than returning the partial result.
 
-### The harness issues pauses and records give-ups
+### The harness injects the new faults
 
 3 changes in `test/support/abd_harness.erl`. `generate/2` gains a pause operation,
 and the other thresholds shift up to make room:
@@ -1311,8 +1309,8 @@ generate(#{next_op := N, replicas := Replicas}, Rand0) ->
     end.
 ```
 
-4% is deliberate and the reasoning is below, under "why the tuning is
-bimodal". Our first attempt used 10% and broke the workload.
+We've tuned our pause fault-injection to a 4% occurrence rate. Tuning fault injections
+to avoid crippling the system entirely will be a unique exercise for each system.
 
 `op_number/1` and `label_for/1` each gain a clause:
 
@@ -1324,8 +1322,7 @@ op_number({pause, N, _Index, _Ms}) -> N;
 label_for({pause, N, _Index, _Ms}) -> {pauser, N};
 ```
 
-And `run_op/5` gains a clause for the new operation. Naming and the start stamp
-already happened in the `run_op/4` head, so this one only does the work:
+And `run_op/5` gains a clause for the new operation:
 
 ```erlang
 run_op({pause, _N, Index, Ms}, _Tab, Replicas, _Mode, _Start) ->
@@ -1333,10 +1330,9 @@ run_op({pause, _N, Index, Ms}, _Tab, Replicas, _Mode, _Start) ->
     abd_replica:pause(lists:nth(Index, Replicas), Ms);
 ```
 
-### Timed-out operations are not completed operations
+### Timeout failures need to be detected
 
-The other 3 `run_op/4` clauses each wrap their client call and record a failure
-under a different key:
+The other 3 `run_op/4` clauses must catch the timeout and record the failure:
 
 ```erlang
 run_op({write, N, Value}, Tab, Replicas, _Mode, Start) ->
@@ -1365,14 +1361,8 @@ run_op({read, N}, Tab, Replicas, Mode, Start) ->
     end.
 ```
 
-Put the `pause` clause above these.
-
-`check/1` needs no change at all, and that's the interesting part.
-
-`{gave_up, read, N}` doesn't match `check/1`'s `{{read, _}, S, F, Ts, _}`
-pattern, so timed-out reads are excluded from the invariant. **They have to
-be.** A read that never returned a value to anybody can't have gone backwards,
-and counting one would manufacture violations that aren't real.
+`check/1` does not need a change, because the invariant code uses a pattern match on
+the read tuples.
 
 ### Run it
 
@@ -1388,109 +1378,19 @@ end
 RESULT: every outcome `:ok`. `clock_ms` reads **10000 on 23 of the 40 seeds and
 0 on the other 17.**
 
-Outcomes staying `ok` is the check that matters. Pausing a replica must not
-break a correct register, since ABD tolerates 1 failure and 2 paused just means
-nobody makes progress.
+Outcomes should all be `:ok`. Pausing doesn't break the cluster, it only makes things
+run more slowly and causes some clients to give up.
 
-**The split is the interesting part, and worth predicting before you run it.** A
-pause is the only timer this system arms, so the clock moves only on seeds that
-drew one, and at 4% over 20 operations most runs draw none. Measured across
-those 40 seeds: 17 runs with no pause, 14 with one, 6 with two, 2 with three,
-1 with four.
+Notice that `clock_ms` is nonzero now; the virtual clock is engaged. Nothing in the
+system actually had to wait around for 10 seconds. We simulated it in a fraction of
+the time.
 
-Where it does move it lands on exactly 10000, because every pause is issued
-while the clock still reads 0 and lasts 10 seconds, and a run ends once no
-timers remain. The final reading is the last resume, every time.
-
-10 virtual seconds of a stalled cluster, inside a few milliseconds of wall
-clock, because when nothing is runnable the driver jumps straight to the next
-deadline instead of waiting.
-
-### Check that the timeout branch actually runs
-
-`clock_ms: 10000` only proves the *replica's* resume timer fired. It says
-nothing about whether a client ever gave up, and a timeout branch that never
-executes is exactly the kind of thing that looks tested and isn't.
-
-```elixir
-:dst_log.profile()
-|> Enum.reject(&(&1.label == :"$dst"))
-|> Enum.map(fn %{what: what} -> if is_tuple(what), do: elem(what, 0), else: what end)
-|> Enum.frequencies()
-```
-
-`profile/0` hands back maps rather than tuples, and the `reject` drops
-`dst_run`'s own `op`, `step` and `clock` entries so that you count only what
-your system did.
-
-
-
-RESULT, on seed 1:
-
-```
-answered_read: 34                     quorum_max: 13
-applied_write: 22                     resumed: 4
-finished: 7                           started: 20
-gave_up: 9                            write_sent: 13
-gave_up_waiting_for_read_quorum: 3
-gave_up_waiting_for_write_quorum: 6
-paused: 4
-pausing: 4
-query_sent: 16
-```
-
-Both timeout paths fire, so the branch is live rather than merely present.
-
-**Seed 1 is not a typical run, and that makes it more useful than one.** It drew
-4 pauses where the average is under one, so 9 of its 20 operations gave up and
-the cluster was down more than it was up. Across all 40 seeds only 8 see a
-give-up at all.
-
-Now look at what's **missing** from that list: `crashed_after_writing` doesn't
-appear. Not one partial write completed. The fault we added at step 8, the one
-that makes the bug reachable, was entirely crowded out by the fault we added
-here — and this is at 4%. Our first attempt used 10% and every run looked like
-this one.
-
-**An injected fault that's too frequent starves the workload of the scenarios
-you're searching for.** A system that never completes an operation can't
-violate a property about completed operations, and your suite stays green
-because nothing interesting ever happens. [Page 5](05-gotchas.md) warns about
-injecting faults the system can't see. This is the opposite failure and it's
-just as quiet.
-
-### Why the tuning is bimodal
-
-Dropping the pause rate from 10% to the 4% above helps, and it doesn't smooth
-anything out. Over
-10 seeds the give-up counts came back as `0, 0, 0, 0, 0, 0` and `9, 9, 11, 12`.
-There's no middle.
-
-The cause is worth understanding because it's a property of simulated time
-generally: **every operation is injected while the virtual clock still reads
-0.** The clock only advances when nothing is runnable, and the driver is busy
-injecting and stepping throughout, so the whole 20-operation workload happens
-at t=0. A 10-second pause therefore spans the entire run. Either you draw 2
-pauses on distinct replicas and the cluster is down for all of it, or you don't
-and it's never down at all.
-
-Lowering the rate makes jams rarer. It can't make them milder. Shortening the
-pause wouldn't help either, because a paused replica *drops* requests rather
-than queuing them, so a client that queried during a pause is doomed whenever
-the pause ends.
-
-### What it cost
-
-The no-write-back sweep found **21 failures per 200 seeds** before this step
-and **12 per 200** after, with the first at seed 53 rather than seed 6.
-
-Fault injection isn't free, and the currency is search efficiency on the faults
-you already had. Operations that time out never complete, and only completed
-reads can violate regularity.
+Feel free to run the `:dst_log` functions in your shell to inspect some traces.
 
 ## Step 14: pin the trace, not the seed
 
-Adding the pause operation changed `generate/2`, and `mix test` went red:
+After adding the pause operation, `mix test` went red. Seed 6 no longer does what
+it used to do. This is expected; we changed how operations are generated.
 
 ```
 1) test seed 6 reproduces the inversion without the write-back (AbdTest)
@@ -1498,19 +1398,17 @@ Adding the pause operation changed `generate/2`, and `mix test` went red:
    right: :ok
 ```
 
-Nothing about the bug changed. Seed 6 now draws a different workload, so the
-schedule it names is a different schedule.
-
-**A seed-pinned regression test is coupled to your workload generator.** Touch
-the generator and every pinned seed silently stops testing what it was pinned
+**When you pin a test to a seed, it's coupled to the generated workload.** Changing
+the generator can cause pinned seeds to silently stop testing what they were pinned
 for. Ours failed loudly because it asserts on a violation. A test asserting
-`ok` would have gone vacuous without a word.
+`ok` would likely be just as pointless.
 
-The fix is to pin the trace. `dst_run:replay/3` never calls `generate/2`, it
+Instead of pinning the seed, we can pin the trace. `dst_run:replay/3` never calls `generate/2`, it
 walks the entries it's given, so a saved trace survives generator changes
 completely.
 
-Capture it once, with `save_fixture/4`:
+Capture it with `save_fixture/4`. For our `abd`, seed 53 now fails, but if you chose different
+parameters, your first failing seed might be different.
 
 ```elixir
 buggy = %{max_ops: 20, max_steps: 20_000, preload: [:abd], config: %{mode: :no_writeback}}
@@ -1526,16 +1424,7 @@ File.mkdir_p!("test/fixtures")
 
 RESULT: `{39, 19, true}`, then `{:ok, {:violation, %{property: :no_new_old_inversion}}}`.
 
-**`save_fixture/4` replays the trace strictly before writing anything**, so a
-fixture on disk is one that has been demonstrated to reproduce rather than one
-you believed would. If it comes back `{:error, {:did_not_replay, _}}`, nothing
-is written and you have learned something useful.
-
-It saves the harness and the options alongside the trace, and the options matter
-as much as the trace does. A reproduction that needs
-`config: %{mode: :no_writeback}` and gets replayed without it does not
-reproduce, and you will spend an afternoon on it. Carrying them means a test
-cannot get that wrong:
+Now we can load that fixture into a test.
 
 ```elixir
   test "the recorded inversion still reproduces" do
@@ -1544,43 +1433,19 @@ cannot get that wrong:
   end
 ```
 
-That test names a file and nothing else. There is no seed, no config and no
-harness module in it to drift out of sync.
+ Whether or not you actually want to do this in your project is up to you. There
+are pros and cons to the approach. It does still break if the *shape* of an
+operation changes, or if `processes/1` starts registering processes in a
+different order. Those are changes to the contract rather than to the workload.
 
-Don't try to write the mirror of this by replaying the same trace against the
-correct implementation. The write-back sends extra messages, so the recorded
-step ids stop being runnable and you get `{error, {diverged, _, _}}` rather
-than `ok`. "Correct mode is fine" is a claim about the *whole system*, and the
-40-seed sweep is the right shape for it.
+## Step 15: How to incorporate system state into your invariant
 
-A fixture also ignores the seed entirely, which is the clearest statement of
-what it buys you. Replay it under any seed and the failure is still there,
-because nothing in a replay is drawn from one.
+`dst_log` records what your system *did*. `dst_observe` is for tracking current
+system state. It requires special configration of the parse transform because
+state is typically accessible via message passing, and all processes are suspended,
+which halts message passing during the `check/1` phase.
 
-It does still break if the *shape* of an operation changes, or if `processes/1`
-starts registering processes in a different order. Those are changes to the
-contract rather than to the workload, and they should break it.
-
-### What this still doesn't exercise
-
-`settle_steps`. Our pause timers are one-shot, so the system still reaches true
-quiescence and the run ends on its own. A system with a *periodic* timer, a
-heartbeat, never reaches "nothing runnable and nothing pending", and its runs
-can only end by exhausting the step budget unless you give it a settle phase.
-If yours has one, read that section of [page 2](02-setting-up.md) before your
-first run.
-
-## Step 15: read state the invariant can't ask for
-
-`dst_log` records what your system *did*. This is the other half: what it
-currently *holds*. Different question, and you want both.
-
-The problem it solves is specific. `check/1` runs against a frozen system, so it
-cannot call into a replica to ask what it stores — every one of them is
-suspended and always will be. That is why the invariant reads ETS, and why the
-replicas' `{Ts, Val}` has been invisible to it all along.
-
-### Publish it
+### Tweak `dst_transform` with a `dst_observe` attribute
 
 One attribute on `src/abd_replica.erl`:
 
@@ -1589,15 +1454,11 @@ One attribute on `src/abd_replica.erl`:
 -dst_observe({st, [ts, val]}).
 ```
 
-**`{st, ...}` and not a bare list**, because our record is `#st{}`. A bare
-`-dst_observe([ts, val])` assumes a record named `state` and fails at compile
-time with `{no_such_record, state}`, which is at least a loud way to find out.
+For every `gen_server` callback, `dst_transform` will publish the fields
+`ts` and `val` from the `st` record to a shared memory location, observable
+by the harness.
 
-Nothing else changes. The transform republishes those 2 fields into the
-process dictionary on every `gen_server` callback return, so there is no
-assignment site anybody can forget to update and staleness is impossible.
-
-### Read it where it matters
+### Read it back out
 
 In `test/support/abd_harness.erl`, take the replicas in `check/1` and attach
 their state to a violation:
@@ -1614,11 +1475,6 @@ check(#{tab := Tab, replicas := Replicas}) ->
 replica_states(Replicas) ->
     [{I, dst_observe:read(Pid)} || {I, Pid} <- lists:enumerate(Replicas)].
 ```
-
-**On violation only, not on every check.** `read/1` copies whatever was
-published, and `check/1` runs after every single action. Paying for that
-thousands of times to enrich a report you will see once is the wrong trade, and
-it is the reason `-dst_observe` takes a field list rather than `all`.
 
 ### Run it
 
@@ -1644,40 +1500,28 @@ RESULT:
  }}
 ```
 
-**The bug is in those 3 lines.** `{1,1}` exists at exactly one replica. One is
-less than a quorum, so a read whose quorum misses that replica cannot see it,
-and the write-back is what would have fixed that before the value ever escaped.
-You can see the shape of the defect without reading the log at all.
+**The bug is now directly visible.** `{1,1}` exists at exactly one replica, not
+a quorum. We have a lot of information about the defect before inspecting
+the trace, shrink, or log.
 
-### The rule, since you now have 2 ways to observe
+### Two ways to observe
 
-They answer different questions and the choice comes up on every system.
+So how do we pick the right one?
 
 **If the state already lives somewhere readable, read it there.** Our reads and
-writes go into ETS because the invariant needs a history, and a history is the
-wrong shape for `dst_observe` — `read/1` returns what was published *last*, not
-a record of everything.
+writes go into ets because the invariant needs a history, `dst_observe` is not
+a history.
 
 **If the state exists only inside a process, publish it.** A replica's
-`{Ts, Val}` is a current value with no natural home outside the process, so it
-publishes. On a suspended process, in a couple of microseconds, whatever the
-mailbox depth.
+`{Ts, Val}` is a current internal value, so publish it out to the harness with
+`dst_observe`.
 
-Alongside `dst_log`: the log is the narrative, this is the snapshot. A failing
-run wants both, and they cost about 10 lines between them.
+Finally, with respect to `dst_log`: the log is the narrative, this is a snapshot.
+Use both to debug.
 
----
+## Conclusion
 
----
-
-## TODO from here
-
-All 15 steps are drafted and walked end to end. Every library feature is now
-exercised. What is left is framing.
-
-- **Front matter**: prerequisites, what you end up with, a time estimate.
-- **Steps 9 and 10 still carry `RESULT` numbers recorded before the pause fault
-  existed.** Everything from step 11 on has been re-recorded from real runs;
-  those 2 have not, and the seed they name (6) no longer fails now that
-  `generate/2` draws pauses. Seed 53 is the first failing one on the final
-  workload. Re-record both.
+That covers all the high level concepts of `dst`. The main takeaway is that DST
+is an investment. Doing it right requires time and attention, but if your
+problem space is the right fit, it will probably prevent some headaches and
+lead to a more reliable software system.
