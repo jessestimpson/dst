@@ -142,7 +142,14 @@ it would hide that rather than surface it.
 
 -export([parse_transform/2]).
 
-%% {Module, Function, Arity} => target module.
+%% `{Module, Function, Arity} => Target`, where `Target` is either a module (the
+%% function name is kept) or `{Module, Function}` (both are replaced).
+%%
+%% The distributed forms — `spawn(Node, Fun)` and friends — are rewritten too, but
+%% to functions that **raise while a run is active**. `eta` does not simulate
+%% distribution, and there is no honest local rewrite: running the child here puts
+%% it on the wrong node, and letting it through puts it outside the schedule. See
+%% `eta_sched:no_dist/3`.
 -define(REWRITES, #{
     {erlang, send_after, 3} => eta_time,
     {erlang, send_after, 4} => eta_time,
@@ -166,17 +173,73 @@ it would hide that rather than surface it.
     {erlang, spawn, 3} => eta_sched,
     {erlang, spawn_link, 1} => eta_sched,
     {erlang, spawn_link, 3} => eta_sched,
-    {proc_lib, spawn, 1} => eta_sched,
-    {proc_lib, spawn, 3} => eta_sched,
-    {proc_lib, spawn_link, 1} => eta_sched,
-    {proc_lib, spawn_link, 3} => eta_sched,
+    {erlang, spawn_monitor, 1} => eta_sched,
+    {erlang, spawn_monitor, 3} => eta_sched,
+    {erlang, spawn_opt, 2} => eta_sched,
+    {erlang, spawn_opt, 4} => eta_sched,
+    %% `proc_lib`'s spawns additionally give the child `$ancestors` and
+    %% `$initial_call`, so they get their own targets rather than sharing the
+    %% plain ones — see `eta_sched:plib_spawn/1`.
+    {proc_lib, spawn, 1} => {eta_sched, plib_spawn},
+    {proc_lib, spawn, 3} => {eta_sched, plib_spawn},
+    {proc_lib, spawn_link, 1} => {eta_sched, plib_spawn_link},
+    {proc_lib, spawn_link, 3} => {eta_sched, plib_spawn_link},
+    {proc_lib, spawn_opt, 2} => {eta_sched, plib_spawn_opt},
+    {proc_lib, spawn_opt, 4} => {eta_sched, plib_spawn_opt},
     %% `gen_server` starts its child inside OTP, where no transform reaches — the
     %% chain is gen:do_spawn/5 -> proc_lib:start_monitor/5 -> erlang:spawn_opt.
     %% `eta_sched` builds an equivalent child instead, gated from birth. See
     %% `eta_sched:start_monitor/3` for why not a shadowed `proc_lib`.
+    %% The distributed forms. Rewritten to raise rather than to run, see above.
+    {erlang, spawn, 2} => eta_sched,
+    {erlang, spawn, 4} => eta_sched,
+    {erlang, spawn_link, 2} => eta_sched,
+    {erlang, spawn_link, 4} => eta_sched,
+    {erlang, spawn_monitor, 2} => eta_sched,
+    {erlang, spawn_monitor, 4} => eta_sched,
+    {erlang, spawn_opt, 3} => eta_sched,
+    {erlang, spawn_opt, 5} => eta_sched,
+    {proc_lib, spawn, 2} => {eta_sched, plib_spawn},
+    {proc_lib, spawn, 4} => {eta_sched, plib_spawn},
+    {proc_lib, spawn_link, 2} => {eta_sched, plib_spawn_link},
+    {proc_lib, spawn_link, 4} => {eta_sched, plib_spawn_link},
+    {proc_lib, spawn_opt, 3} => {eta_sched, plib_spawn_opt},
+    {proc_lib, spawn_opt, 5} => {eta_sched, plib_spawn_opt},
+    %% `logger` hands every event to a handler process the scheduler does not own,
+    %% and under load that handoff turns synchronous. See `eta_logger`.
+    {logger, emergency, 1} => eta_logger,
+    {logger, emergency, 2} => eta_logger,
+    {logger, emergency, 3} => eta_logger,
+    {logger, alert, 1} => eta_logger,
+    {logger, alert, 2} => eta_logger,
+    {logger, alert, 3} => eta_logger,
+    {logger, critical, 1} => eta_logger,
+    {logger, critical, 2} => eta_logger,
+    {logger, critical, 3} => eta_logger,
+    {logger, error, 1} => eta_logger,
+    {logger, error, 2} => eta_logger,
+    {logger, error, 3} => eta_logger,
+    {logger, warning, 1} => eta_logger,
+    {logger, warning, 2} => eta_logger,
+    {logger, warning, 3} => eta_logger,
+    {logger, notice, 1} => eta_logger,
+    {logger, notice, 2} => eta_logger,
+    {logger, notice, 3} => eta_logger,
+    {logger, info, 1} => eta_logger,
+    {logger, info, 2} => eta_logger,
+    {logger, info, 3} => eta_logger,
+    {logger, debug, 1} => eta_logger,
+    {logger, debug, 2} => eta_logger,
+    {logger, debug, 3} => eta_logger,
+    {logger, log, 2} => eta_logger,
+    {logger, log, 3} => eta_logger,
+    {logger, log, 4} => eta_logger,
     {gen_server, start_monitor, 3} => eta_sched,
+    {gen_server, start_monitor, 4} => eta_sched,
     {gen_server, start_link, 3} => eta_sched,
-    {gen_server, start, 3} => eta_sched
+    {gen_server, start_link, 4} => eta_sched,
+    {gen_server, start, 3} => eta_sched,
+    {gen_server, start, 4} => eta_sched
 }).
 
 -if(?DOCATTRS).
@@ -218,7 +281,16 @@ walk(Node, _Locals) ->
 %%
 %% Guarded on the module not defining the name itself, which is the condition the
 %% original rule was really protecting.
--define(AUTO_SPAWNS, [{spawn, 1}, {spawn, 3}, {spawn_link, 1}, {spawn_link, 3}]).
+-define(AUTO_SPAWNS, [
+    {spawn, 1},
+    {spawn, 3},
+    {spawn_link, 1},
+    {spawn_link, 3},
+    {spawn_monitor, 1},
+    {spawn_monitor, 3},
+    {spawn_opt, 2},
+    {spawn_opt, 4}
+]).
 
 %% A remote call whose target is in the rewrite table has its module replaced.
 %% Arity is taken from the argument list, so a rewrite only applies to the exact
@@ -227,6 +299,8 @@ rewrite(
     {call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}, _Locals
 ) ->
     case maps:find({Mod, Fun, length(Args)}, ?REWRITES) of
+        {ok, {Target, TargetFun}} ->
+            {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, TargetFun}}, Args};
         {ok, Target} ->
             {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, Fun}}, Args};
         error ->

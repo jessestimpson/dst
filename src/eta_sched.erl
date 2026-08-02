@@ -152,11 +152,44 @@ releasing, not after.
 %% Scheduler-owned spawning — what `eta_transform` points a system's `spawn` calls
 %% at. `gated/1,3` are exported because they are spawned by MFA, which is what
 %% makes a gated child distinguishable in the spawn trace event.
--export([active/0, current/0, spawn/1, spawn/3, spawn_link/1, spawn_link/3, gated/1, gated/3]).
+-export([
+    active/0,
+    current/0,
+    spawn/1, spawn/3,
+    spawn_link/1, spawn_link/3,
+    spawn_monitor/1, spawn_monitor/3,
+    spawn_opt/2, spawn_opt/4,
+    gated/1, gated/3
+]).
 
-%% Gated `gen_server` starts — see `start_monitor/3`. `gated/4` is spawned by MFA
+%% The distributed forms, which raise while a run is active. See `no_dist/3`.
+-export([
+    spawn/2, spawn/4,
+    spawn_link/2, spawn_link/4,
+    spawn_monitor/2, spawn_monitor/4,
+    spawn_opt/3, spawn_opt/5,
+    plib_spawn/2, plib_spawn/4,
+    plib_spawn_link/2, plib_spawn_link/4,
+    plib_spawn_opt/3, plib_spawn_opt/5
+]).
+
+%% The `proc_lib` flavours, which additionally give the child the OTP process
+%% dictionary entries. See `plib_spawn/1`.
+-export([
+    plib_spawn/1, plib_spawn/3,
+    plib_spawn_link/1, plib_spawn_link/3,
+    plib_spawn_opt/2, plib_spawn_opt/4,
+    gated_plib/2, gated_plib/4
+]).
+
+%% Gated `gen_server` starts — see `start_monitor/3`. `gated/5` is spawned by MFA
 %% for the same reason `gated/1,3` are: the spawn trace event has to name it.
--export([start_monitor/3, start_link/3, start/3, gated/4]).
+-export([
+    start_monitor/3, start_monitor/4,
+    start_link/3, start_link/4,
+    start/3, start/4,
+    gated/5
+]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -382,6 +415,158 @@ spawn_link(M, F, A) ->
         true -> erlang:spawn_link(?MODULE, gated, [M, F, A])
     end.
 
+-spec spawn_monitor(fun(() -> term())) -> {pid(), reference()}.
+spawn_monitor(Fun) ->
+    case active() of
+        false -> erlang:spawn_monitor(Fun);
+        true -> erlang:spawn_monitor(?MODULE, gated, [Fun])
+    end.
+
+-spec spawn_monitor(module(), atom(), [term()]) -> {pid(), reference()}.
+spawn_monitor(M, F, A) ->
+    case active() of
+        false -> erlang:spawn_monitor(M, F, A);
+        true -> erlang:spawn_monitor(?MODULE, gated, [M, F, A])
+    end.
+
+%% The options are passed straight through, so `link`, `monitor`, heap sizes and
+%% the rest keep their meanings — including the return shape, which is a bare pid
+%% unless `monitor` is asked for.
+-spec spawn_opt(fun(() -> term()), list()) -> pid() | {pid(), reference()}.
+spawn_opt(Fun, Opts) ->
+    case active() of
+        false -> erlang:spawn_opt(Fun, Opts);
+        true -> erlang:spawn_opt(?MODULE, gated, [Fun], Opts)
+    end.
+
+-spec spawn_opt(module(), atom(), [term()], list()) -> pid() | {pid(), reference()}.
+spawn_opt(M, F, A, Opts) ->
+    case active() of
+        false -> erlang:spawn_opt(M, F, A, Opts);
+        true -> erlang:spawn_opt(?MODULE, gated, [M, F, A], Opts)
+    end.
+
+%% ---------------------------------------------------------------------------
+%% proc_lib flavours
+%% ---------------------------------------------------------------------------
+
+%% `proc_lib`'s spawns differ from `erlang`'s in one way that matters: the child
+%% gets `$ancestors` and `$initial_call`, without which it is not an OTP process
+%% and `sys` cannot introspect it. Routing them through the plain gated spawn
+%% would drop that, so these carry it, and the inert path stays inside `proc_lib`
+%% rather than falling through to `erlang`.
+-spec plib_spawn(fun(() -> term())) -> pid().
+plib_spawn(Fun) ->
+    case active() of
+        false -> proc_lib:spawn(Fun);
+        true -> erlang:spawn(?MODULE, gated_plib, [Fun, plib_ctx(Fun)])
+    end.
+
+-spec plib_spawn(module(), atom(), [term()]) -> pid().
+plib_spawn(M, F, A) ->
+    case active() of
+        false -> proc_lib:spawn(M, F, A);
+        true -> erlang:spawn(?MODULE, gated_plib, [M, F, A, plib_ctx(M, F, A)])
+    end.
+
+-spec plib_spawn_link(fun(() -> term())) -> pid().
+plib_spawn_link(Fun) ->
+    case active() of
+        false -> proc_lib:spawn_link(Fun);
+        true -> erlang:spawn_link(?MODULE, gated_plib, [Fun, plib_ctx(Fun)])
+    end.
+
+-spec plib_spawn_link(module(), atom(), [term()]) -> pid().
+plib_spawn_link(M, F, A) ->
+    case active() of
+        false -> proc_lib:spawn_link(M, F, A);
+        true -> erlang:spawn_link(?MODULE, gated_plib, [M, F, A, plib_ctx(M, F, A)])
+    end.
+
+-spec plib_spawn_opt(fun(() -> term()), list()) -> pid() | {pid(), reference()}.
+plib_spawn_opt(Fun, Opts) ->
+    case active() of
+        false -> proc_lib:spawn_opt(Fun, Opts);
+        true -> erlang:spawn_opt(?MODULE, gated_plib, [Fun, plib_ctx(Fun)], Opts)
+    end.
+
+-spec plib_spawn_opt(module(), atom(), [term()], list()) -> pid() | {pid(), reference()}.
+plib_spawn_opt(M, F, A, Opts) ->
+    case active() of
+        false -> proc_lib:spawn_opt(M, F, A, Opts);
+        true -> erlang:spawn_opt(?MODULE, gated_plib, [M, F, A, plib_ctx(M, F, A)], Opts)
+    end.
+
+%% ---------------------------------------------------------------------------
+%% The distributed forms
+%% ---------------------------------------------------------------------------
+
+%% `spawn(Node, Fun)` and its relatives ask for a process on another node, and
+%% `eta` does not simulate distribution. There is no honest rewrite: running the
+%% child here would silently put it on the wrong node, and letting it through
+%% would put it outside the schedule entirely. So while a run is active these
+%% raise, which turns a system that cannot be simulated into a loud failure at
+%% the call rather than a quiet loss of determinism 200 steps later.
+%%
+%% With no run in progress they delegate, so a module built with the transform
+%% still works normally outside a simulation.
+spawn(N, F) -> no_dist(active(), {erlang, spawn, 2}, fun() -> erlang:spawn(N, F) end).
+spawn(N, M, F, A) -> no_dist(active(), {erlang, spawn, 4}, fun() -> erlang:spawn(N, M, F, A) end).
+spawn_link(N, F) ->
+    no_dist(active(), {erlang, spawn_link, 2}, fun() -> erlang:spawn_link(N, F) end).
+
+spawn_link(N, M, F, A) ->
+    no_dist(active(), {erlang, spawn_link, 4}, fun() -> erlang:spawn_link(N, M, F, A) end).
+
+spawn_monitor(N, F) ->
+    no_dist(active(), {erlang, spawn_monitor, 2}, fun() -> erlang:spawn_monitor(N, F) end).
+
+spawn_monitor(N, M, F, A) ->
+    no_dist(active(), {erlang, spawn_monitor, 4}, fun() -> erlang:spawn_monitor(N, M, F, A) end).
+
+spawn_opt(N, F, O) ->
+    no_dist(active(), {erlang, spawn_opt, 3}, fun() -> erlang:spawn_opt(N, F, O) end).
+
+spawn_opt(N, M, F, A, O) ->
+    no_dist(active(), {erlang, spawn_opt, 5}, fun() -> erlang:spawn_opt(N, M, F, A, O) end).
+
+plib_spawn(N, F) -> no_dist(active(), {proc_lib, spawn, 2}, fun() -> proc_lib:spawn(N, F) end).
+
+plib_spawn(N, M, F, A) ->
+    no_dist(active(), {proc_lib, spawn, 4}, fun() -> proc_lib:spawn(N, M, F, A) end).
+
+plib_spawn_link(N, F) ->
+    no_dist(active(), {proc_lib, spawn_link, 2}, fun() -> proc_lib:spawn_link(N, F) end).
+
+plib_spawn_link(N, M, F, A) ->
+    no_dist(active(), {proc_lib, spawn_link, 4}, fun() -> proc_lib:spawn_link(N, M, F, A) end).
+
+plib_spawn_opt(N, F, O) ->
+    no_dist(active(), {proc_lib, spawn_opt, 3}, fun() -> proc_lib:spawn_opt(N, F, O) end).
+
+plib_spawn_opt(N, M, F, A, O) ->
+    no_dist(active(), {proc_lib, spawn_opt, 5}, fun() -> proc_lib:spawn_opt(N, M, F, A, O) end).
+
+no_dist(false, _MFA, Delegate) ->
+    Delegate();
+no_dist(true, MFA, _Delegate) ->
+    error(
+        {eta_sched,
+            {no_distribution, MFA,
+                <<"eta does not simulate distribution; run the nodes as processes in one VM">>}}
+    ).
+
+%% Computed in the *parent*, because `$ancestors` is the parent's list with the
+%% parent on the front and the child cannot see it.
+plib_ctx(Fun) ->
+    {module, M} = erlang:fun_info(Fun, module),
+    {name, N} = erlang:fun_info(Fun, name),
+    {arity, A} = erlang:fun_info(Fun, arity),
+    {[self() | own_ancestors()], {M, N, A}}.
+
+plib_ctx(M, F, A) ->
+    {[self() | own_ancestors()], {M, F, length(A)}}.
+
 -if(?DOCATTRS).
 -doc false.
 -endif.
@@ -396,6 +581,24 @@ gated(Fun) ->
 -spec gated(module(), atom(), [term()]) -> term().
 gated(M, F, A) ->
     _ = wait_for_token(),
+    apply(M, F, A).
+
+-if(?DOCATTRS).
+-doc false.
+-endif.
+gated_plib(Fun, {Ancestors, InitialCall}) ->
+    _ = wait_for_token(),
+    put('$ancestors', Ancestors),
+    put('$initial_call', InitialCall),
+    Fun().
+
+-if(?DOCATTRS).
+-doc false.
+-endif.
+gated_plib(M, F, A, {Ancestors, InitialCall}) ->
+    _ = wait_for_token(),
+    put('$ancestors', Ancestors),
+    put('$initial_call', InitialCall),
     apply(M, F, A).
 
 %% An empty mailbox and a selective receive, so the child is quiescent from birth
@@ -457,27 +660,54 @@ Inert with no scheduler running: delegates straight to `gen_server`.
 start_monitor(Mod, Args, Options) ->
     case active() of
         false -> gen_server:start_monitor(Mod, Args, Options);
-        true -> gated_start(Mod, Args, monitor)
+        true -> gated_start(undefined, Mod, Args, monitor)
     end.
 
 -spec start_link(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Mod, Args, Options) ->
     case active() of
         false -> gen_server:start_link(Mod, Args, Options);
-        true -> gated_start(Mod, Args, link)
+        true -> gated_start(undefined, Mod, Args, link)
     end.
 
 -spec start(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
 start(Mod, Args, Options) ->
     case active() of
         false -> gen_server:start(Mod, Args, Options);
-        true -> gated_start(Mod, Args, plain)
+        true -> gated_start(undefined, Mod, Args, plain)
     end.
 
-gated_start(Mod, Args, Kind) ->
+%% The 4-arity forms, which name the server. Registration happens in the *child*,
+%% before `init/1`, which is where `gen` does it and is what makes
+%% `{error, {already_started, Pid}}` mean what it means.
+-spec start_monitor(gen_server:server_name(), module(), term(), list()) ->
+    {ok, {pid(), reference()}} | ignore | {error, term()}.
+start_monitor(Name, Mod, Args, Options) ->
+    case active() of
+        false -> gen_server:start_monitor(Name, Mod, Args, Options);
+        true -> gated_start(Name, Mod, Args, monitor)
+    end.
+
+-spec start_link(gen_server:server_name(), module(), term(), list()) ->
+    {ok, pid()} | ignore | {error, term()}.
+start_link(Name, Mod, Args, Options) ->
+    case active() of
+        false -> gen_server:start_link(Name, Mod, Args, Options);
+        true -> gated_start(Name, Mod, Args, link)
+    end.
+
+-spec start(gen_server:server_name(), module(), term(), list()) ->
+    {ok, pid()} | ignore | {error, term()}.
+start(Name, Mod, Args, Options) ->
+    case active() of
+        false -> gen_server:start(Name, Mod, Args, Options);
+        true -> gated_start(Name, Mod, Args, plain)
+    end.
+
+gated_start(Name, Mod, Args, Kind) ->
     Parent = self(),
     Ancestors = [Parent | own_ancestors()],
-    MFA = [Parent, Ancestors, Mod, Args],
+    MFA = [Parent, Ancestors, Name, Mod, Args],
     {Pid, Ref} =
         case Kind of
             monitor -> erlang:spawn_monitor(?MODULE, gated, MFA);
@@ -508,19 +738,45 @@ drop_monitor(Ref) -> erlang:demonitor(Ref, [flush]).
 -if(?DOCATTRS).
 -doc false.
 -endif.
-gated(Parent, Ancestors, Mod, Args) ->
+gated(Parent, Ancestors, Name, Mod, Args) ->
     _ = wait_for_token(),
     %% What proc_lib:init_p/3 would have set. Without these the process is not an
     %% OTP process: no crash-report formatting, and `sys` cannot introspect it.
     put('$ancestors', Ancestors),
     put('$initial_call', {Mod, init, 1}),
+    case register_name(Name) of
+        ok ->
+            gated_init(Parent, Name, Mod, Args);
+        {error, _} = Err ->
+            Parent ! {'$eta_started', self(), Err},
+            exit(normal)
+    end.
+
+%% `{local, N}` only. `{global, _}` and `{via, _, _}` both register through a
+%% service process the scheduler does not own, so a start would block on
+%% something outside the schedule — the same class of real-time dependency as
+%% `code_server`. Refused rather than delegated, because delegating would produce
+%% an ungated child and a run that quietly stopped being reproducible.
+register_name(undefined) ->
+    ok;
+register_name({local, N}) ->
+    try
+        true = erlang:register(N, self()),
+        ok
+    catch
+        error:badarg -> {error, {already_started, whereis(N)}}
+    end;
+register_name(Other) ->
+    {error, {eta_sched, unsupported_server_name, Other}}.
+
+gated_init(Parent, Name, Mod, Args) ->
     case Mod:init(Args) of
         {ok, State} ->
             Parent ! {'$eta_started', self(), {ok, self()}},
-            gen_server:enter_loop(Mod, [], State);
+            enter_loop(Mod, Name, State);
         {ok, State, {continue, C}} ->
             Parent ! {'$eta_started', self(), {ok, self()}},
-            gated_continue(Mod, C, State);
+            gated_continue(Mod, Name, C, State);
         {stop, Reason} ->
             Parent ! {'$eta_started', self(), {error, Reason}},
             exit(Reason);
@@ -535,13 +791,18 @@ gated(Parent, Ancestors, Mod, Args) ->
             exit({eta_sched, unsupported_init, Other})
     end.
 
+%% A named server has to enter its loop knowing its name, or `gen_server` will not
+%% answer calls addressed to the name.
+enter_loop(Mod, undefined, State) -> gen_server:enter_loop(Mod, [], State);
+enter_loop(Mod, Name, State) -> gen_server:enter_loop(Mod, [], State, Name).
+
 %% `gen_server` runs handle_continue after the init acknowledgement and before any
 %% message, and a continue may chain into another. `enter_loop/3` takes a state,
 %% not a continue, so this is done here.
-gated_continue(Mod, C, State) ->
+gated_continue(Mod, Name, C, State) ->
     case Mod:handle_continue(C, State) of
-        {noreply, State1} -> gen_server:enter_loop(Mod, [], State1);
-        {noreply, State1, {continue, C2}} -> gated_continue(Mod, C2, State1);
+        {noreply, State1} -> enter_loop(Mod, Name, State1);
+        {noreply, State1, {continue, C2}} -> gated_continue(Mod, Name, C2, State1);
         {stop, Reason, _State1} -> exit(Reason)
     end.
 
@@ -788,7 +1049,7 @@ terminate(_Reason, St) ->
 
 do_register(St, Pids) when is_list(Pids) ->
     lists:foldl(fun(Pid, Acc) -> do_register(Acc, Pid) end, St, Pids);
-do_register(St = #st{ids = Ids}, Pid) when is_pid(Pid) ->
+do_register(St = #st{ids = Ids, gated = Gated}, Pid) when is_pid(Pid) ->
     case maps:is_key(Pid, Ids) of
         true ->
             St;
@@ -801,10 +1062,33 @@ do_register(St = #st{ids = Ids}, Pid) when is_pid(Pid) ->
             try
                 erlang:trace(Pid, true, ?TRACE_FLAGS),
                 erlang:suspend_process(Pid),
-                adopt(St, Pid)
+                St1 = adopt(St, Pid),
+                %% A gated child is waiting for a token only the scheduler can
+                %% send. When its parent is traced, the spawn event delivers it;
+                %% when the parent is the driver — or anything else the scheduler
+                %% does not own — there is no spawn event, and this is the only
+                %% route. Deliberately the same three steps as `handle_trace`,
+                %% reached the other way round.
+                case is_gated(Pid) andalso not maps:is_key(Pid, Gated) of
+                    true ->
+                        Pid ! ?GO,
+                        St1#st{gated = Gated#{Pid => true}};
+                    false ->
+                        St1
+                end
             catch
                 error:badarg -> St
             end
+    end.
+
+%% The VM's own record of how the process was started, not the `$initial_call`
+%% in its dictionary — `proc_lib` overwrites the latter, and this has to survive
+%% that.
+is_gated(Pid) ->
+    case erlang:process_info(Pid, initial_call) of
+        {initial_call, {?MODULE, gated, _}} -> true;
+        {initial_call, {?MODULE, gated_plib, _}} -> true;
+        _ -> false
     end.
 
 %% A child that died before it could be suspended is still adopted, as exited.
@@ -1034,8 +1318,8 @@ do_drain(St, Pid, Ref, SelfSends) ->
 %% adopt it and hand it its token. It does not count as adopted late, because it
 %% has not run.
 handle_trace(
-    St = #st{ids = Ids, gated = Gated}, {trace, _Parent, spawn, Child, {?MODULE, gated, _}}
-) ->
+    St = #st{ids = Ids, gated = Gated}, {trace, _Parent, spawn, Child, {?MODULE, F, _}}
+) when F =:= gated; F =:= gated_plib ->
     case maps:is_key(Child, Ids) of
         true ->
             St;

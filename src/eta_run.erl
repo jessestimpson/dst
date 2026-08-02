@@ -113,11 +113,6 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
 %% slower is a `check/1` that called into a suspended process — see `eta_harness`.
 -define(CHECK_TIMEOUT, 5000).
 
-%% Where `spawn_op/1` parks pids until the driver has registered them. The driver's
-%% own process dictionary, which is safe because `execute/2` runs there and nowhere
-%% else — and private, because nothing outside this module reads the key.
--define(PENDING_OPS, '$eta_run_pending_ops').
-
 -record(r, {
     mod :: module(),
     sut :: eta_harness:state(),
@@ -280,28 +275,7 @@ scheduler decides when it runs, like every other process.
 -endif.
 -spec spawn_op(fun(() -> term())) -> pid().
 spawn_op(Fun) ->
-    Pid = spawn(fun() ->
-        receive
-            {?MODULE, go} -> Fun()
-        end
-    end),
-    put(?PENDING_OPS, [Pid | pending_ops()]),
-    Pid.
-
-pending_ops() ->
-    case get(?PENDING_OPS) of
-        undefined -> [];
-        Pids -> Pids
-    end.
-
-%% Let the operation processes go, now that the scheduler owns them. Oldest first,
-%% so the order matches the order `execute/2` created them in rather than the order
-%% they happen to be stacked in.
-release_ops() ->
-    Pids = lists:reverse(pending_ops()),
-    erase(?PENDING_OPS),
-    [P ! {?MODULE, go} || P <- Pids],
-    ok.
+    eta_sched:spawn(Fun).
 
 %% ---------------------------------------------------------------------------
 %% Reading a result
@@ -695,9 +669,10 @@ apply_op(R, Op) ->
     Sut1 = Mod:execute(Op, Sut),
     %% An operation is issued by spawning; pick up whatever it created. Already
     %% known pids are ignored, so re-registering the whole set is correct.
+    %% Registering is also what lets them run: a gated child gets its token from
+    %% the scheduler, and `register/2` is the route when the parent — here, the
+    %% driver — is not traced. See `spawn_op/1`.
     Sched1 = eta_sched:register(Sched, Mod:processes(Sut1)),
-    %% Only now may those processes run — see `spawn_op/1`.
-    ok = release_ops(),
     spend(R#r{
         sut = Sut1,
         sched = Sched1,

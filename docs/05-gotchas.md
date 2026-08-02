@@ -109,9 +109,31 @@ on every event, forever. Cache the answer in `persistent_term`.
 Here's the general rule to carry to your own project. Under a user-level
 scheduler, **any synchronous call into an OTP service process is a real-time
 dependence**: `code_server`, `logger`'s handlers, `global`, `net_kernel`,
-`application_controller`. Grepping for `code:ensure_loaded`, `code:is_loaded`,
-`logger:` and `global:` along the paths your system exercises is much cheaper
-than the instrumentation it takes to find these afterwards.
+`application_controller`. Grepping for `code:ensure_loaded`, `code:is_loaded`
+and `global:` along the paths your system exercises is much cheaper than the
+instrumentation it takes to find these afterwards.
+
+`logger` is the one of those the transform handles for you — see below.
+
+### Logging is one of them, and it is handled
+
+A `logger` call doesn't just format a string. It hands the event to a handler,
+and the default handler `logger_std_h` is a process the scheduler doesn't own.
+Under load it switches from asynchronous to synchronous, at which point a log
+call is a synchronous call into an OTP service process. The handler then runs on
+the real scheduler and makes your process runnable again at a moment nothing
+chose, so a chatty system can have its schedule decided by how busy its log
+handler happens to be. The symptom is a seed that mostly reproduces.
+
+Every `logger` level function and `logger:log/2,3,4` is rewritten to
+`eta_logger`, which records the event into `eta_log` while a run is collecting
+and delegates to `logger` when one isn't. So your system's own logging becomes
+part of the narrative `eta_log:analyze/0` prints, at a sequence number
+comparable with everything else, instead of scrolling past in a separate stream.
+
+Nothing is filtered by level and no formatter runs. The run's log is a record of
+what happened rather than an operator's console, and deciding at record time what
+a reader will want is how you lose the line that mattered.
 
 ## Build-time hazards
 
@@ -150,15 +172,55 @@ from source in `setup_all` so it can't exercise the stale one.
 
 ### A plain spawn is a determinism hole
 
-The driver isn't traced, so a process it creates isn't adopted until the driver
-registers it, and in that window the process runs on the real scheduler. One
-racing process is usually harmless. 2, created by operations injected close
-together, race each other to deliver their first message.
+A process created by a plain `spawn` isn't adopted until the scheduler notices
+it, and in that window it runs on the real scheduler. One racing process is
+usually harmless. 2, created by operations injected close together, race each
+other to deliver their first message.
 
-Inside a transformed module `spawn` is rewritten to `eta_sched:spawn/1`
-automatically. Inside `execute/2` it isn't, because your harness isn't
-transformed, so use `eta_run:spawn_op/1` there. Watch `sched.adopted_late` in
-the run result. It should be at or very near zero.
+A gated spawn closes the window: the child starts blocked on a token only the
+scheduler can send, so there is no interval in which it is alive and unowned.
+
+**Inside a transformed module you get this for free.** Every local spawn form is
+rewritten: `spawn`, `spawn_link`, `spawn_monitor` and `spawn_opt`, on both
+`erlang` and `proc_lib`, qualified or bare. `gen_server:start`, `start_link` and
+`start_monitor` are rewritten too, at both arities, because those spawn inside
+OTP where no transform of your code reaches.
+
+**Inside `execute/2` you don't**, because your harness isn't transformed. Use
+`eta_run:spawn_op/1` there. It is the same mechanism under a different name:
+
+```erlang
+spawn_op(Fun) ->
+    eta_sched:spawn(Fun).
+```
+
+There used to be 2 gating protocols with 2 different tokens, and the harness had
+to know which one it was in. There is 1 now, and the thing that releases a gated
+child is `eta_sched:register/2` — which the driver already calls with whatever
+`processes/1` returns after every operation. So the order operations become
+runnable in is the order `processes/1` hands them over, and that is the only
+ordering rule; it used to be that plus an undocumented one hidden in a
+process-dictionary stack.
+
+Watch `sched.adopted_late` in the run result. It should be at or very near zero.
+
+### The distributed spawn forms raise
+
+`spawn(Node, Fun)` and its relatives ask for a process on another node, and `eta`
+does not simulate distribution. There is no honest rewrite: running the child
+locally puts it on the wrong node, and letting it through puts it outside the
+schedule entirely.
+
+So while a run is active they raise:
+
+```erlang
+{eta_sched, {no_distribution, {erlang, spawn, 2},
+             <<"eta does not simulate distribution; run the nodes as processes in one VM">>}}
+```
+
+With no run in progress they delegate, so a module built with the transform still
+works normally outside a simulation. A multi-node system under `eta` runs its
+nodes as processes in one VM.
 
 ### suspend_process/1 is documented for debuggers
 
