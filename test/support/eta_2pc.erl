@@ -32,6 +32,35 @@
 %% eta_harness
 %% ---------------------------------------------------------------------------
 
+%% The topology, when a run asked for a network. Two-phase commit is a
+%% distributed protocol, so its peers belong on separate nodes: the coordinator
+%% on one, each participant on its own, and the `prepare`/`vote`/`decision`
+%% traffic between them crossing links that can be broken.
+%%
+%% Clients are deliberately left off it. A client is a caller, not a peer — its
+%% `gen_server:call` to the coordinator is a local API call rather than a network
+%% round trip, and `eta_net:call/3` refuses a synchronous call *across a link*
+%% because it cannot own the reply leg. Leaving clients unplaced says exactly
+%% that, and it is also what happens by default: they are spawned by the driver,
+%% which is on no node, and placement is inherited.
+%%
+%% Inert when no network is running, which is every run that does not ask for one.
+place(Coordinator, Participants) ->
+    case eta_net:running() of
+        false ->
+            ok;
+        true ->
+            ok = eta_net:place(coordinator, [Coordinator]),
+            lists:foreach(
+                fun({Index, Pid}) ->
+                    ok = eta_net:place(list_to_atom("participant_" ++ integer_to_list(Index)), [
+                        Pid
+                    ])
+                end,
+                Participants
+            )
+    end.
+
 init(Seed, Config) ->
     Tab = ets:new(eta_2pc, [public, set]),
     N = maps:get(participants, Config, ?PARTICIPANTS),
@@ -45,6 +74,7 @@ init(Seed, Config) ->
      || Index <- lists:seq(1, N)
     ],
     {ok, Coordinator} = eta_2pc_coordinator:start_link(Tab, Participants, Mode),
+    ok = place(Coordinator, Participants),
 
     {ok, #{
         tab => Tab,

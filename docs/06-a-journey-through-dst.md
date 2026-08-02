@@ -673,8 +673,10 @@ failure that makes the bug visible.
 For example, your network can experience a failure
 that causes one of the ABD writers to crash. Right now our system can't
 express this failure mode, because the network is always reliable. Forcing the matter
-is called fault injection. Defining the system faults is your responsibility. `eta` gives
-you the entrypoint for making those faults deterministic.
+is called fault injection. Defining the system faults is mostly your responsibility. `eta` gives
+you the entrypoint for making those faults deterministic. We also provide `eta_net`,
+which can help to inject message-passing faults between simulated nodes. For our
+exercise, we'll build the fault injection utility ourselves.
 
 ### What our reliable network looks like in code
 

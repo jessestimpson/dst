@@ -33,6 +33,8 @@ since the discrete-event loop does nothing but advance to the next deadline.
 - **Reads frozen state.** `eta_observe` gets a suspended process's state out
   without asking it anything, which is the only way an invariant can inspect a
   system the scheduler has stopped.
+- **Injects network faults.** `eta_net` can be configured to automatically inject
+  faults in message delivery on simulated Erlang nodes.
 
 ## Getting Started
 
@@ -41,19 +43,20 @@ call:
 
 ```erlang
 #{outcome := Outcome, trace := Trace} =
-    eta_run:run(my_sut, #{seed => 7, max_ops => 25, max_steps => 20000}).
+    eta_run:run(my_harness, #{seed => 7, max_ops => 25, max_steps => 20000}).
 ```
 
 When a run fails, shrink it:
 
 ```erlang
 #{trace := Minimal, verified := true} =
-    eta_shrink:shrink(my_sut, Trace, #{seed => 7, max_ops => 25}).
+    eta_shrink:shrink(my_harness, Trace, #{seed => 7, max_ops => 25}).
 ```
 
-The library ships with a two-phase commit implementation as an example,
+The library ships with a [two-phase commit implementation as an example](test/support/ets_2pc.erl),
 and includes an optional bug that will break an invariant for demonstration
-purposes.
+purposes. We also provide a [walkthrough that implements an ABD Qurom Register](docs/06-a-journey-through-dst.md)
+and demonstrates the bug-finding method.
 
 ## Documentation
 
@@ -116,14 +119,6 @@ that consumer exercises.
 
 ### Known gaps, roughly by size
 
-- **No network simulation.** `eta` controls scheduling and time; it does not
-  control message delivery. A client that sends to 3 peers does so inside one
-  scheduler step, so a partially-delivered broadcast isn't a state the scheduler
-  can produce, and you have to model that fault in your workload instead.
-  Partial delivery, per-link reordering and partitions are all out of reach.
-  This is the largest gap. Idea: `eta`'s responsibility is to inject a seed
-  into the system under test, via the harness, and fault injection is the
-  developer's.
 - **Elixir systems can't be transformed.** See above.
 - **One simulation per VM.** `eta_time` and `eta_log` keep state in named ETS
   tables, so runs must be serial. Keep the tests `async: false`.

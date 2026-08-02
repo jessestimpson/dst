@@ -93,6 +93,9 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
     %% Timers the clock refused to advance to because nothing schedulable owned
     %% them. Should be 0. See `eta_time:advance_to_next/1`.
     stray_timers := non_neg_integer(),
+    %% What the simulated network did, or `#{}` when none was installed. See
+    %% `eta_net:stats/0`; `dropped` is what a non-vacuity guard asserts on.
+    net := #{atom() => non_neg_integer()},
     sched := #{atom() => non_neg_integer()}
 }.
 
@@ -164,6 +167,12 @@ Options, all with defaults:
 - `log` (`true`) — collect a `eta_log` record of the run. `false` suppresses the
   events but **not** the sequence numbers `log/1` hands out, so a harness that
   stamps its operations from them keeps working. See `eta_log`.
+- `net` (`false`) — install a simulated network for the run. `true` for a
+  perfect one, or `#{policy => ...}` to inject loss and delay; see `eta_net`. It
+  is started **before** `init/2`, seeded from the run's seed, so a fault schedule
+  is a function of that seed and nothing else. A harness whose cluster must sync
+  before it can survive faults leaves the policy perfect here and calls
+  `eta_net:set_policy/1` at the end of `init/2`.
 - `preload` (`[]`) — applications whose modules to load before the run starts.
   **Name your own application here.** `kernel`, `stdlib` and `eta` are always
   included; anything you add is loaded on top. `false` disables it entirely.
@@ -342,11 +351,21 @@ simulation suite after the determinism gate itself.
 -endif.
 -spec audit(result()) -> ok | {suspect, [{atom(), term()}]}.
 audit(Result = #{modules_loaded := Modules, sched := Sched}) ->
+    Net = maps:get(net, Result, #{}),
     Checks = [
         {modules_loaded, Modules, []},
         {adopted_late, maps:get(adopted_late, Sched, 0), 0},
         {timeouts, maps:get(timeouts, Sched, 0), 0},
-        {stray_timers, maps:get(stray_timers, Result, 0), 0}
+        {stray_timers, maps:get(stray_timers, Result, 0), 0},
+        %% A message that drew a delay with no clock to hang it on was delivered
+        %% immediately, so the network was quieter than its policy said. Not a
+        %% determinism hole — every run reaching here has a clock — but it is the
+        %% same class of "the run did not do what you asked" as the rest.
+        %% A send by a process other than the one being stepped, so when it landed
+        %% was decided by wall clock. Nothing else in this list catches it — the
+        %% run audits clean and the trace diverges anyway. See
+        %% `eta_sched:stepping/0`.
+        {net_unmanaged, maps:get(unmanaged, Net, 0), 0}
     ],
     case [{What, Found} || {What, Found, Clean} <- Checks, Found =/= Clean] of
         [] -> ok;
@@ -489,6 +508,13 @@ drive(Mod, Opts, Source) ->
     ok = eta_log:label('$eta'),
     %% Before the system, always — see the module doc.
     ok = eta_time:start(#{seed => Seed}),
+    %% And the network before the system for the same reason the clock is: a
+    %% policy installed after the system has started has already had the startup
+    %% traffic go past it, and startup runs on the real scheduler. That is how a
+    %% seeded fault schedule stops being a function of its seed. Started perfect
+    %% by default, so a harness that wants faults only after its cluster has
+    %% synced calls `eta_net:set_policy/1` from `init/2` rather than reseeding.
+    ok = start_net(maps:get(net, Opts, false), Seed),
     try
         {ok, Sut} = Mod:init(Seed, maps:get(config, Opts, #{})),
         Sched0 = eta_sched:new(#{seed => Seed}),
@@ -522,8 +548,32 @@ drive(Mod, Opts, Source) ->
             end,
         finish(Outcome, R1)
     after
+        %% The network before the clock, because `in_flight/0` reads the clock to
+        %% decide what has already been delivered. Both outlive `finish/2`, which
+        %% is where the counters are read — the Elixir original tore its network
+        %% down first and its non-vacuity guard reported zero drops on a run that
+        %% had dropped plenty, a guard that failed closed only by accident.
+        eta_net:stop(),
         eta_time:stop()
     end.
+
+%% `net => false` (the default) runs with no network at all, which is exactly the
+%% behaviour of every run written before there was one — and it is enforced rather
+%% than assumed.
+%%
+%% The network is a named ETS table, so it is global to the VM and outlives
+%% whoever started it. A run that merely declined to start one would still route
+%% every send through a network some *earlier* test left running, under that
+%% test's policy: a walkthrough that injects its faults in its own workload would
+%% quietly be dropping messages as well. Stopping is also what the `after` clause
+%% does on the way out, so this makes the rule symmetric — **a run owns the
+%% network's lifetime**, including when it wants none.
+start_net(false, _Seed) ->
+    eta_net:stop();
+start_net(true, Seed) ->
+    start_net(#{}, Seed);
+start_net(Opts, Seed) when is_map(Opts) ->
+    eta_net:start(#{seed => maps:get(seed, Opts, Seed), policy => maps:get(policy, Opts, #{})}).
 
 %% Load every module of the named applications, before there is a scheduler to
 %% be outside of.
@@ -834,6 +884,9 @@ finish(Outcome, R) ->
     Stats = eta_sched:stats(Sched),
     ClockMs = eta_time:now_ms(),
     Strays = eta_time:strays(),
+    %% While both the network and the clock are still up — `in_flight` is a
+    %% question about the wheel, not just a counter.
+    Net = net_stats(),
     %% Before `release/1` and `terminate/1`, so that teardown's own loading is
     %% not blamed on the run.
     Modules = loaded_since(R#r.loaded),
@@ -861,8 +914,18 @@ finish(Outcome, R) ->
         skipped => R#r.skipped,
         modules_loaded => Modules,
         stray_timers => Strays,
+        net => Net,
         sched => Stats
     }.
+
+%% `#{}` for a run with no network, which is what makes `net` safe to read
+%% unconditionally and what tells a reader "none was installed" rather than
+%% "none of these things happened".
+net_stats() ->
+    case eta_net:running() of
+        true -> eta_net:stats();
+        false -> #{}
+    end.
 
 %% Whether a deadline addressed to `Dest` can produce a scheduling event.
 %%

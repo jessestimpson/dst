@@ -11,15 +11,18 @@ Nothing else about the module changes, and the rewrite is a pure call-target
 substitution: `erlang:send_after(T, D, M)` becomes `eta_time:send_after(T, D, M)`,
 and so on for the table below.
 
-## Three passes, one transform
+## Four passes, one transform
 
 A module never names more than one `parse_transform`. The extra passes are
 controlled by attributes rather than by naming another transform:
 
 1. **Timer and clock rewriting** — the table below, applied always.
-2. **Receive timeouts** — puts `receive ... after T` on the virtual clock.
+2. **Message sending** — points `!` and the `cast`/`reply` functions at
+   `eta_net`, so a simulated network can drop, delay or cut them. Applied unless
+   the module declares `-eta_net(false)`; see below.
+3. **Receive timeouts** — puts `receive ... after T` on the virtual clock.
    Applied unless the module declares `-eta_after(false)`; see below.
-3. **State observability** — applied only to a module declaring
+4. **State observability** — applied only to a module declaring
    `-eta_observe(all)` or `-eta_observe({Record, Fields})`, which republishes the
    state on every `gen_server` callback return so a simulation can read it while
    the process is suspended. See `eta_observe`.
@@ -124,6 +127,55 @@ simulation.
 | `erlang:timestamp/0` | `eta_time:timestamp/0` |
 | `os:system_time/0,1` | `eta_time:system_time/0,1` |
 | `os:timestamp/0` | `eta_time:timestamp/0` |
+
+## Sending
+
+The network pass rewrites, unless the module declares `-eta_net(false)`:
+
+| From | To |
+|---|---|
+| `Dest ! Msg` | `eta_net:send(Dest, Msg)` |
+| `erlang:send/2,3` | `eta_net:send/2,3` |
+| `gen_server:cast/2` | `eta_net:cast/2` |
+| `gen_statem:cast/2` | `eta_net:cast/2` |
+| `gen_server:reply/2` | `eta_net:reply/2` |
+
+`!` is the one rewrite that is not a call. `eta_net:send/2` returns `Msg`, which
+is what `!` evaluates to, so the substitution is value-preserving.
+
+`eta_net` delegates to `erlang:send/2` unless a network is running, so this pass
+changes nothing about a run that does not start one. What it *does* change is who
+can be faulted later: routing has to be uniform per channel, because a direct
+send can overtake a delayed one, and module-granular rewriting is what makes that
+safe. See `eta_net`.
+
+`gen_server:call/2,3` is rewritten to `eta_net:call/2,3`, which routes the
+request. The **reply** leg is reached from the other end: in a module declaring
+`-behaviour(gen_server)`, every `handle_call/3` clause is wrapped so a
+`{reply, R, S}` return becomes a routed `eta_net:reply(From, R)` and a
+`{noreply, S}`. Both legs are then ordinary network traffic and can be faulted
+independently — which is what makes "the work happened, the caller never learned
+it did" a reachable state. See `eta_net:call/3`.
+
+## What raises rather than being rewritten
+
+Everything `eta_net` cannot yet put on the network raises, so the boundary is
+discoverable by using it instead of by reading a table.
+
+| | when |
+|---|---|
+| `gen_server:abcast`, `multi_call`, `send_request`/`wait_response`/`receive_response`/`check_response` | at run time, while a network is running |
+| every client-side function of `gen_statem` and `gen_event` except `gen_statem:cast/2` | the same |
+| a module declaring `-behaviour(gen_statem)` or `-behaviour(gen_event)` | at **compile** time |
+
+The last one is a property of the module rather than of a code path: those
+behaviours reply from inside OTP rather than from a `handle_call` return, so
+every call answered by such a module would come around the network, in every run.
+`-eta_net(false).` opts the module out of this pass and keeps the rest.
+
+The runtime ones are runtime because a module may hold one on a path no
+simulation reaches, and refusing to compile it would block adoption over code the
+run never executes. Both are inert without a network.
 
 ## Only *qualified* calls are rewritten
 
@@ -249,7 +301,7 @@ it would hide that rather than surface it.
 parse_transform(Forms, _Options) ->
     Locals = local_functions(Forms),
     Rewritten = [walk(Form, Locals) || Form <- Forms],
-    observe_pass(after_pass(Rewritten)).
+    observe_pass(after_pass(net_pass(Rewritten))).
 
 %% Every `{Name, Arity}` the module defines itself. Needed to decide whether an
 %% unqualified `spawn(F)` is the auto-imported BIF or the module's own function.
@@ -316,6 +368,301 @@ rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
     end;
 rewrite(Node, _Locals) ->
     Node.
+
+%% ---------------------------------------------------------------------------
+%% Network pass — points sends at `eta_net`, unless `-eta_net(false)`
+%% ---------------------------------------------------------------------------
+
+%% The sends that name a function, and so can be rewritten the ordinary way.
+%%
+%% `gen_server:call/2,3` is deliberately absent. Its request could be rewritten
+%% here, but the reply is sent by `gen:reply/2` from inside OTP where no transform
+%% reaches — so routing one leg and not the other would produce a channel that
+%% carries some of a conversation and not the rest, which is exactly the
+%% mixed-routing hazard `eta_net`'s moduledoc warns about. `gen_server:reply/2` is
+%% rewritten instead, which covers the reply a callback defers rather than returns.
+%% Name of the generated helper that routes a `handle_call` reply.
+-define(REPLY_FUN, '$eta_net_reply').
+
+-define(NET_REWRITES, #{
+    {erlang, send, 2} => eta_net,
+    {erlang, send, 3} => eta_net,
+    {gen_server, cast, 2} => {eta_net, cast},
+    {gen_statem, cast, 2} => {eta_net, cast},
+    {gen_server, reply, 2} => {eta_net, reply},
+    %% The request leg. The reply leg is brought onto the network from the other
+    %% end, by `handle_call_pass/1` below — routing only one of them would leave
+    %% the pair half-covered, and a reply that goes around the network can
+    %% overtake a message that went through it. See `eta_net:call/3`.
+    {gen_server, call, 2} => {eta_net, call},
+    {gen_server, call, 3} => {eta_net, call}
+}).
+
+%% Client-side messaging `eta_net` does not implement yet.
+%%
+%% Each is rewritten to `eta_net:unsupported/2`, which raises **while a network is
+%% running** and otherwise calls the original. Same position `eta_sched` takes on
+%% the distributed spawn forms, and for the same reason: there is no honest local
+%% rewrite, and silently letting the call through would mean a run states a fault
+%% model that quietly does not cover a channel.
+%%
+%% Raising at runtime rather than at compile time is deliberate. A module may hold
+%% one of these on a path no simulation ever reaches, and refusing to compile it
+%% would block adoption over code the run never executes.
+%%
+%% What is *not* here is as much of a statement as what is: `call/2,3`, `cast/2`
+%% and `reply/2` on `gen_server` are supported, and `gen_statem:cast/2` is too —
+%% a cast is a message whatever answers it. Everything else in these three
+%% interfaces is a gap with a name.
+-define(NET_UNSUPPORTED, [
+    %% Broadcasts and multi-node calls: distribution, which `eta` does not
+    %% simulate at all.
+    {gen_server, abcast, 2},
+    {gen_server, abcast, 3},
+    {gen_server, multi_call, 2},
+    {gen_server, multi_call, 3},
+    {gen_server, multi_call, 4},
+    %% The asynchronous request/response interface. Routable in principle — the
+    %% request is an ordinary send and the reply comes back through the same
+    %% `handle_call` return this transform already rewrites — but the reply is
+    %% matched by a `ReqId` the caller holds rather than by a receive this module
+    %% controls, so it needs its own design.
+    {gen_server, send_request, 2},
+    {gen_server, send_request, 4},
+    {gen_server, wait_response, 2},
+    {gen_server, wait_response, 3},
+    {gen_server, receive_response, 2},
+    {gen_server, receive_response, 3},
+    {gen_server, check_response, 2},
+    {gen_server, check_response, 3},
+    %% `gen_statem` replies from inside its own action handling rather than from a
+    %% `handle_call` return, so nothing here can bring that leg onto the network
+    %% yet. See `statem_unsupported/1`.
+    {gen_statem, call, 2},
+    {gen_statem, call, 3},
+    {gen_statem, send_request, 2},
+    {gen_statem, send_request, 4},
+    {gen_statem, wait_response, 1},
+    {gen_statem, wait_response, 2},
+    {gen_statem, wait_response, 3},
+    {gen_statem, receive_response, 1},
+    {gen_statem, receive_response, 2},
+    {gen_statem, receive_response, 3},
+    {gen_statem, check_response, 2},
+    {gen_statem, check_response, 3},
+    %% `gen_event` the same: a handler's reply is produced inside the event
+    %% manager, out of reach.
+    {gen_event, notify, 2},
+    {gen_event, sync_notify, 2},
+    {gen_event, call, 3},
+    {gen_event, call, 4},
+    {gen_event, send_request, 3},
+    {gen_event, send_request, 5},
+    {gen_event, wait_response, 2},
+    {gen_event, wait_response, 3},
+    {gen_event, receive_response, 2},
+    {gen_event, receive_response, 3},
+    {gen_event, check_response, 2},
+    {gen_event, check_response, 3}
+]).
+
+%% On unless a module says otherwise, for the same reason the `after` pass is:
+%% a knob you have to know about is a silent hole waiting to happen. A module
+%% built for simulation whose sends bypass the network makes the network *look*
+%% installed while a channel it should own goes unrouted — and a half-routed
+%% channel can reorder, which manufactures findings.
+net_pass(Forms) ->
+    case net_enabled(Forms) of
+        false ->
+            Forms;
+        true ->
+            ok = statem_unsupported(Forms),
+            handle_call_pass(net_walk(Forms))
+    end.
+
+%% A `gen_statem` or `gen_event` module cannot have its replies put on the
+%% network, so it is refused at **compile time** rather than at run time.
+%%
+%% The difference from `?NET_UNSUPPORTED` is that this is a property of the module
+%% rather than of a code path. A `gen_statem` does not reply from a `handle_call`
+%% return — it replies from a `{reply, From, Msg}` action handled inside
+%% `gen_statem` itself, where `handle_call_pass/1` cannot reach. So *every* call
+%% answered by this module would come around the network, and there is no run in
+%% which that is not true. A runtime raise would report it once per call site
+%% instead of once, and only for the paths a run happened to take.
+%%
+%% `-eta_net(false).` is the opt-out, and it is a real one: the module keeps timer,
+%% clock and spawn rewriting and simply takes no part in the network. That is the
+%% right answer for a state machine that is not a peer.
+statem_unsupported(Forms) ->
+    case behaviours(Forms) -- [gen_server, supervisor] of
+        [] ->
+            ok;
+        [B | _] when B =:= gen_statem; B =:= gen_event ->
+            error(
+                {eta_net,
+                    {behaviour_unsupported, B, <<
+                        "eta_net cannot route this behaviour's replies: they are sent "
+                        "from inside OTP rather than from a handle_call return, so a "
+                        "call answered here would always come around the network. Add "
+                        "`-eta_net(false).` to keep this module out of the network pass "
+                        "(timer, clock and spawn rewriting are unaffected)"
+                    >>}}
+            );
+        _ ->
+            ok
+    end.
+
+behaviours(Forms) ->
+    [B || {attribute, _, A, B} <- Forms, A =:= behaviour orelse A =:= behavior].
+
+%% Puts the *reply* leg of a `gen_server:call` on the network.
+%%
+%% `gen_server:call/3`'s request is an ordinary send this transform can point at
+%% `eta_net`. Its reply is not: `gen:reply/2` runs inside OTP and every one of its
+%% clauses ends in a raw send from the server process, so no rewrite at the call
+%% site can reach it. Routing one leg and not the other is worse than routing
+%% neither — the request is then subject to the network's ordering clamp and the
+%% reply is not, so a reply can be delivered ahead of a message sent before it.
+%%
+%% The answer is to rewrite the *callee*. A `handle_call/3` clause body is wrapped
+%% so that its return passes through a generated helper:
+%%
+%%     handle_call(Req, From, S) -> '$eta_net_reply'(From, begin OriginalBody end).
+%%
+%% and the helper turns a reply-carrying return into a routed reply plus a
+%% `noreply`:
+%%
+%%     {reply, R, S}        ->  eta_net:reply(From, R), {noreply, S}
+%%     {reply, R, S, X}     ->  eta_net:reply(From, R), {noreply, S, X}
+%%     {stop, Reason, R, S} ->  eta_net:reply(From, R), {stop, Reason, S}
+%%
+%% Matching on the value at runtime rather than on `{reply, ...}` literals in the
+%% source is deliberate, and it is the same choice `-eta_observe`'s pass makes: a
+%% callback that builds its return in a helper function has no literal here to
+%% rewrite, and a pass that only caught the literals would cover most of a module
+%% and quietly miss the rest.
+%%
+%% Only for a module that declares `-behaviour(gen_server)`. `handle_call/3` is a
+%% name anyone may use, and these three shapes mean something specific only in
+%% that contract.
+handle_call_pass(Forms) ->
+    case is_gen_server(Forms) andalso lists:any(fun is_handle_call/1, Forms) of
+        false ->
+            Forms;
+        true ->
+            Anno = erl_anno:new(0),
+            insert_before_eof([wrap_handle_call(F) || F <- Forms], [reply_fun(Anno)])
+    end.
+
+is_gen_server([{attribute, _, behaviour, gen_server} | _]) -> true;
+is_gen_server([{attribute, _, behavior, gen_server} | _]) -> true;
+is_gen_server([_ | Rest]) -> is_gen_server(Rest);
+is_gen_server([]) -> false.
+
+is_handle_call({function, _, handle_call, 3, _}) -> true;
+is_handle_call(_) -> false.
+
+wrap_handle_call({function, Anno, handle_call, 3, Clauses}) ->
+    {function, Anno, handle_call, 3, [wrap_handle_call_clause(C) || C <- Clauses]};
+wrap_handle_call(Form) ->
+    Form.
+
+%% The `From` argument is whatever the clause called it, and it may be a pattern
+%% rather than a variable — `handle_call(Req, {Pid, _} = From, S)` is ordinary, and
+%% so is a clause that ignores it. A fresh variable is bound to it instead, which
+%% works whatever the original pattern was and cannot collide with the clause's
+%% own names.
+wrap_handle_call_clause({clause, Anno, [Req, From, State], Guards, Body}) ->
+    V = {var, Anno, '$eta_net_from'},
+    {clause, Anno, [Req, {match, Anno, V, From}, State], Guards, [
+        {call, Anno, {atom, Anno, ?REPLY_FUN}, [V, {block, Anno, Body}]}
+    ]};
+wrap_handle_call_clause(Clause) ->
+    Clause.
+
+%% '$eta_net_reply'(From, Ret) -> case Ret of ... end.
+reply_fun(Anno) ->
+    From = {var, Anno, 'From'},
+    Ret = {var, Anno, 'Ret'},
+    R = {var, Anno, 'R'},
+    S = {var, Anno, 'S'},
+    X = {var, Anno, 'X'},
+    Reason = {var, Anno, 'Reason'},
+    Send = {call, Anno, {remote, Anno, {atom, Anno, eta_net}, {atom, Anno, reply}}, [From, R]},
+    Tup = fun(Es) -> {tuple, Anno, Es} end,
+    A = fun(Name) -> {atom, Anno, Name} end,
+    Clauses = [
+        {clause, Anno, [Tup([A(reply), R, S])], [], [Send, Tup([A(noreply), S])]},
+        {clause, Anno, [Tup([A(reply), R, S, X])], [], [Send, Tup([A(noreply), S, X])]},
+        {clause, Anno, [Tup([A(stop), Reason, R, S])], [], [
+            Send, Tup([A(stop), Reason, S])
+        ]},
+        {clause, Anno, [Ret], [], [Ret]}
+    ],
+    {function, Anno, ?REPLY_FUN, 2, [
+        {clause, Anno, [From, Ret], [], [{'case', Anno, Ret, Clauses}]}
+    ]}.
+
+net_enabled([{attribute, _, eta_net, false} | _]) -> false;
+net_enabled([_ | Rest]) -> net_enabled(Rest);
+net_enabled([]) -> true.
+
+%% The same bottom-up structural walk `walk/2` uses. Kept separate rather than
+%% folded into `?REWRITES` because that table is unconditional and this pass is
+%% not: `-eta_net(false)` has to be able to turn it off without taking the timer
+%% and spawn rewriting with it.
+net_walk(Node) when is_tuple(Node) ->
+    net_rewrite(list_to_tuple([net_walk(E) || E <- tuple_to_list(Node)]));
+net_walk(Nodes) when is_list(Nodes) ->
+    [net_walk(E) || E <- Nodes];
+net_walk(Node) ->
+    Node.
+
+%% `Dest ! Msg` is `{op, Anno, '!', Dest, Msg}` — the one rewrite here that is not
+%% a call, and the one that matters most, because a raw send is how most Erlang
+%% protocol code talks to a peer. `eta_net:send/2` returns `Msg`, which is what
+%% `!` evaluates to, so the substitution is value-preserving and safe in any
+%% expression position.
+net_rewrite({op, Anno, '!', Dest, Msg}) ->
+    {call, Anno, {remote, Anno, {atom, Anno, eta_net}, {atom, Anno, send}}, [Dest, Msg]};
+net_rewrite({call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}) ->
+    MFA = {Mod, Fun, length(Args)},
+    case lists:member(MFA, ?NET_UNSUPPORTED) of
+        true -> unsupported_call(Anno, MFA, Args);
+        false -> net_rewrite_known(Anno, RAnno, MAnno, FAnno, Mod, Fun, Args)
+    end;
+net_rewrite(Node) ->
+    Node.
+
+%% `M:F(A, B)` becomes `eta_net:unsupported({M, F, 2}, [A, B])`.
+%%
+%% One target for every arity of every unsupported function, because it carries
+%% the original MFA rather than encoding it in the target's name — which is also
+%% what lets it call the original when no network is running.
+unsupported_call(Anno, {M, F, A}, Args) ->
+    MFA =
+        {tuple, Anno, [
+            {atom, Anno, M},
+            {atom, Anno, F},
+            {integer, Anno, A}
+        ]},
+    List = lists:foldr(
+        fun(Arg, Acc) -> {cons, Anno, Arg, Acc} end,
+        {nil, Anno},
+        Args
+    ),
+    {call, Anno, {remote, Anno, {atom, Anno, eta_net}, {atom, Anno, unsupported}}, [MFA, List]}.
+
+net_rewrite_known(Anno, RAnno, MAnno, FAnno, Mod, Fun, Args) ->
+    case maps:find({Mod, Fun, length(Args)}, ?NET_REWRITES) of
+        {ok, {Target, TargetFun}} ->
+            {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, TargetFun}}, Args};
+        {ok, Target} ->
+            {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, Fun}}, Args};
+        error ->
+            {call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Receive-timeout pass — applied only to a module declaring `-eta_after(true)`

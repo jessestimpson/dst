@@ -155,6 +155,7 @@ releasing, not after.
 -export([
     active/0,
     current/0,
+    stepping/0,
     spawn/1, spawn/3,
     spawn_link/1, spawn_link/3,
     spawn_monitor/1, spawn_monitor/3,
@@ -336,6 +337,33 @@ plain `erlang` spawns.
 -spec active() -> boolean().
 active() ->
     ets:info(?ACTIVE, name) =/= undefined.
+
+-if(?DOCATTRS).
+-doc """
+The process the scheduler is stepping right now, or `undefined` between steps.
+
+Exactly one process runs during a step — every other one the scheduler owns is
+suspended — so this is the sharpest available statement of "on the schedule". A
+side effect caused by any other process while this is set happened at a moment
+wall-clock timing chose, not one the seed did.
+
+`undefined` is not the opposite of that. Between steps the driver itself is
+running, and a harness injecting an operation there is doing something the trace
+records; nothing is off-schedule merely because no step is in progress.
+
+Read out of band, from ETS, because the answer is wanted by processes that could
+not ask for it: the scheduler is a `gen_server` and a call into it from inside a
+step would deadlock against the step.
+""".
+-endif.
+-spec stepping() -> pid() | undefined.
+stepping() ->
+    try ets:lookup(?ACTIVE, stepping) of
+        [{stepping, Pid}] -> Pid;
+        [] -> undefined
+    catch
+        error:badarg -> undefined
+    end.
 
 -if(?DOCATTRS).
 -doc """
@@ -1159,8 +1187,15 @@ is_runnable(#st{exited = Exited, blocked_at = Blocked}, Id, Pid) ->
 do_step(St0 = #st{procs = Procs}, Id) ->
     Pid = maps:get(Id, Procs),
     QueueBefore = queue_len(Pid),
+    %% Published for the duration of the step, and erased after it. While a step
+    %% is in progress this is the *only* process that is supposed to be running,
+    %% so anything else that acts during it is acting outside the schedule.
+    %% `eta_net` uses it to tell an on-schedule send from an off-schedule one; see
+    %% `stepping/0`.
+    true = ets:insert(?ACTIVE, {stepping, Pid}),
     safe_resume(Pid),
     {Quiescence, St1} = await_quiescent(St0, Pid),
+    true = ets:delete(?ACTIVE, stepping),
     St2 = St1#st{steps = St1#st.steps + 1, choices = [Id | St1#st.choices]},
     case status(Pid) of
         dead ->
@@ -1318,8 +1353,13 @@ do_drain(St, Pid, Ref, SelfSends) ->
 %% adopt it and hand it its token. It does not count as adopted late, because it
 %% has not run.
 handle_trace(
-    St = #st{ids = Ids, gated = Gated}, {trace, _Parent, spawn, Child, {?MODULE, F, _}}
+    St = #st{ids = Ids, gated = Gated}, {trace, Parent, spawn, Child, {?MODULE, F, _}}
 ) when F =:= gated; F =:= gated_plib ->
+    %% A child belongs wherever its parent does. `eta_net` is inert if no network
+    %% is running, and a no-op if the parent was never placed — see
+    %% `eta_net:place/2` for why a topology that does not follow spawning is a
+    %% topology that goes stale the first time the system creates a worker.
+    ok = eta_net:inherit(Parent, Child),
     case maps:is_key(Child, Ids) of
         true ->
             St;
@@ -1333,7 +1373,8 @@ handle_trace(
                 error:badarg -> St
             end
     end;
-handle_trace(St = #st{ids = Ids}, {trace, _Parent, spawn, Child, _MFA}) ->
+handle_trace(St = #st{ids = Ids}, {trace, Parent, spawn, Child, _MFA}) ->
+    ok = eta_net:inherit(Parent, Child),
     case maps:is_key(Child, Ids) of
         true ->
             St;
