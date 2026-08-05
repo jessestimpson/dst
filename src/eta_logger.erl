@@ -37,6 +37,8 @@ It does not filter by level, consult `logger`'s configuration, or run formatters
 An event is recorded whatever the level, because the run's log is a record of
 what happened rather than an operator's console, and deciding at record time what
 a reader will want is how you lose the line that mattered.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

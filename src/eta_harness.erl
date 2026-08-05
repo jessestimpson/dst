@@ -83,6 +83,8 @@ not need.
 Name whatever you care about and leave the rest out; anything absent falls back
 to its position. Names are ordinary terms and `eta_log` renders them: an atom
 becomes itself, `{Kind, N}` becomes `kind-n`, anything else falls back to `~p`.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

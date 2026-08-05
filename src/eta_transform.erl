@@ -139,8 +139,22 @@ The network pass rewrites, unless the module declares `-eta_net(false)`:
 | `gen_server:cast/2` | `eta_net:cast/2` |
 | `gen_statem:cast/2` | `eta_net:cast/2` |
 | `gen_server:reply/2` | `eta_net:reply/2` |
+| `erlang:monitor/2,3` | `eta_net:monitor/2,3` |
+| `erlang:demonitor/1,2` | `eta_net:demonitor/1,2` |
 
-`!` is the one rewrite that is not a call. `eta_net:send/2` returns `Msg`, which
+`!` is the one rewrite that is not a call.
+
+**Why monitors are in this pass.** A link failure fires every monitor held across
+it, and a monitor is made by a BIF inside the system under test — so a simulated
+network can only know one exists by being what creates it. Without the rewrite a
+partition is invisible to the code that detects peers, which is most of the code
+that matters. `eta_net:monitor/2` simulates only a monitor whose ends are placed
+on different simulated nodes and leaves every other one a plain `erlang:monitor`,
+so the rewrite changes nothing for a module that is not part of a topology.
+
+The monitor BIFs are auto-imported, so a bare `monitor(process, Pid)` is rewritten
+too — on the same terms as the bare spawns below: only when the module does not
+define that name itself. `eta_net:send/2` returns `Msg`, which
 is what `!` evaluates to, so the substitution is value-preserving.
 
 `eta_net` delegates to `erlang:send/2` unless a network is running, so this pass
@@ -189,6 +203,8 @@ anyway.
 process that sleeps is neither runnable nor blocked on a receive, so it cannot be
 scheduled. Code under simulation should not sleep at all, and silently virtualising
 it would hide that rather than surface it.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 
@@ -301,7 +317,7 @@ it would hide that rather than surface it.
 parse_transform(Forms, _Options) ->
     Locals = local_functions(Forms),
     Rewritten = [walk(Form, Locals) || Form <- Forms],
-    observe_pass(after_pass(net_pass(Rewritten))).
+    observe_pass(after_pass(net_pass(Rewritten, Locals))).
 
 %% Every `{Name, Arity}` the module defines itself. Needed to decide whether an
 %% unqualified `spawn(F)` is the auto-imported BIF or the module's own function.
@@ -390,6 +406,18 @@ rewrite(Node, _Locals) ->
     {gen_server, cast, 2} => {eta_net, cast},
     {gen_statem, cast, 2} => {eta_net, cast},
     {gen_server, reply, 2} => {eta_net, reply},
+    %% Monitors. A partition has to fire the `noconnection` DOWNs real
+    %% distribution would, and a monitor is created by a BIF inside the system
+    %% under test — so the only way this module can know one exists is to be the
+    %% thing that creates it. Same seam as the sends, and it belongs to the *net*
+    %% pass rather than the unconditional one for the same reason: a module that
+    %% takes no part in the network should keep its monitors exactly as they are.
+    %% `eta_net` leaves everything but a monitor across a declared link as a plain
+    %% `erlang:monitor`. See `eta_net:monitor/2`.
+    {erlang, monitor, 2} => eta_net,
+    {erlang, monitor, 3} => eta_net,
+    {erlang, demonitor, 1} => eta_net,
+    {erlang, demonitor, 2} => eta_net,
     %% The request leg. The reply leg is brought onto the network from the other
     %% end, by `handle_call_pass/1` below — routing only one of them would leave
     %% the pair half-covered, and a reply that goes around the network can
@@ -471,13 +499,13 @@ rewrite(Node, _Locals) ->
 %% built for simulation whose sends bypass the network makes the network *look*
 %% installed while a channel it should own goes unrouted — and a half-routed
 %% channel can reorder, which manufactures findings.
-net_pass(Forms) ->
+net_pass(Forms, Locals) ->
     case net_enabled(Forms) of
         false ->
             Forms;
         true ->
             ok = statem_unsupported(Forms),
-            handle_call_pass(net_walk(Forms))
+            handle_call_pass(net_walk(Forms, Locals))
     end.
 
 %% A `gen_statem` or `gen_event` module cannot have its replies put on the
@@ -612,27 +640,47 @@ net_enabled([]) -> true.
 %% folded into `?REWRITES` because that table is unconditional and this pass is
 %% not: `-eta_net(false)` has to be able to turn it off without taking the timer
 %% and spawn rewriting with it.
-net_walk(Node) when is_tuple(Node) ->
-    net_rewrite(list_to_tuple([net_walk(E) || E <- tuple_to_list(Node)]));
-net_walk(Nodes) when is_list(Nodes) ->
-    [net_walk(E) || E <- Nodes];
-net_walk(Node) ->
+net_walk(Node, Locals) when is_tuple(Node) ->
+    net_rewrite(list_to_tuple([net_walk(E, Locals) || E <- tuple_to_list(Node)]), Locals);
+net_walk(Nodes, Locals) when is_list(Nodes) ->
+    [net_walk(E, Locals) || E <- Nodes];
+net_walk(Node, _Locals) ->
     Node.
+
+%% The auto-imported monitor BIFs, handled the same way and for the same reason
+%% as `?AUTO_SPAWNS`: `monitor(process, Pid)` written bare is `erlang:monitor/2`,
+%% and leaving it alone means a monitor this module cannot see — which is a
+%% partition that silently fails to fire it. Guarded on the module not defining
+%% the name itself, since `monitor/2` is a name anyone may use.
+-define(NET_AUTO, [
+    {monitor, 2},
+    {monitor, 3},
+    {demonitor, 1},
+    {demonitor, 2}
+]).
 
 %% `Dest ! Msg` is `{op, Anno, '!', Dest, Msg}` — the one rewrite here that is not
 %% a call, and the one that matters most, because a raw send is how most Erlang
 %% protocol code talks to a peer. `eta_net:send/2` returns `Msg`, which is what
 %% `!` evaluates to, so the substitution is value-preserving and safe in any
 %% expression position.
-net_rewrite({op, Anno, '!', Dest, Msg}) ->
+net_rewrite({op, Anno, '!', Dest, Msg}, _Locals) ->
     {call, Anno, {remote, Anno, {atom, Anno, eta_net}, {atom, Anno, send}}, [Dest, Msg]};
-net_rewrite({call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}) ->
+net_rewrite({call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}, _Locals) ->
     MFA = {Mod, Fun, length(Args)},
     case lists:member(MFA, ?NET_UNSUPPORTED) of
         true -> unsupported_call(Anno, MFA, Args);
         false -> net_rewrite_known(Anno, RAnno, MAnno, FAnno, Mod, Fun, Args)
     end;
-net_rewrite(Node) ->
+net_rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
+    Key = {Fun, length(Args)},
+    case lists:member(Key, ?NET_AUTO) andalso not sets:is_element(Key, Locals) of
+        true ->
+            {call, Anno, {remote, Anno, {atom, Anno, eta_net}, {atom, FAnno, Fun}}, Args};
+        false ->
+            {call, Anno, {atom, FAnno, Fun}, Args}
+    end;
+net_rewrite(Node, _Locals) ->
     Node.
 
 %% `M:F(A, B)` becomes `eta_net:unsupported({M, F, 2}, [A, B])`.

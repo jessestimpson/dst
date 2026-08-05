@@ -95,6 +95,8 @@ can survive shrinking despite contributing nothing, and did in that example.
 The trace is still a genuine repro; it is the *minimality* that is approximate, and
 knowing which is which matters when reading one. Closing it means remapping ids as
 entries are removed, which is a real extension rather than a tuning change.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

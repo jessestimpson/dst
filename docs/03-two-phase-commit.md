@@ -8,6 +8,11 @@ reveals.
 This page reads that example. If you'd rather build something from scratch,
 [A Journey Through DST](06-a-journey-through-dst.md) does that instead.
 
+## AI disclosure
+
+This document is pending a human rewrite. We still expect the content to be mostly
+correct.
+
 ## The protocol
 
 A coordinator wants a group of participants to agree on a transaction. It asks

@@ -59,6 +59,8 @@ The clock starts before the system, always. A timer armed while `eta_time` is
 inert goes to the real clock and stays there until it fires and re-arms, so
 long-period timers — the interesting ones — would silently never be virtual. This
 is why `init/2` is called by the driver rather than by the caller beforehand.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

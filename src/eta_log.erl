@@ -101,6 +101,8 @@ safe too, for a reason worth stating: a step ends when a process **blocks in a
 receive**, and an ETS operation never blocks. Observability that changed the
 schedule would be worse than none, since every failure you then investigated
 would be a different failure from the one you set out to investigate.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

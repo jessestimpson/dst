@@ -73,6 +73,8 @@ There used to be a third form, a bare field list, which meant "these fields of
 `#state{}`". It is gone. A module whose record was named anything else failed at
 compile time complaining about a record it had never declared, and a reader had
 to know the convention to see why.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

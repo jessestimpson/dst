@@ -8,6 +8,11 @@ The examples below come from `dgen_registry`: several nodes each holding a
 replica of a `name -> pid` map, with one elected leader through which all
 changes pass.
 
+## AI disclosure
+
+This document is pending a human rewrite. We still expect the content to be mostly
+correct.
+
 ## The contract
 
 ```erlang

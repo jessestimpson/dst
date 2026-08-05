@@ -3,6 +3,11 @@
 Grouped by where they bite. If you're here because a seed stopped reproducing,
 start with the method rather than the list.
 
+## AI disclosure
+
+This document is pending a human rewrite. We still expect the content to be mostly
+correct.
+
 ## How to debug a determinism failure
 
 Reading the code and thinking hard has a poor record against "the same seed

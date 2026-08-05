@@ -53,6 +53,8 @@ in ticks, and never while work remains to be done at the current instant.
 
 The tables are named, so one clock exists per VM. Simulations must not run
 concurrently in the same node.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

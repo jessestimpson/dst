@@ -128,6 +128,8 @@ releasing, not after.
   the scheduler keeps waiting while the process is alive and not suspended, since
   the event is then in flight. Only a process that is dead, or that did not resume
   at all, ends a step this way in practice.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 
@@ -1294,8 +1296,11 @@ await_event(St, Pid, Want, Budget, Patience) when Budget > 0, Patience > 0 ->
             {ok, St};
         {trace, Pid, out_exited, _} ->
             {exited, St};
-        {trace, Pid, exit, _Reason} ->
-            {exited, handle_trace(St, {trace, Pid, exit, normal})};
+        {trace, Pid, exit, Reason} ->
+            %% Reason is passed through rather than flattened to `normal`: nothing
+            %% here reads it, but `eta_net` does — a simulated monitor's DOWN
+            %% carries the real exit reason. See `eta_net:notify_exit/2`.
+            {exited, handle_trace(St, {trace, Pid, exit, Reason})};
         {trace, _, _, _} = T ->
             await_event(handle_trace(St, T), Pid, Want, Budget - 1, Patience);
         {trace, _, _, _, _} = T ->
@@ -1398,7 +1403,13 @@ handle_trace(St = #st{ids = Ids}, {trace, Parent, spawn, Child, _MFA}) ->
                     adopt_exited(St, Child)
             end
     end;
-handle_trace(St = #st{ids = Ids, exited = Exited}, {trace, Pid, exit, _Reason}) ->
+handle_trace(St = #st{ids = Ids, exited = Exited}, {trace, Pid, exit, Reason}) ->
+    %% The scheduler is the tracer for every process in a run, so this is the one
+    %% place an exit is observed at a point the schedule fixes rather than
+    %% whenever the BEAM happens to run a watcher. `eta_net` has no other source
+    %% for it, and is inert if no network is running. See
+    %% `eta_net:notify_exit/2`.
+    ok = eta_net:notify_exit(Pid, Reason),
     case maps:find(Pid, Ids) of
         {ok, Id} -> St#st{exited = Exited#{Id => true}};
         error -> St

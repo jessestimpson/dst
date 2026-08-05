@@ -135,6 +135,93 @@ defmodule EtaNetRunTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Link events as part of the schedule
+  # ---------------------------------------------------------------------------
+
+  describe "partitions, node kills and monitors under a run" do
+    @faults :eta_net_faults
+    @fault_opts %{
+      max_ops: 30,
+      max_steps: 20_000,
+      preload: [:eta],
+      net: %{policy: %{drop_p: 0.2, delay_p: 0.2, max_delay: 20}}
+    }
+
+    @describetag timeout: 300_000
+
+    defp fault_run(seed) do
+      @run.run(@faults, Map.merge(@fault_opts, %{seed: seed}))
+    end
+
+    test "the same seed produces an identical trace" do
+      # The bar every message this feature introduces has to clear. A signal or a
+      # synthetic DOWN is part of the schedule, so a fan-out ordered by anything
+      # the run did not decide — `ets:match/2`'s row order, a corpse reaped at
+      # its own pace — shows up here as two traces from one seed.
+      #
+      # Ten runs, because an order that is merely usually right passes twice.
+      runs = for _ <- 1..10, do: fault_run(4)
+
+      traces = Enum.map(runs, & &1.trace)
+
+      assert length(Enum.uniq(traces)) == 1,
+             "one seed produced #{length(Enum.uniq(traces))} distinct traces in 10 runs"
+
+      nets = Enum.map(runs, & &1.net)
+      assert length(Enum.uniq(nets)) == 1, "one seed produced distinct network outcomes"
+
+      outcomes = Enum.map(runs, & &1.outcome)
+      assert length(Enum.uniq(outcomes)) == 1
+
+      # Non-vacuity, one clause per thing the run claims to exercise.
+      net = hd(nets)
+      assert net.noconnection > 0, "no monitor was ever severed; the run proves nothing"
+      assert net.signalled > 0, "no link event was ever delivered"
+      assert net.dropped > 0, "the network lost nothing"
+    end
+
+    test "a different seed produces a different one" do
+      a = fault_run(4)
+      b = fault_run(19)
+
+      assert a.trace != b.trace or a.net != b.net
+    end
+
+    test "a recorded trace replays under the same link events" do
+      recorded = fault_run(4)
+
+      replayed = @run.replay(@faults, recorded.trace, Map.merge(@fault_opts, %{seed: 4}))
+
+      assert replayed.outcome == recorded.outcome
+      assert replayed.net == recorded.net
+      assert replayed.skipped == 0
+    end
+
+    test "a process on another simulated node never learns the real exit reason" do
+      # `check/1` is the assertion — the harness fails the run if any process ever
+      # records a DOWN whose reason is not `noconnection` (or `noproc`, for a
+      # monitor created on a peer that had already gone). In one VM a killed
+      # process yields `killed` to every monitor it has, so this only holds
+      # because the remote monitors are retired before the process dies.
+      for seed <- [4, 19, 41] do
+        result = fault_run(seed)
+        assert result.outcome == :ok, "seed #{seed}: #{inspect(result.outcome)}"
+      end
+    end
+
+    test "a perfect network still delivers the link events" do
+      # The events are not faults and must not be subject to the fault policy: a
+      # partition on a perfect network still severs monitors and still signals.
+      result = @run.run(@faults, Map.merge(@fault_opts, %{seed: 4, net: true}))
+
+      assert result.outcome == :ok
+      assert result.net.dropped == 0
+      assert result.net.signalled > 0
+      assert result.net.noconnection > 0
+    end
+  end
+
   describe "delay" do
     test "is virtual, so a slow network costs no wall-clock time" do
       opts = %{

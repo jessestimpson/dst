@@ -5,6 +5,11 @@ from your own system, and how to tell whether any of it worked. For a hands-on
 version of the same material, [A Journey Through DST](06-a-journey-through-dst.md)
 builds a project from an empty directory.
 
+## AI disclosure
+
+This document is pending a human rewrite. We still expect the content to be mostly
+correct.
+
 ## The parts
 
 ```

@@ -19,6 +19,9 @@ that is done too. `eta_sched`, `eta_time`, `eta_transform`, `eta_after_transform
 under test on the full driver: `dgen_registry` and two-phase commit. The suite runs
 with no FoundationDB (`DGEN_BACKEND=dgen_mem mix test`).
 
+`eta_net` is a sixth component the plan did not contain at all, argued for and
+written up under "The network, and the events a failure delivers" below.
+
 Both systems now reproduce their own schedule exactly and replay a recorded trace
 strictly; `eta_2pc` also shrinks. What remains is the acceptance criteria below and
 the rest of Phase 5's "no real-time dependence anywhere" goal.
@@ -32,6 +35,10 @@ framework as the phases land. Each completed phase should leave behind not just 
 tick but what was *learned* building it — the assumptions that turned out wrong are
 the most valuable thing here, because they are what a reader would otherwise have
 to rediscover.
+
+## AI disclosure
+
+This document is LLM generated.
 
 ## What this is for
 
@@ -122,14 +129,16 @@ easy to introduce and produces failures that look like scheduler bugs.
 
 ## Architecture
 
-Six components. The first four are system-agnostic and are the reusable framework;
-the last two are what a system under test provides.
+Seven components. The first five are system-agnostic and are the reusable
+framework; the last two are what a system under test provides.
 
 ```
 eta_sched    serializing scheduler: owns the process set, picks who steps next
              from a seeded RNG, detects quiescence, emits the choice sequence
 eta_time     virtual clock + timer wheel; when nothing is runnable, advance to
              the next timer deadline rather than waiting
+eta_net      simulated network: per-ordered-pair loss, delay and cuts over a
+             declared topology, plus the events a link or node failure delivers
 eta_run      driver: seed -> setup -> generate -> step -> check -> teardown,
              recording everything needed for exact replay
 eta_shrink   delta-debugging over the choice sequence and the op list
@@ -138,6 +147,9 @@ eta_shrink   delta-debugging over the choice sequence and the op list
              fault-injectable (for dgen: a pure-Erlang dgen_backend)
 <sut>_model  workload generator + invariants
 ```
+
+`eta_net` is the one that was not planned. The row is here rather than in the
+phase list because it does not belong to a phase; see the section at the end.
 
 ### The SUT contract
 
@@ -186,7 +198,7 @@ rewrite, then reinstated and built when porting `dgen_registry` measured what
 adoption actually costs. `set_on_spawn` adopts a child *after the fact*; it does not
 stop the child acting first. The original table was right.
 
-The spawn row is also the **one place the "only qualified calls" rule does not
+The spawn row is also **one of two places the "only qualified calls" rule does not
 apply**, and the exception is principled rather than pragmatic. That rule exists
 because `monotonic_time` and friends are not auto-imported, so a bare call must be
 to something the module defines and rewriting it would break the module.
@@ -197,6 +209,26 @@ defining that name itself, which is the condition the original rule was protecti
 
 The third row is the one this document previously said was impossible — see
 Phase 5.
+
+Two more rows arrived with `eta_net`, in a pass of their own that a module can opt
+out of with `-eta_net(false)`:
+
+| From | To | Where |
+|---|---|---|
+| `Dest ! Msg`, `erlang:send/2,3`, `gen_server:cast/2`, `call/2,3`, `reply/2` | `eta_net:*` | `eta_transform` |
+| `erlang:monitor/2,3`, `demonitor/1,2` | `eta_net:*` | `eta_transform` |
+
+The sends are the obvious half. The **monitors** are the second exception to the
+qualified-calls rule, for the same reason as the spawns — `monitor/2` is
+auto-imported and most code writes it bare — and they are in the transform at all
+because there is nowhere else to put them: a monitor is created by a BIF inside
+the system under test, and a simulated network that cannot see one cannot fire the
+`noconnection` it owes it. The reasoning is under "A monitor cannot be made to
+lie" below; it is the single riskiest decision in `eta_net`.
+
+Both rows are in the *network* pass rather than the unconditional one, which is
+the difference that makes them safe: a module that takes no part in a topology
+keeps its sends and its monitors exactly as they were.
 
 ## Phases
 
@@ -1036,6 +1068,233 @@ accident, and the registry's replay was measured by *re-running the seed* — wh
 exercises `run/2`, not `replay/3`. Two things that both look like "replay works" and
 only one of them was tested.
 
+### The network, and the events a failure delivers
+
+Shipped as [`src/eta_net.erl`](../src/eta_net.erl). It is not a phase, because the
+plan did not contain it — and the plan's argument for why it was unnecessary is
+one of this document's load-bearing paragraphs.
+
+"The central primitive" says you do not need to intercept messages to control
+delivery order, because Erlang guarantees FIFO per ordered pair and controlling
+*who runs* therefore fixes the global order. That is true, and it settles the
+wrong question. It settles **order**; it says nothing about **delivery**. A client
+that casts to three peers does so inside one scheduler step, so a
+partially-delivered broadcast is not a state the scheduler can reach at all — and
+a partially-delivered broadcast is where both of the registry's known replication
+defects live. Controlling who runs is sufficient for determinism and insufficient
+for a fault model. `DGen.Sim.Net` existed for exactly that reason and was never
+system-agnostic; `eta_net` is that idea extracted, with the fault model narrowed
+to things real Erlang can produce: per ordered pair, **deliver, drop, delay or
+cut**, and never reorder.
+
+#### Faults are not the whole of a failure
+
+The gap that the first version left, and the more instructive half of the work.
+
+`eta_net` could break a *link* long before it could produce a *failure*. Real
+distribution does not merely stop carrying messages when a connection dies: it
+delivers `nodedown` to both ends, and it fires every monitor held across the
+connection with `noconnection`. A simulator that drops messages and delivers
+neither injects a state the real system cannot be in — both ends still believing
+the link is up — and everything that follows is an artefact wearing the costume of
+a defect. Phase 5's write-up already names half of this ("a fault model that
+cannot be healed has to be narrowed"), and the narrowing it describes was a
+workaround for the missing events rather than a design.
+
+The monitor half is worse, because it is silent. Under `eta_net` a partitioned
+peer is alive in the same VM, so the VM's monitor stays armed and nothing fires.
+Any system whose failure detection runs on monitors — which is most of them — was
+untestable against a partition, while the link fault itself worked perfectly and
+the suite stayed green.
+
+Three things closed it, and the last one is the whole of the difficulty:
+
+| | |
+|---|---|
+| Per-side derivation | `#{signal => nodedown}` sends `{nodedown, B}` to A's side and `{nodedown, A}` to B's. An atom names a *kind*; a literal term still goes to both sides unchanged, so existing callers are untouched. |
+| Directionality | `#{learns => a}` is "A finds out and B does not notice", which is what two independently timing-out ends actually do. It governs the signal and the DOWNs together, because they are one event seen twice. The cut stays symmetric: a lost link loses both directions whether or not anyone has realised. |
+| Synthetic `noconnection` DOWNs | Below. |
+
+#### Located and faultable are different questions
+
+`place/2` used to answer both at once, and the case that forces them apart is the
+common one rather than a corner.
+
+A `dgen` node runs a member, an elector and a connector under one supervisor. Only
+member-to-member traffic crosses the wire: the electors coordinate through
+FoundationDB and never message each other, so an elector's "send" is a durable
+store operation in a message's clothing. **Dropping one models a failure the store
+cannot produce** — a database commits or errors, it does not silently evaporate —
+and doing exactly that has already produced two false violations of a real safety
+property on this codebase, each indistinguishable at first look from the
+replication defect the suite hunts.
+
+But the connector is where node-level failure detection lives. It owns
+`net_kernel:monitor_nodes/1`, it drives the stranded-member reap and the
+leader-liveness backstop, and it has to die when its node does. So it must be *on*
+the node without being *on the wire*, and neither `place/2` nor leaving it
+unplaced says that: unplaced is not on any node at all, so it learns nothing when
+one fails.
+
+`attach/2` is the answer, and the distinction it introduces is now the spine of
+the module:
+
+- **Located** decides who receives link events and who dies with the node.
+- **Faultable** decides whose messages may be dropped or delayed.
+
+A send is faulted only when *both* ends are faultable, so an attached process is
+safe in either direction; children inherit both properties.
+
+The alternative considered and rejected was "place everything and narrow `scope`
+until the store traffic is excluded". It states the same thing in a form that has
+to be kept correct by hand every time the system grows a message, and the failure
+mode of getting it wrong is a false violation rather than an error. Topology is
+the durable statement; `scope` is what a particular run is entitled to break.
+
+#### A monitor cannot be made to lie, so it has to be replaced
+
+The hard decision, and the one most likely to have been got subtly wrong.
+
+The requirement is an asymmetry: when a node dies, a process on **another**
+simulated node must see `noconnection`, while a monitor in the same VM that is not
+part of the topology sees the real exit reason. One VM cannot produce that with
+real monitors, and the reason is worth stating precisely rather than waving at:
+
+- **A monitor cannot be cancelled by anyone but its owner.** `erlang:demonitor/1`
+  raises for a monitor another process created, so the driver cannot retire a
+  watcher's monitor before killing the target.
+- **A `DOWN` already queued cannot be rewritten.** Mailboxes are private. A
+  synthetic `noconnection` delivered alongside a real `killed` is two DOWNs for one
+  monitor, which real Erlang never produces — and the second one arrives with a
+  ref the watcher has already retired and re-monitored past, which is precisely
+  the shape that makes a correct system look broken.
+
+So the monitor has to be *simulated*: `eta_net:monitor/2` records the pair and
+issues its own ref, and no VM monitor exists behind it. Three variants were
+considered for detecting the target's death and two are traps:
+
+| Source of the exit | Why not |
+|---|---|
+| A broker process holding real monitors | Learns at the right moment and forwards at the wrong one. It is not a process the scheduler owns, so its forwarded DOWN lands whenever the BEAM runs it — a message ordered by wall clock, which is the thing the framework exists to remove. |
+| A real monitor in the watcher under a private tag | Lands at exactly the right moment in exactly the wrong shape, and nothing can rewrite another process's mailbox to fix it. |
+| **`eta_sched`'s exit trace** | Shipped. The scheduler is already the tracer for every process in a run and already calls `eta_net:inherit/2` from the same handler, so it learns of an exit synchronously with the step that caused it, in a process whose mailbox is read at points the schedule fixes. |
+
+Delivery from the scheduler is exact rather than approximately right: only one
+process runs during a step, so a DOWN raised at the end of it necessarily sits
+behind every message the dying process sent during it, which is the order the VM
+would have produced.
+
+**The scope is deliberately narrow, and the narrowing is the safety argument.** A
+monitor is simulated only when, at creation, watcher and target are located on
+*different* simulated nodes. Everything else stays a plain `erlang:monitor`. The
+two choices fail in opposite directions: a real monitor cannot produce
+`noconnection`, but a simulated one hangs the watcher forever if the exit
+notification is ever missed. Confining simulation to the pairs a partition can
+actually sever bounds that exposure to monitors the run declared a link for, and
+leaves crash detection everywhere else on machinery that cannot go wrong.
+
+The consequence, recorded because it will bite someone: a monitor created
+**before** its ends are placed is a real one and will never fire `noconnection`.
+Place the topology in `init/2`, alongside registration, which is where it belongs
+anyway.
+
+`eta_net:call/3`'s own monitor is left real on purpose. It is the framework's
+liveness check on a callee and has to work whatever the scheduler is reporting;
+the cost is that a call outstanding across a partition ends in its virtual timeout
+rather than in `noconnection`, which is a known simplification rather than an
+oversight.
+
+#### Killing a node is an ordering problem, not a killing problem
+
+`kill_node/2` exists because the hand-rolled version — kill the tree, then signal
+— is wrong in a way that is invisible until it produces a wrong answer. The order
+that works is:
+
+1. Fire `noconnection` at every simulated monitor held **from another node** on a
+   process about to die.
+2. Retire every monitor with either end on the node.
+3. Cancel what was in flight to or from it, as a failing node loses the wire.
+4. Kill.
+5. Signal the survivors.
+
+Step 1 must precede step 4 for two independent reasons, and only the first is
+obvious. The obvious one is the asymmetry: once the process dies, every monitor it
+has yields `killed`, so the remote ones must already be gone. The second is a
+race — the exit signal is posted asynchronously and the scheduler may report it at
+any moment, so a monitor still on the books when the kill lands can fire with the
+real reason before the driver reaches step 5.
+
+**The kill also has to be waited for.** `erlang:exit/2` posts a signal; the process
+dies some moment later, chosen by the BEAM. `eta_sched:runnable/1` asks
+`is_process_alive/1`, so returning before the answer settled would make the
+scheduler's next choice depend on how fast a corpse was reaped — one step decided
+by wall clock, and a seed that stops reproducing its own schedule. `kill_node/2`
+monitors each victim and waits.
+
+A killed node's *name* survives and its processes do not, so re-placing on the same
+name is how a restart is expressed. Cuts and retired monitors do not reset, for the
+same reason `heal_partition/3` resurrects nothing: an event says what just
+happened, it does not undo what happened before.
+
+#### Determinism, and a test that did not have the power to prove it
+
+Every message this introduces is part of the schedule, so all of it obeys the
+rules the fault schedule already did: delivered synchronously by the driver
+between steps, never on wall-clock timing, and **never drawing from the fault
+RNG** — adding a signal must not shift which messages get dropped, for the same
+reason out-of-scope traffic does not.
+
+The subtler hazard is fan-out order. `endpoints/1` built its list through
+`ets:match/2`, whose row order is guaranteed by nothing, and a fan-out delivered
+in table order puts a different sequence of messages in different mailboxes from
+run to run. Placements and monitors now carry a monotonic sequence number stamped
+when they are created, and every fan-out sorts by it — so the order comes from
+something the run itself decided: the order the harness placed them in, and for
+children the order they were spawned in.
+
+**The honest part.** The run-level determinism test — ten runs of one seed through
+`eta_run`, with partitions, kills and monitors as generated operations — **does not
+catch an unsorted fan-out.** Removing both sorts leaves it green, because with six
+processes and identical insertion sequences the table happens to hand rows back in
+insertion order. Two direct tests were written for the property instead, asserting
+that signals fan out in placement order and synthetic DOWNs in monitor order; both
+fail with the sorts removed. The general point is one this document keeps
+rediscovering: an integration test that would catch a bug *if the bug bit* is not
+evidence that it would bite, and the cheap move is to break the code and watch the
+test go red before believing it.
+
+Measured, seed 4, a thirty-operation run over three nodes of two processes each:
+
+| | |
+|---|---|
+| link signals delivered | 28 |
+| synthetic `noconnection` DOWNs | 10 |
+| messages dropped / delayed | 7 / 7 |
+| processes killed with their node | 4 of 6 |
+| stray timers, late adoptions, step timeouts | 0 |
+| distinct traces in 10 runs of the seed | 1 |
+
+The invariant driving that run is the asymmetry itself: no process on another
+simulated node may ever record a DOWN whose reason is not `noconnection`. In one
+VM a killed process yields `killed` to every monitor it has, so the property only
+holds because step 1 above happens before step 4 — which makes it a test of the
+ordering rather than a restatement of it.
+
+#### What it deliberately is not
+
+`eta_net` does not emulate `net_kernel`, and this is worth stating loudly because
+the next reader will assume otherwise. A simulated node is a name in a table.
+`nodes()` will not list one, `net_kernel:monitor_nodes/1` will not report one,
+`connect_node/1` will not reach one, and `node(Pid)` still answers with the real
+node. What is delivered is the *events* a link or node failure produces, and
+nothing else — a system under test receives its `nodedown` because a harness sent
+it, not because distribution did.
+
+That leaves a real obligation on the system under test rather than on the
+framework: a connector-shaped process that subscribes through `net_kernel` needs a
+seam the harness can drive instead. There is no way around it short of emulating
+distribution, which is the thing `eta` has declined to do since the first page.
+
 ## Effort
 
 | Phase | Estimate | Cumulative |
@@ -1241,6 +1500,26 @@ The version to avoid is the middle one: per-run tables behind a single global
 
 ## Open questions
 
+- **A step can end early, and it is not accounted for anywhere.** Found while
+  building `eta_net`'s determinism test against a deliberately crude system under
+  test: a process draining a preloaded mailbox in a tight catch-all `receive` was
+  observed consuming **one** of six queued messages and being recorded as blocked
+  at a queue length of five. `blocked_at` then holds it out of `runnable_ids/1`
+  until the queue grows past that mark, so with message loss in play the process
+  can be stranded and the schedule diverges; a perfect network hides it, because
+  every arrival pushes the queue past the stale mark and self-corrects. Measured:
+  40 runs of one seed identical with `drop_p = 0.0`, two distinct schedules in ten
+  with any loss at all, diverging from the third choice. `timeouts` stays 0
+  throughout, so none of the existing determinism instrumentation reports it — the
+  scheduler believes the step completed normally.
+
+  It does not appear to reach the `gen_server`-shaped systems in the suite, whose
+  operations arrive one at a time, which is why the determinism test was moved onto
+  `eta_run` and a real system under test rather than the crude one. Unfixed and
+  unexplained: the suspicion is `await_block/3` reading `waiting` at an `out` event
+  in a window where the process has not fetched its signal queue, but that has not
+  been confirmed and the cheap confirmation is not obvious. It belongs with the
+  determinism boundary in `eta_sched`'s moduledoc once it is understood.
 - Does Concuerror's DPOR subsume enough of phases 0 and 4 to change the plan?
 - How much of OTP genuinely needs the transform? Possibly just `gen_server` and
   `gen_statem`; worth measuring before committing to Phase 5's estimate.
