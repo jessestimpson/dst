@@ -8,16 +8,17 @@ A simulated network: seeded message loss, delay and partitions between processes
 in one VM.
 
 `eta_sched` decides *who runs* and `eta_time` decides *when*. Neither decides
-whether a message arrives — so a client that sends to three peers reaches all
-three inside one scheduler step, and a partially delivered broadcast is not a
-state the schedule can produce. This module is the missing third: it owns
-delivery, and can drop, delay or cut it.
+whether a message arrives, so a client that sends to three peers reaches all
+three inside one scheduler step. This module owns delivery, and can drop, delay
+or cut it.
 
-## The seam is a function
+Inert unless a network is running: every function here delegates to its ordinary
+counterpart, so a module built with `eta_transform` behaves normally outside a
+simulation.
 
-Everything here hangs off `send/2`, which is an ordinary exported function that
-**delegates straight to `erlang:send/2` unless a network is running**. A system
-reaches it three ways, and they are the same seam:
+## Reaching it
+
+`send/2` is an ordinary exported function, and there are three ways to call it:
 
 ```erlang
 Peer ! {replicate, Batch}.                     %% eta_transform rewrites this
@@ -26,87 +27,40 @@ myapp_link:send(Peer, {replicate, Batch}).     %% or from your own transport mod
 ```
 
 Use the transform unless your system already has a transport module, in which
-case call this from it and skip the header entirely.
+case call this from it and skip the header.
 
-## The fault model is deliberately narrow
+**Routing must be uniform per channel.** If some sends between two processes come
+through here and others go direct, a direct message can overtake a delayed one —
+reordering within an ordered pair, introduced by the harness and blamed on the
+system. The transform is module-granular so a peer-facing module is either in or
+out; a hand-written seam is call-site granular, and one `Pid ! ack` left unwrapped
+in an error branch is enough to break it.
 
-Only faults **real Erlang can produce**. Distribution guarantees that messages
-delivered between one ordered pair of processes arrive in send order, and does
-not guarantee delivery at all. So, per ordered `{From, To}` pair, this module may
+## The fault model
 
-- **deliver** the message (the default),
-- **drop** it — a signal lost to a failing link,
-- **delay** it — arrived later, still in order,
-- **cut** the channel, dropping everything until healed.
+Only faults real Erlang can produce. Distribution guarantees that messages between
+one ordered pair arrive in send order, and does not guarantee delivery at all. So
+per ordered pair this module may **deliver**, **drop**, **delay**, or **cut** the
+channel until healed. It never reorders within a pair; injecting that would
+manufacture counterexamples the real system cannot produce.
 
-It never reorders two messages on the same ordered pair, because distribution
-never does. Injecting that would manufacture counterexamples the real system
-cannot produce, and every "bug" found would be a false positive. Messages on
-*different* pairs are already unordered with respect to each other.
+A perfect policy is exactly the behaviour of no network at all, which is what
+makes `drop_p => 0.0` usable as a control run.
 
-**Loss comes with a signal.** A real link failure is never just lost messages —
-it delivers `nodedown`/`nodeup` to both ends, and systems hang their recovery off
-those. `partition/3` and `heal_partition/3` take a `signal` for exactly this;
-dropping messages without it injects something no network produces, and the
-unrecovered state you then report is not a defect. See `partition/3`.
-
-## Delay is virtual, and there is no network process
-
-The decision is made **at send time**, inside the
-sending process's own step, and a delayed message is handed to `eta_time` — so
-the delivery is an ordinary deadline in the timer wheel the driver already
-drains, at a virtual time, costing nothing to wait for. `eta_time`'s
-schedulability filter looks at a timer's *destination*, so a delivery belongs to
-its receiver: a sender that exits mid-flight does not turn its message into a
-stray timer.
-
-Two consequences worth stating:
-
-- **In-flight messages are pending deadlines**, so "nothing runnable" is not
-  quiescence while one is outstanding, and `eta_run` needs no changes to know
-  that — `idle/1` advances to the delivery and the existing `{clock, Ms}` trace
-  entry records it. Replay works unmodified.
-
-- **The fault schedule cannot drift.** The RNG is consumed once per in-scope
-  send, and every send happens inside a scheduler step whose order is already a
-  function of the seed.
-
-## Message Ordering
-
-Each channel records the virtual time of its last scheduled delivery, and a new
-one lands at `max(Now + Delay, Last + 1)`. Per-pair order is preserved by
-construction across delivered and delayed messages alike, with nothing to
-release and nothing to drain.
-
-This is also why a message is delivered *directly* when it draws no delay and the
-channel has nothing outstanding: a perfect network is exactly the behaviour of no
-network at all, which keeps `drop_p => 0.0` usable as a control run.
+**Loss comes with a signal.** A real link failure delivers `nodedown`/`nodeup` to
+both ends and systems hang recovery off those, so `partition/3` and
+`heal_partition/3` take one. Dropping messages without it injects something no
+network produces. See `partition/3`.
 
 ## Where the network is
 
-By default every link is faultable, which is fine for a two-process test and
-wrong for anything with structure: a system's real fault model is not "any
-message may be lost" but "any message *that crosses a link* may be lost".
-`place/2` says which processes are on which simulated node, and faults then apply
-only to sends whose ends are on different ones.
+`place/2` assigns processes to simulated nodes, and faults then apply only to
+sends whose ends are on different ones. Prefer it to `scope`: topology says where
+the wire is, `scope` says which traffic on it a run is entitled to break. With no
+topology declared, every link is faultable.
 
-Prefer it to `scope` for that job. `scope` narrows by message *kind*, which is
-about what a run is entitled to assert (see `set_policy/1`); topology narrows by
-*where the wire is*, which is a fact about the system. Describing the second with
-a predicate is how a harness ends up faulting a reply to a client, or a
-component that coordinates through a database — both of which produce
-plausible-looking violations of real safety properties.
-
-## Routing has to be uniform per channel
-
-If some sends on `{A, B}` come through here and others go direct, a later direct
-message can overtake an earlier delayed one — reordering within an ordered pair,
-reintroduced by the harness, and attributed to the system under test.
-
-A transform is *module* granular, so a peer-facing module is either in or out. A
-hand-placed seam is *call-site* granular, which is where a half-routed channel
-comes from: one `Pid ! ack` left unwrapped in an error branch is enough. A system
-that writes its own calls owns this rule.
+Delay is virtual — a delayed message becomes a deadline in `eta_time`'s wheel — so
+waiting one out costs no real time.
 """.
 -endif.
 
@@ -205,11 +159,11 @@ Options:
 
 - `seed` — seeds the fault schedule, so a run replays.
 - `policy` — see `set_policy/1`. Defaults to a perfect network, which is what a
-  control run wants and what a cluster needs while it is still starting up.
+  cluster needs while it is still starting up.
 
-One network per VM, the same rule (and for the same reason) as `eta_time` and
-`eta_log`: the state is in named tables, so runs must be serial. Starting over a
-running network resets it; starting over one another live process owns raises.
+One network per VM, as with `eta_time` and `eta_log`, so runs must be serial.
+Starting over a running network resets it; starting over one another live process
+owns raises.
 """.
 -endif.
 -spec start(#{seed => integer(), policy => policy()}) -> ok.
@@ -228,9 +182,9 @@ start(Opts) ->
     ]),
     ok.
 
-%% See `eta_time`'s equivalent: the existence of a named table is the lock,
-%% because the VM destroys it when its owner exits. `stop/0` is deliberately not
-%% guarded, so an `on_exit` running in another process still cleans up.
+%% The existence of the named table is the lock: the VM destroys it when its owner
+%% exits. `stop/0` is deliberately unguarded, so an `on_exit` running in another
+%% process still cleans up.
 claim() ->
     case ets:info(?STATE, owner) of
         undefined ->
@@ -251,8 +205,8 @@ claim() ->
 -doc """
 Stops the network. Safe to call when none is running.
 
-Messages already in flight stay in `eta_time`'s wheel and are delivered by
-whatever advances the clock next — they are ordinary timers by that point.
+Messages already in flight are ordinary `eta_time` timers by then, and are still
+delivered by whatever advances the clock next.
 """.
 -endif.
 -spec stop() -> ok.
@@ -284,14 +238,11 @@ running() ->
 -doc """
 Sends a message, subject to the network.
 
-Returns `Msg`, so this is a drop-in for both `Dest ! Msg` and `erlang:send/2` —
-which is what lets `eta_transform` rewrite the operator without changing the
-value of the expression.
+Returns `Msg`, so it is a drop-in for both `Dest ! Msg` and `erlang:send/2`.
 
-A destination that is neither a pid nor a registered name — `{Name, Node}`,
-`{global, _}`, `{via, _, _}` — is passed through untouched. `eta` does not
-simulate distribution, and a name resolved by another registry is not a channel
-this module can identify.
+A destination this module cannot identify as a local process — `{global, _}`,
+`{via, _, _}`, a remote node — is passed through untouched. `eta` does not
+simulate distribution.
 """.
 -endif.
 -spec send(dest() | term(), term()) -> term().
@@ -303,9 +254,8 @@ send(Dest, Msg) ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:send/3`. The options are for distribution (`nosuspend`, `noconnect`) and
-have no meaning between two processes in one VM, so under a running network they
-are ignored and the send is routed; otherwise it is passed through.
+`erlang:send/3`. The options are for distribution and have no meaning between two
+processes in one VM, so a routed send ignores them.
 """.
 -endif.
 -spec send(dest() | term(), term(), list()) -> ok | nosuspend | noconnect.
@@ -320,23 +270,15 @@ send(Dest, Msg, Opts) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_server:cast/2`, routed. Casts are the natural faultable channel — they are
-asynchronous already, so a dropped one is a fault the sender's own code has to
-tolerate rather than a hang.
-
-Like `gen_server:cast/2` this never raises, including for a name nobody has
-registered.
+`gen_server:cast/2`, routed. Never raises, including for an unregistered name.
 """.
 -endif.
 -spec cast(dest() | term(), term()) -> ok.
 cast(Dest, Msg) ->
     case running() andalso normalize(Dest) of
         To when is_pid(To) ->
-            %% Tagged by the payload, not by the envelope. `{'$gen_cast', _}` is
-            %% OTP's wrapper and every cast in the system carries it, so scoping a
-            %% policy on it would select all of them or none — which makes the
-            %% `{tags, _}` form useless for exactly the traffic it is most wanted
-            %% for. What a run means by "the replication stream" is the payload.
+            %% Tagged by the payload rather than by OTP's `'$gen_cast'` envelope,
+            %% which every cast carries and so would select all of them or none.
             catch route(self(), To, {'$gen_cast', Msg}, tag(Msg)),
             ok;
         _ ->
@@ -347,48 +289,28 @@ cast(Dest, Msg) ->
 -doc """
 `gen_server:call/2,3`, with **both legs on the network**.
 
-A call is the one exchange OTP does not let a transform reach all of. The request
-is an ordinary send, but the reply is produced by `gen:reply` from inside
-`gen_server`, and all three of its clauses end in a raw send from the server
-process — so no `From` this module constructs can make it routable.
+The request is an ordinary send this module routes. The reply cannot be reached
+from here — `gen:reply` sends it from inside `gen_server` — so `eta_transform`
+brings it on from the other end, rewriting a `gen_server` module's
+`handle_call/3` returns so `{reply, R, S}` becomes `eta_net:reply(From, R)` plus
+`{noreply, S}`.
 
-Routing only the request would be worse than routing nothing. A request that goes
-through here is subject to the ordering clamp; a reply that goes around is not, so
-it can be delivered ahead of a message sent before it. That is reordering within
-an ordered pair — the one fault distribution never produces, and the one thing
-this module must never manufacture.
+Both legs can therefore be dropped or delayed independently, which is what makes
+the asymmetric fault reachable: the work happened, the caller never learned it
+did.
 
-So the reply is brought onto the network from the other end. `eta_transform`
-rewrites a `gen_server` module's `handle_call/3` returns: `{reply, R, S}` becomes
-`eta_net:reply(From, R)` followed by `{noreply, S}`. Both legs are then ordinary
-routed messages, both can be dropped or delayed independently, and the asymmetric
-fault that actually bites — the work happened, the caller never learned it did —
-becomes reachable.
+Monitors the callee and takes a timeout, as `gen_server:call/3` does, with two
+differences:
 
-## What this implementation has to reproduce
+- **The timeout is virtual**, so waiting one out on a dropped request costs no
+  real time and fires where the schedule chose.
+- **The monitor is not routed**, and cannot be: `DOWN` is a signal, not a
+  message, so a partition does not suppress it. Model peer failure as a crash and
+  network failure as a cut; they are different faults.
 
-`gen_server:call/3` is not just a send and a receive. It monitors the callee, so
-a dead server is an exit rather than a hang; it takes a timeout; and it cleans up
-after itself. All of that is here, with two differences that matter:
-
-- **The timeout is virtual.** It is armed through `eta_time:arm_after/2`, the
-  same mechanism `eta_transform` gives a rewritten `receive ... after`. A call
-  that waits out a five-second timeout on a dropped request costs no real time,
-  and — more importantly — fires at a point the schedule chose.
-
-- **The monitor is not routed, and cannot be.** Exits and `DOWN`s are signals
-  rather than messages, so a partition does not suppress them. In one VM the
-  peer really is alive, so this is mostly right; a system whose failure detection
-  is monitor-based will not see the failure the network is injecting. Model peer
-  failure as a crash and network failure as a cut, and know they are different.
-
-## Calling something that was not transformed
-
-Then its reply is still unrouted, and no static check can see that from here. It
-is caught after the fact instead: a call registers its tag, `reply/2` clears it,
-and a reply that arrives with the tag still outstanding came around the network.
-That raises, naming the callee, because a channel the run believes it is faulting
-and is not is exactly the silent gap this module exists to close.
+**Raises `unrouted_reply` if the callee was not built with the transform**, since
+its reply then comes around the network and one direction of the channel is
+silently unfaultable.
 """.
 -endif.
 -spec call(dest() | term(), term()) -> term().
@@ -405,8 +327,8 @@ call(Dest, Req, Timeout) ->
 do_call(To, Dest, Req, Timeout) ->
     Tag = make_ref(),
     Mon = erlang:monitor(process, To),
-    %% Registered before the request goes out, so that a reply cannot beat the
-    %% registration and be mistaken for an unrouted one.
+    %% Before the request goes out, so a reply cannot beat the registration and be
+    %% mistaken for an unrouted one.
     true = ets:insert(?CALLS, {Tag, outstanding}),
     _ = route(self(), To, {'$gen_call', {self(), Tag}, Req}, tag(Req)),
     AfterRef = make_ref(),
@@ -427,12 +349,8 @@ do_call(To, Dest, Req, Timeout) ->
             exit({timeout, {eta_net, call, [Dest, Req, Timeout]}})
     end.
 
-%% Did the reply come through the network, or around it?
-%%
-%% `reply/2` takes the tag out on its way past, so a tag still here when the
-%% reply lands means the callee answered by a path this module never saw — it was
-%% not built with the transform. The call worked; what did not work is the fault
-%% model, which is quietly missing one direction of this channel.
+%% `reply/2` takes the tag out on its way past, so a tag still here when the reply
+%% lands means the callee answered by a path this module never saw.
 check_routed(Tag, To, Req) ->
     case ets:take(?CALLS, Tag) of
         [] ->
@@ -441,43 +359,34 @@ check_routed(Tag, To, Req) ->
             error(
                 {eta_net,
                     {unrouted_reply, To, tag(Req), <<
-                        "this call was answered by a process eta_transform never "
-                        "reached, so the reply came around the network: it cannot be "
-                        "dropped or delayed, and it is not subject to the ordering "
-                        "clamp the request went through. Build the callee with the "
-                        "transform, or keep the call off the simulated network by "
-                        "placing both ends on one node"
+                        "the callee was not built with eta_transform, so its reply "
+                        "came around the network and cannot be faulted. Build it with "
+                        "the transform, or place both ends on one node"
                     >>}}
             )
     end.
 
 -if(?DOCATTRS).
 -doc """
-`gen_server:reply/2`, routed — so a *reply* can be lost independently of the
-request that caused it, which is the asymmetric fault that actually bites: the
-work happened, the caller never learned it did, and it retries.
+`gen_server:reply/2`, routed — so a reply can be lost independently of the request
+that caused it.
 
-The reply is addressed to the caller's pid, `element(1, From)`, rather than to
-the alias in the tag. Both land in the same mailbox and the caller's selective
-receive matches on the tag either way, so this is the same delivery by a route
-this module can identify. Note that OTP deactivates the alias once a reply
-arrives through it: a reply sent here is *more* likely to be received than one
-sent through a stale alias, never less.
+Addressed to the caller's pid rather than to the alias in the tag. Both land in
+the same mailbox and the caller's selective receive matches on the tag either
+way.
 
-The **request** leg of a `gen_server:call/3` is not routed — `gen:call` sends
-from inside OTP, where no transform reaches. See the plan's "What cannot be
-intercepted".
+`eta_transform` also rewrites `handle_call/3` returns to call this, which is how
+the reply leg of `call/3` gets onto the network.
 """.
 -endif.
 -spec reply(term(), term()) -> ok.
 reply(From = {To, Tag}, Reply) when is_pid(To) ->
     case running() of
         true ->
-            %% A reply's leading element is the caller's tag — a reference, unique
-            %% per call — so it names nothing a policy or a log could use. Every
-            %% reply is tagged `'$gen_reply'` instead, which is a channel a run can
-            %% actually talk about: "lose the answer, keep the work".
-            %% Marks the call as answered through the network. See `call/3`.
+            %% Tagged `'$gen_reply'` rather than by the caller's tag, which is a
+            %% fresh reference per call and so names nothing a policy could scope
+            %% on. Deleting marks the call answered through the network — `call/3`
+            %% uses the absence to detect a reply that came around it.
             true = ets:delete(?CALLS, Tag),
             _ = route(self(), To, {Tag, Reply}, '$gen_reply'),
             ok;
@@ -490,23 +399,16 @@ reply(From, Reply) ->
 -if(?DOCATTRS).
 -doc """
 What `eta_transform` points the messaging functions this module does not
-implement at. Raises while a network is running; calls the original otherwise.
+implement at: broadcasts and multi-node calls, the asynchronous
+request/response interface, and the `gen_statem` and `gen_event` client APIs.
+The list is `?NET_UNSUPPORTED` in `eta_transform`.
 
-The list lives in `eta_transform` (`?NET_UNSUPPORTED`) and covers the parts of
-`gen_server`, `gen_statem` and `gen_event` whose traffic cannot yet be put on the
-network: broadcasts and multi-node calls, the asynchronous request/response
-interface, and everything belonging to a behaviour whose replies come from inside
-OTP.
+Raises while a network is running, and calls the original otherwise — so a module
+holding one on a path no simulation reaches still builds and behaves normally.
 
-**Raising is the feature.** The alternative is letting the call through, which
-means a run states a fault model — "this link drops one message in five" — and
-the model silently does not cover a channel. That gap is invisible: the suite
-stays green and the seeds mean less than they claim. An error names the exact
-function and stops the run, so what is supported and what is not is discoverable
-by using it rather than by reading a table.
-
-Inert without a network, so a module holding one of these on a path no simulation
-reaches still builds and still runs normally outside a run.
+Raising rather than passing through is deliberate: a run states a fault model,
+and a channel the model silently fails to cover makes the suite green for the
+wrong reason.
 """.
 -endif.
 -spec unsupported({module(), atom(), arity()}, [term()]) -> term().
@@ -526,24 +428,17 @@ unsupported({M, F, _A} = MFA, Args) ->
             )
     end.
 
-%% A channel is a pair of **pids**, and every way of addressing a local process
-%% normalizes to one.
+%% A channel is a pair of pids, and every way of addressing a local process
+%% normalizes to one. Required for correctness rather than convenience: a system
+%% that sometimes sends to `Peer` and sometimes to `{peer, node()}` would
+%% otherwise open two channels to one process, each with its own ordering clamp.
 %%
-%% This is a correctness requirement, not ergonomics. A system that sometimes
-%% sends to `Peer` and sometimes to `{peer, node()}` — which is what
-%% `gen_server:cast/2` to a named member looks like — would otherwise open two
-%% channels to one process, each with its own ordering clamp, and a message on one
-%% could overtake a message on the other. Same target, same channel, however it
-%% was addressed.
+%% A name resolves **at send time**, unlike `erlang:send/2` which resolves on
+%% delivery. Only observable if the name is re-registered while a message to it is
+%% in flight.
 %%
-%% A name is resolved **at send time**, so a delayed message is committed to the
-%% process that held the name when it was sent. That is a real difference from
-%% `erlang:send/2`, which resolves on delivery, and it only shows up if the name
-%% is re-registered to a different process while a message to it is in flight.
-%%
-%% `undefined` — an unregistered name, a remote node, a `{global, _}` or
-%% `{via, _, _}` — means "not a channel this module can identify", and the caller
-%% falls back to sending directly. `eta` does not simulate distribution.
+%% `undefined` means "not a local process this module can identify", and the
+%% caller falls back to sending directly.
 normalize(Pid) when is_pid(Pid) -> Pid;
 normalize(Name) when is_atom(Name) -> erlang:whereis(Name);
 normalize({Name, Node}) when is_atom(Name), Node =:= node() -> erlang:whereis(Name);
@@ -568,19 +463,16 @@ Sets the random fault policy. Anything omitted keeps its current value.
 A message's **tag** is its leading element, except that `cast/2` and `reply/2`
 name the payload rather than OTP's envelope: a cast of `{prepare, TxId}` is
 tagged `prepare`, not `'$gen_cast'`, and every reply is tagged `'$gen_reply'`.
-Tagging casts by the envelope would make `{tags, _}` select every cast in the
-system or none of them, which is useless for the traffic it is most wanted for.
 
-**Scope is not a tuning knob.** It is how a run states which recovery paths it is
-entitled to exercise. Loss on a request channel is recovered in production by the
-node event a reconnect delivers, so a run that drops those without also
-delivering the event is injecting a fault real distribution cannot produce. A run
-that asserts a property *during* a fault — with no heal to pay that debt at — has
-to restrict the loss to a channel whose recovery is self-contained, such as a
-replication stream a follower repairs from a version discontinuity.
+**Scope states which recovery paths a run is entitled to exercise**, rather than
+tuning how hard it tries. Loss on a channel whose recovery depends on a node
+event cannot be asserted against mid-run, because nothing delivers that event
+until the heal; a run that checks a property *during* a fault has to restrict
+loss to a channel that repairs itself, such as a replication stream a follower
+rejoins from a version discontinuity.
 
-An out-of-scope message is delivered **without drawing from the RNG**. A message
-the policy cannot affect must not shift the fault schedule for the ones it can.
+An out-of-scope message draws nothing from the RNG, so narrowing the scope does
+not shift the fault schedule for the traffic still inside it.
 """.
 -endif.
 -spec set_policy(policy()) -> ok.
@@ -599,51 +491,28 @@ policy() ->
 
 -if(?DOCATTRS).
 -doc """
-Puts processes on a simulated node.
+Puts processes on a simulated node — how a system says where its network is.
 
-This is how a system says **where its network is**, and it is worth preferring
-over `scope` for that job. Faults apply to a send only when both ends are placed
-and their nodes differ — so the fault model becomes a fact about the topology
-rather than a predicate a harness has to write correctly.
+Faults apply to a send only when both ends are placed and their nodes differ, so
+the fault model follows the topology rather than a predicate the harness has to
+keep correct.
 
 ```erlang
 eta_net:place(node_a, [MemberA]),
-eta_net:place(node_b, [MemberB]),
-eta_net:place(node_c, [MemberC]).
+eta_net:place(node_b, [MemberB]).
 ```
 
-That distinction is not cosmetic. The harness this module replaced faulted
-exactly the right set *by accident*, because its hook sat on the one function
-that inter-member traffic went through — the seam's location was the fault model.
-Re-describing that as a predicate got it wrong twice on a codebase whose fault
-model was already written down, both times producing a plausible-looking
-violation of a real safety property. A topology cannot make that mistake, because
-"crosses a link" is the same statement in the simulation as in production.
+**Unplaced means not on the network**: never faulted, in either direction. That
+is the safe default and also a useful thing to say deliberately — a component
+that really coordinates through a database is only *modelled* by messages here,
+and dropping them injects a failure the real system cannot have. It also keeps a
+network inert for processes it does not know about, such as leftovers from an
+earlier test in the same VM.
 
-## Unplaced means "not on the network"
+If nothing at all is placed, every link is faultable, so `place/2` is opt-in.
 
-A process nobody placed is never faulted, in either direction. That is the safe
-default, and it is also a useful thing to say deliberately: a component that
-coordinates through a database rather than by message passing is *modelled* by
-messages in a single-VM simulation, and those messages should not be dropped
-because the real ones do not exist. `dgen` places its registry members and leaves
-their electors unplaced for exactly this reason — the elector's peer traffic
-stands in for durable queue operations.
-
-It also means a network is inert for anything it does not know about, including
-processes left over from an earlier test in the same VM.
-
-**If nothing at all is placed, every link is faultable.** A network with no
-topology behaves as it did before there was one, so `place/2` is opt-in.
-
-## Children inherit
-
-A process spawned by a placed process is placed on the same node, at the moment
-`eta_sched` adopts it. Without that, a topology would be as stale as whatever
-last declared it — a transaction worker or a collector spawned mid-run would send
-across a link nobody had told the network about, and the fault would silently not
-happen. Inheritance is what makes this a description of the system rather than a
-snapshot of it.
+**Children inherit** their parent's node as `eta_sched` adopts them, so a worker
+spawned mid-run does not send across a link the network was never told about.
 """.
 -endif.
 -spec place(term(), [dest()]) -> ok.
@@ -683,8 +552,7 @@ inherit(Parent, Child) ->
     end.
 
 %% Whether a send crosses a simulated link, and so is something the policy may
-%% fault. No topology at all means every link is faultable, which is what a
-%% network that predates `place/2` expects.
+%% fault. No topology at all means every link is faultable.
 crosses_link(From, Dest) ->
     case ets:info(?PLACE, size) of
         0 ->
@@ -699,11 +567,8 @@ crosses_link(From, Dest) ->
     end.
 
 %% A reference to cut or partition: a node if it names one, otherwise a process.
-%%
-%% Only an atom is ambiguous, and only if a node has been given the same name as a
-%% registered process. Nodes win, because `partition(node_a, node_b)` is the
-%% overwhelmingly common thing to mean; a pid is never ambiguous, so a caller who
-%% hits the collision can pass one.
+%% Only an atom is ambiguous — a node named the same as a registered process — and
+%% nodes win; pass a pid to disambiguate.
 resolve(Ref) when is_atom(Ref) ->
     case ets:member(?PLACE, {node, Ref}) of
         true -> {node, Ref};
@@ -719,16 +584,8 @@ on_node(Node) ->
 merge_policy(Policy) ->
     maps:merge(?DEFAULT_POLICY, maps:with(maps:keys(?DEFAULT_POLICY), Policy)).
 
-%% Everything that configures or inspects a network needs one to exist, and the
-%% failure without this reads as an ETS `badarg` from somewhere in the middle of
-%% this module — which says nothing about the actual mistake, and the actual
-%% mistake is a specific and recurring one: a run whose options do not ask for a
-%% network, driving a harness that assumes one. A replayed fixture saved before
-%% the `net` option existed is exactly that.
-%%
-%% `send/2` and friends are deliberately *not* guarded. Their contract is to be
-%% inert without a network, which is what lets a transformed module behave
-%% normally outside a simulation.
+%% Configuring or inspecting a network needs one to exist. `send/2` and friends
+%% are deliberately *not* guarded: their contract is to be inert without one.
 require_running(What) ->
     case running() of
         true ->
@@ -752,9 +609,8 @@ require_running(What) ->
 -doc """
 Drops everything sent from `From` to `To` until `heal/2`. One direction.
 
-Messages already in flight on that channel are cancelled, because a link that
-goes down loses what was on it. They are counted as both `dropped` and
-`cancelled`.
+Messages already in flight on that channel are cancelled, as a failing link loses
+what was on it, and counted as both `dropped` and `cancelled`.
 """.
 -endif.
 -spec cut(dest(), dest()) -> ok.
@@ -807,24 +663,19 @@ Cuts both directions, optionally delivering a link-down signal to both ends.
 eta_net:partition(A, B, #{signal => {nodedown, node()}})
 ```
 
-**Prefer the signalling form.** Dropping messages models a failing link, and a
-real link failure is never only lost messages: it delivers `nodedown`/`nodeup` to
-both ends, and systems deliberately hang recovery off those. A harness that drops
-without signalling has injected something no network produces — messages
-vanishing while both ends still believe the link is up — and the unrecovered
-state it then reports is an artefact, not a defect. The Elixir original learned
-this from a follower that had optimistically deleted a row whose request was
-dropped and never recovered; it looked exactly like a product bug and was not
-one.
+**Prefer the signalling form.** A real link failure is never only lost messages:
+it delivers `nodedown`/`nodeup` to both ends and systems hang recovery off those.
+Dropping without signalling injects something no network produces — messages
+vanishing while both ends still believe the link is up — and the unrecovered state
+that follows is an artefact rather than a defect.
 
-The trap on the other side is real too: recovery driven by the signal may repair
-the very divergence under test. A run asserting a property *during* a fault
-therefore restricts loss by `scope` instead. Both options are wrong in some
-situation, which is why neither is the default and why this argument is
-mandatory-looking.
+The opposite trap is real too: recovery driven by the signal may repair the very
+divergence under test, so a run asserting a property *during* a fault restricts
+loss by `scope` instead. Neither is right in every situation, which is why there
+is no default.
 
-The signal is delivered directly, not routed — it is the link event itself, so a
-cut channel must not swallow it.
+The signal is delivered directly rather than routed, so a cut channel cannot
+swallow it, and reaches every process on both nodes.
 """.
 -endif.
 -spec partition(dest(), dest(), #{signal => term()}) -> ok.
@@ -852,10 +703,8 @@ heal_partition(A, B, Opts) ->
     ok = heal(B, A),
     signal(Opts, endpoints(A) ++ endpoints(B)).
 
-%% Who a link signal reaches. Partitioning two nodes has to tell **everything on
-%% them**, not two representative processes: a system hangs its recovery off that
-%% event, and a member that never saw it is a member the harness has quietly
-%% excluded from recovering.
+%% Who a link signal reaches: everything on the node, not a representative — a
+%% process that never saw the event is one the harness excluded from recovering.
 endpoints(Ref) ->
     case resolve(Ref) of
         {node, Node} -> on_node(Node);
@@ -870,11 +719,8 @@ signal(_, _) ->
 
 -if(?DOCATTRS).
 -doc """
-Drops exactly the next `K` messages from `From` to `To`, then resumes.
-
-Precise where a probability is not: "lose the reply to this one operation" is a
-question a `drop_p` cannot ask, and the answer is usually a shorter
-counterexample.
+Drops exactly the next `K` messages from `From` to `To`, then resumes. Asks what a
+probability cannot: "lose the reply to this one operation".
 """.
 -endif.
 -spec drop_next(dest(), dest(), non_neg_integer()) -> ok.
@@ -888,16 +734,13 @@ drop_next(From0, To0, K) ->
 On the `From -> To` channel, lets the next `Skip` messages tagged `Tag` through,
 then drops the following `K` of them. Other traffic is untouched.
 
-Precise in a way neither `cut/2` nor `drop_next/3` can be, because it counts
-*within one kind of message*. Severing a channel part-way through a single group
-commit is the example that motivated it: a batch interleaves on the wire with
-acks and replies, so "drop messages 2..4 of this batch" cannot be said as a raw
-message count. Dropping a strict subset of one batch is a materially different
-fault from dropping a whole channel — it can leave no version discontinuity for
-gap detection to notice, which is exactly the shape of defect worth hunting.
+Counts *within one kind of message*, which a raw message count cannot: a batch
+interleaves on the wire with acks and replies, so "drop messages 2..4 of this
+batch" is only expressible by tag. Losing a strict subset of one batch is a
+materially different fault from losing a whole channel — it can leave no
+discontinuity for the receiver to detect.
 
-See `set_policy/1` for what a tag is; for a cast it is the payload's leading
-element, not `'$gen_cast'`.
+See `set_policy/1` for what a tag is.
 """.
 -endif.
 -spec drop_matching(dest(), dest(), term(), non_neg_integer(), non_neg_integer()) -> ok.
@@ -979,37 +822,26 @@ route(From, Dest, Msg) ->
 %% What this send is, as far as the schedule is concerned.
 %%
 %% - `scheduled` — routed, faulted, and allowed to draw from the fault schedule.
-%% - `escaped` — a send the schedule did not order, into a process it controls.
-%%   Delivered untouched, drawn for nothing, and **counted**: nothing else in a
-%%   run reports it, and it is enough on its own to make a trace diverge.
-%% - `foreign` — neither end belongs to the run. Delivered untouched and not
-%%   counted.
+%% - `escaped` — the schedule did not order it, but it targets a process the
+%%   scheduler owns. Delivered untouched, draws nothing, and **counted**: it is
+%%   enough on its own to make a trace diverge, and nothing else reports it.
+%% - `foreign` — neither end belongs to the run. Delivered untouched, draws
+%%   nothing, not counted.
 %%
-%% The first test is exact rather than approximate: during a step one process runs
-%% and every other one the scheduler owns is suspended, so a send from anything
-%% else happened at a moment wall-clock timing chose. Asking "is the sender
-%% registered with the scheduler" instead is both weaker and wrong — weaker
-%% because a process can be owned and still be running loose, wrong because the
-%% answer lags whatever the scheduler last adopted.
+%% During a step one process runs and every other one the scheduler owns is
+%% suspended, so a send from anything else happened at a moment wall-clock timing
+%% chose. That is exact, where asking "is the sender registered with the
+%% scheduler" would be both weaker (a process can be owned and still running
+%% loose) and stale.
 %%
-%% The `foreign` case is not a softening of that, it is the same rule applied to
-%% the destination. This module is global to the VM, so **every** transformed
-%% module in the VM sends through it — including a leftover system from an earlier
-%% test file, still firing its own heartbeat. Such a send cannot touch the run:
-%% its target is not a process the scheduler owns, so nothing about it can change
-%% what is runnable. Counting it anyway made a 250-seed sweep fail with
-%% `unmanaged: 1` when run after the rest of a suite and pass when run alone,
-%% which is the worst kind of diagnostic — one that fires on something the reader
-%% cannot act on.
+%% `foreign` exists because this module is global to the VM, so every transformed
+%% module in it sends through here — including a leftover system from an earlier
+%% test file. Such a send cannot change what is runnable, so counting it would
+%% fire a diagnostic the reader cannot act on. It still draws nothing: a
+%% stranger's message must not shift the fault schedule.
 %%
-%% Crucially, `foreign` still draws nothing. A stranger's message must not be able
-%% to shift the fault schedule, which is the real hazard a shared VM presents and
-%% the reason this is a three-way answer rather than a boolean.
-%%
-%% `undefined` — no step in progress — is not off-schedule at all. The driver runs
-%% between steps, and a harness injecting an operation there is doing something
-%% the trace records. Outside a run there is no scheduler and everything is
-%% scheduled by default, which keeps a hand-driven network behaving as it did.
+%% No step in progress is not off-schedule: the driver runs between steps, and
+%% outside a run there is no scheduler at all.
 classify(From, Dest) ->
     case eta_sched:stepping() of
         undefined -> scheduled;
@@ -1017,9 +849,8 @@ classify(From, Dest) ->
         Stepping -> escaped_or_foreign(Dest, Stepping)
     end.
 
-%% "Does the scheduler own the destination" answered without asking the scheduler:
-%% while a step is in progress every process it owns *except* the stepped one is
-%% suspended, and nothing else in a normal system is.
+%% "Does the scheduler own the destination", without asking it: mid-step every
+%% process it owns except the stepped one is suspended.
 escaped_or_foreign(Dest, Stepping) when Dest =:= Stepping ->
     escaped;
 escaped_or_foreign(Dest, _Stepping) ->
@@ -1028,9 +859,8 @@ escaped_or_foreign(Dest, _Stepping) ->
         _ -> foreign
     end.
 
-%% `Tag` is what a policy scopes on and what the log records, and it is passed
-%% rather than derived so that `cast/2` and `reply/2` can name the payload instead
-%% of OTP's envelope. See their clauses.
+%% `Tag` is what a policy scopes on and what the log records. Passed rather than
+%% derived so `cast/2` and `reply/2` can name the payload, not OTP's envelope.
 route(From, Dest, Msg, Tag) ->
     case classify(From, Dest) of
         scheduled ->

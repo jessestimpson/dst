@@ -10,7 +10,7 @@ An **ABD Quorum Register** is a simple distributed system that shares a single v
 replicated across 3 nodes. The value is meant to stay correct while clients read
 and write concurrently. It's designed for message-passing systems, like the BEAM,
 and so its implementation is fairly simple. It also features a counter-intuitive
-step that leads to an inconsistency bug whem omitted, making it a good example
+step that leads to an inconsistency bug when omitted, making it a good example
 for demonstrating DST's bug-finding capabilities.
 
 We recommend you have read [What DST Is](01-what-dst-is.md) to establish a baseline
@@ -18,7 +18,7 @@ for the technique.
 
 ## What ABD is
 
-We'll start 3 processes, each one is labeled as a "replica", and they all particpate
+We'll start 3 processes, each one is labeled as a "replica", and they all participate
 in message passing to each other. Each process holds a `{Timestamp, Value}` tuple in
 its state. For a quorum to be achieved, 2 of the 3 must agree on the tuple contents.
 
@@ -31,7 +31,7 @@ The system provides the following API:
   that pair back to a quorum**, then return the value.
 
 The write-back in the read path is the counter-intuitive part. It may look
-redundant: you're writing back a value you just read a couple nanonseconds ago.
+redundant: you're writing back a value you just read a couple nanoseconds ago.
 But it turns out to be critical to the consistency of the system, and we'll
 demonstrate exactly that over the course of this document.
 
@@ -39,7 +39,7 @@ demonstrate exactly that over the course of this document.
 
 We'll put the project beside your `eta` checkout so the dependency can be a
 plain relative path. We're using `mix` because the tooling makes for a simpler
-walkthough, but `rebar` could just as well be used, with some modification.
+walkthrough, but `rebar` could just as well be used, with some modification.
 We'll write the ABD register itself in Erlang - we're going to use `parse_transform`.
 
 ```bash
@@ -54,7 +54,7 @@ Clear the Elixir scaffolding and make the directories we need:
 cd abd && rm -rf lib test/abd_test.exs && mkdir -p src test/support
 ```
 
-Then edit `mix.exs`. In `project/0`, add 3 keys:
+Then edit `mix.exs`. In `project/0`, add 2 keys:
 
 ```elixir
       erlc_paths: erlc_paths(Mix.env()),
@@ -95,7 +95,8 @@ If the compile fails, double-check your configuration.
 **`runtime: false` rather than `only: :test`.** `eta` requires the inclusion
 of an hrl file in the ABD code. For the preprocessor to find the hrl, the `eta`
 project must be findable in all compilations. The `DST` define is what disables
-all `eta` features in your production code.
+all `eta` features in your production code. Your app must define `DST` where
+needed, usually for `MIX_ENV=test`.
 
 **`{:d, :DST}` for the whole test env, not a dedicated simulation profile.**
 `eta_time` falls back to the real `erlang` functions whenever no virtual clock
@@ -186,7 +187,7 @@ a client take the first set that arrive, which makes the quorum set a scheduling
 choice, which would typically be a source of nondeterminism.
 
 **Timestamps are `{Seq, WriterId}`, not integers.** 2 concurrent writers can
-read the same maximum and both pick `Seq + 1`. Including a another identifier
+read the same maximum and both pick `Seq + 1`. Including another identifier
 gets us a total order. This is an ABD implementation detail that you are free
 to ignore for the purposes of the demo.
 
@@ -322,7 +323,6 @@ features.
 
 init(_Seed, Config) ->
     Tab = ets:new(abd, [public, ordered_set]),
-    true = ets:insert(Tab, {clock, 0}),
     N = maps:get(replicas, Config, 3),
     Replicas = [begin {ok, P} = abd_replica:start_link(I), P end || I <- lists:seq(1, N)],
     {ok, #{tab => Tab, replicas => Replicas, clients => [], next_op => 1}}.
@@ -359,19 +359,18 @@ execute(Op, Sut = #{tab := Tab, replicas := Replicas, clients := Clients}) ->
 op_number({write, N, _Value}) -> N;
 op_number({read, N}) -> N.
 
-%% Both phases are timed on a logical clock kept in the same table. Only one
-%% process runs at a time, so the counter is a faithful total order of events.
+%% Both phases are stamped with `eta_log:log/1`, which records the event and
+%% returns the sequence number it filed it under. Only one process runs at a
+%% time, so those numbers are a faithful total order of events - and they point
+%% straight back into the log we learn to read in step 11.
 run_op({write, N, Value}, Tab, Replicas) ->
-    Start = tick(Tab),
+    Start = eta_log:log(started),
     Ts = abd_client:write(Replicas, N, Value),
-    ets:insert(Tab, {{write, N}, Start, tick(Tab), Ts, Value});
+    ets:insert(Tab, {{write, N}, Start, eta_log:log({finished, Ts}), Ts, Value});
 run_op({read, N}, Tab, Replicas) ->
-    Start = tick(Tab),
+    Start = eta_log:log(started),
     {Ts, Val} = abd_client:read(Replicas),
-    ets:insert(Tab, {{read, N}, Start, tick(Tab), Ts, Val}).
-
-tick(Tab) ->
-    ets:update_counter(Tab, clock, 1).
+    ets:insert(Tab, {{read, N}, Start, eta_log:log({finished, Ts}), Ts, Val}).
 
 %% ---------------------------------------------------------------------------
 %% The invariant
@@ -452,9 +451,9 @@ Our invariant is known as "regularity", sometimes called *no new-old inversion*:
 > Once a read has returned a value, no read that starts later may return an older one.
 
 Our `check/1` confirms that the system's timestamps make sense in the context of this
-invariant. Every operation gets a start and finish stamp from a simple logical clock
-(`ets:update_counter`). Since only one process is ever running at a time, the
-counter reliably represents the total order of operations.
+invariant. Every operation gets a start and finish stamp from `eta_log:log/1`.
+Since only one process is ever running at a time, its sequence number reliably
+represents the total order of operations. We'll make additional use of `eta_log` later.
 
 As mentioned earlier, we can't call `abd_replica:get/1`. We can't do any message
 passing to the system under test. Currently, we're reading from a client-driven
@@ -470,10 +469,13 @@ MIX_ENV=test iex -S mix
 ```
 
 ```elixir
-result = :eta_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000})
+opts = %{seed: 1, max_ops: 20, max_steps: 20_000, preload: [:abd]}
+result = :eta_run.run(:abd_harness, opts)
 :eta_run.summary(result)
 :eta_run.audit(result)
 ```
+
+The `preload` option is required, and we'll explain why coming up.
 
 RESULT:
 
@@ -485,7 +487,9 @@ RESULT:
   steps: 103,
   clock_ms: 0,
   skipped: 0,
+  stray_timers: 0,
   modules_loaded: [],
+  net: %{},
   sched: %{processes: 23, exited: 20, adopted_late: 0, timeouts: 0, steps: 103},
   trace_length: 123
 }
@@ -573,6 +577,7 @@ new VM is a special case and we want it in the sample.
 
 This experiment will group traces that match each other. Notice that we're giving the
 same seed on each of 5 runs. We hope to end up with identical traces each time.
+Notice also that `preload` is gone.
 
 ```elixir
 traces = for _ <- 1..5, do: :eta_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000}).trace
@@ -606,7 +611,7 @@ Here are some potential outputs and what they might mean.
 Modules are loaded lazily, by a single `code_server` process on the node. `eta_sched`
 has scheduled a process to run. That process reaches a module the system hasn't loaded yet,
 and sends a message to the `code_server` process, which isn't tracked by `eta_sched`.
-Our process waits on a reply, which `eta_sched` picks up as a yeild, and an opportunity
+Our process waits on a reply, which `eta_sched` picks up as a yield, and an opportunity
 for something else to be scheduled. On future runs, this specific yield doesn't exist,
 so we end up with a different trace.
 
@@ -620,13 +625,15 @@ MIX_ENV=test iex -S mix
 :eta_run.run(:abd_harness, %{seed: 1, max_ops: 20, max_steps: 20_000}).modules_loaded
 ```
 
+RESULT: `[:abd_client]`.
+
 This should show you the modules that were loaded during the run. This is an
-indicator of nondeterminism, not because the sytem is nondeterministic, but because
+indicator of nondeterminism, not because the system is nondeterministic, but because
 it changes `eta_sched`'s scheduling choices.
 
 ### The fix
 
-Add the `preload` option (which is what we had already done in our test file):
+Put the `preload` option back (which is what step 6 and our test file already do):
 
 ```elixir
 opts = %{seed: 1, max_ops: 20, max_steps: 20_000, preload: [:abd]}
@@ -640,8 +647,8 @@ other modules, you will have to add them here.
 codepaths. Some other seed may enter a path with a new module call. Only you know
 the full set of modules that's relevant to preload.
 
-Now go back to **"does a seed name an execution?"** at the top of this step and
-run the 5-trace grouping again, on yet another fresh VM.
+Now go back to the 5-trace grouping at the top of this step and run it again, on
+yet another fresh VM.
 
 RESULT: `1` and `[[1, 2, 3, 4, 5]]`.
 
@@ -662,7 +669,7 @@ test "a seed names an execution" do
 end
 ```
 
-Provide enough input seeds to have a high likeihood of covering all codepaths. This
+Provide enough input seeds to have a high likelihood of covering all codepaths. This
 test will start failing if you add code that calls a new module that is not preloaded.
 
 ## Step 8: fault injection
@@ -734,13 +741,14 @@ and `run_op/3` gains one:
 
 ```erlang
 run_op({partial_write, N, Value, Targets}, Tab, Replicas) ->
-    Start = tick(Tab),
+    Start = eta_log:log(started),
     Ts = abd_client:partial_write(Replicas, N, Value, Targets),
-    ets:insert(Tab, {{partial_write, N}, Start, tick(Tab), Ts, Value});
+    ets:insert(Tab, {{partial_write, N}, Start, eta_log:log({finished, Ts}), Ts, Value});
 ```
 
-Put it alongside the `write` and `read` clauses you already have. The stamps
-still come from `tick/1`. (Note: that will change in Step 11)
+Put it alongside the `write` and `read` clauses you already have. The row it
+writes is only for the record: `check/1` matches on `{{read, _}, ...}` and never
+looks at it.
 
 The target replica is selected in `generate/2`, using the seed, and carried
 in the operation, so that it is part of the recorded trace.
@@ -782,7 +790,7 @@ read(Replicas, Mode) ->
 and add `read/2` added to the export list.
 
 The rest of the changes are to thread `mode` from `Config` down to the call.
-Four edits in `test/support/abd_harness.erl`.
+Three edits in `test/support/abd_harness.erl`.
 
 `init/2`'s returned map gains a `mode` key:
 
@@ -804,17 +812,17 @@ All three `run_op` clauses gain a fourth argument; only the read clause uses it:
 
 ```erlang
 run_op({write, N, Value}, Tab, Replicas, _Mode) ->
-    Start = tick(Tab),
+    Start = eta_log:log(started),
     Ts = abd_client:write(Replicas, N, Value),
-    ets:insert(Tab, {{write, N}, Start, tick(Tab), Ts, Value});
+    ets:insert(Tab, {{write, N}, Start, eta_log:log({finished, Ts}), Ts, Value});
 run_op({partial_write, N, Value, Targets}, Tab, Replicas, _Mode) ->
-    Start = tick(Tab),
+    Start = eta_log:log(started),
     Ts = abd_client:partial_write(Replicas, N, Value, Targets),
-    ets:insert(Tab, {{partial_write, N}, Start, tick(Tab), Ts, Value});
+    ets:insert(Tab, {{partial_write, N}, Start, eta_log:log({finished, Ts}), Ts, Value});
 run_op({read, N}, Tab, Replicas, Mode) ->
-    Start = tick(Tab),
+    Start = eta_log:log(started),
     {Ts, Val} = abd_client:read(Replicas, Mode),
-    ets:insert(Tab, {{read, N}, Start, tick(Tab), Ts, Val}).
+    ets:insert(Tab, {{read, N}, Start, eta_log:log({finished, Ts}), Ts, Val}).
 ```
 
 Start a new `iex`, and let's conduct a search:
@@ -843,14 +851,16 @@ The violation:
 {:violation, %{
   property: :no_new_old_inversion,
   detail: "a later read reported an older value",
-  earlier: {8, 11, {1, 1}},
-  later: {12, 13, {0, 0}}
+  earlier: {29, 39, {1, 1}},
+  later: {43, 48, {0, 0}}
 }}
 ```
 
-Those tuples are `{start, finish, timestamp}`. `start` and `finish` define the
-scheduler steps - they point back to items of the trace to aide in debugging.
-The timestamps show the ordering violation - 1 ia earlier than 0.
+Those tuples are `{start, finish, timestamp}`. `start` and `finish` are `eta_log`
+sequence numbers - they point back to items of the log to aid in debugging, which
+we'll learn to render in step 11. The timestamps show the ordering violation: the
+read that finished first reported `{1, 1}`, and the read that started after it
+reported the older `{0, 0}`.
 
 ## Step 10: We have the trace of the bug, now let's print it out
 
@@ -871,7 +881,7 @@ and the shrinker starts a fresh system for every candidate.
 RESULT: `original: 35, shrunk: 19, tests: 393, verified: true`, in 457 ms.
 
 `verified: true` tells you that the search was successful. During the search, a
-candidate is only a recipe, replayed in lenient mode where some steps  get skipped.
+candidate is only a recipe, replayed in lenient mode where some steps get skipped.
 `verified: true` means `eta_shrink` took what that run actually
 executed and replayed it again strictly, and it still failed. `false` means the
 search found something smaller that doesn't reproduce, and you get the original
@@ -884,9 +894,12 @@ Here is the shrunk trace:
 ```erlang
 [{op, {partial_write, 1, {v, 1}, [2]}},
  {op, {partial_write, 2, {v, 2}, [3]}},
- {op, {read, 3}},
- ...
- {step, 3}, {step, 1}, {step, 2}, {step, 3}, {step, 8}, {step, 1}, ...]
+ {op, {read, 3}}, {op, {read, 4}}, {op, {read, 5}},
+ {step, 3}, {step, 1},
+ {op, {read, 6}},
+ {step, 2}, {step, 3}, {step, 8}, {step, 1},
+ {op, {read, 7}},
+ {step, 2}, {step, 8}, {step, 9}, {step, 2}, {step, 0}, {step, 9}]
 ```
 
 If that means nothing to you, that's the correct reaction.
@@ -898,7 +911,7 @@ that gap.
 
 ### Using `eta_log`
 
-`eta_log` uses a global table. It's API is modeled after `fprof` and other built-in
+`eta_log` uses a global table. Its API is modeled after `fprof` and other built-in
 Erlang analysis tools. Don't execute these yet; we need to instrument the ABD
 code first.
 
@@ -1001,27 +1014,10 @@ label_for({read, N}) -> {reader, N}.
 There is an optional `labels/1` callback on `eta_harness`, but we don't need it here
 because each process names itself.
 
-### Use one clock, and only one
+### Wire up the label
 
-Your harness has been stamping operations from its own `tick/1` counter since
-step 5. Throw it away and stamp from `eta_log:log/1`, which returns its sequence
-number. Four edits in `test/support/abd_harness.erl`.
-
-**In `init/2`**, delete the counter row:
-
-```erlang
-    true = ets:insert(Tab, {clock, 0}),     %% delete this line
-```
-
-**Delete `tick/1` entirely:**
-
-```erlang
-tick(Tab) ->                               %% delete this function
-    ets:update_counter(Tab, clock, 1).
-```
-
-**In each of the 3 `run_op/4` clauses**, name the process and replace both
-`tick(Tab)` calls. Provided here in full for easy copying.
+Your harness has been stamping operations from `eta_log:log/1` since step 5, so
+the clock is covered. What's missing is the name. Replace `run_op` with the following:
 
 ```erlang
 run_op(Op, Tab, Replicas, Mode) ->
@@ -1056,7 +1052,7 @@ investigate.
 
 ### Read the failure
 
-Four files have changed since step 10, so start a **fresh shell** and rebuild
+Three files have changed since step 10, so start a **fresh shell** and rebuild
 `shrunk` from scratch.
 
 ```bash
@@ -1133,7 +1129,7 @@ RESULT:
    43  reader-7       {finished,{0,0}}
 ```
 
-### How to read 40 lines
+### How to read 40+ lines
 
 Don't! The violation tells you which ones matter.
 
@@ -1213,8 +1209,15 @@ Both become deterministic with `eta_time`'s virtual clock.
 Here's another fault injection site. This time, we'll allow the replica to become
 busy, preventing timely responses. This fault simulates high network latency.
 
-In `src/abd_replica.erl`, add a `paused` field, a `pause/2` cast, and 3 clauses
-**above** the existing `handle_cast`s:
+In `src/abd_replica.erl`, add a `paused` field to `#st{}` and a `pause/2` cast
+next to `read/3` and `write/5`, exported with them:
+
+```erlang
+pause(Pid, Ms) ->
+    gen_server:cast(Pid, {pause, Ms}).
+```
+
+Then 3 clauses **above** the existing `handle_cast`s:
 
 ```erlang
 handle_cast({pause, Ms}, St) ->
@@ -1229,7 +1232,7 @@ handle_cast({write, _Ref, _From, _Ts, _Val}, St = #st{paused = true}) ->
     {noreply, St};
 ```
 
-and a `handle_info` clause to bring it back:
+and a `handle_info` clause to bring it back, added to the callback export list:
 
 ```erlang
 handle_info(resume, St) ->
@@ -1281,7 +1284,7 @@ collect_writes(Ref, N) ->
     end.
 ```
 
-Here we're execising `eta_transform`'s rewrite of the `receive-after` construct
+Here we're exercising `eta_transform`'s rewrite of the `receive-after` construct
 instead of an `erlang:send_after` call.
 
 **The timeout is a client failure, so we throw.** A client
@@ -1334,7 +1337,7 @@ run_op({pause, _N, Index, Ms}, _Tab, Replicas, _Mode, _Start) ->
 
 ### Timeout failures need to be detected
 
-The other 3 `run_op/4` clauses must catch the timeout and record the failure:
+The other 3 `run_op/5` clauses must catch the timeout and record the failure:
 
 ```erlang
 run_op({write, N, Value}, Tab, Replicas, _Mode, Start) ->
@@ -1435,6 +1438,9 @@ Now we can load that fixture into a test.
   end
 ```
 
+The 2 seed-pinned tests from step 12 are still red until you re-pin them to 53,
+which is the coupling this step is about.
+
  Whether or not you actually want to do this in your project is up to you. There
 are pros and cons to the approach. It does still break if the *shape* of an
 operation changes, or if `processes/1` starts registering processes in a
@@ -1443,7 +1449,7 @@ different order. Those are changes to the contract rather than to the workload.
 ## Step 15: How to incorporate system state into your invariant
 
 `eta_log` records what your system *did*. `eta_observe` is for tracking current
-system state. It requires special configration of the parse transform because
+system state. It requires special configuration of the parse transform because
 state is typically accessible via message passing, and all processes are suspended,
 which halts message passing during the `check/1` phase.
 
