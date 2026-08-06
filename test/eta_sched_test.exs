@@ -438,4 +438,117 @@ defmodule DstSchedTest do
       :ets.delete(trace)
     end
   end
+
+  describe "cold code" do
+    # The failure this catches is the one `eta_run`'s docs used to end with
+    # "nothing catches it": a process waiting on `code_server` is, to the
+    # scheduler, a process blocked in a receive, so if it is the last thing
+    # standing the run ends at what looks exactly like quiescence and reports
+    # success.
+    #
+    # Reproducing that by racing a real demand-load is what `eta_2pc`'s
+    # `maybe_touch_lazy/2` declines to do, and for a good reason: whether the
+    # code server answers before the run reaches quiescence is a question about
+    # real time, and it was measured at 2 failures in 14 runs. A flaky test in a
+    # project about determinism is not a test.
+    #
+    # So the race is removed rather than run. The code server is suspended, which
+    # turns "parked on the code server" from a moment into a state, and the
+    # assertion is then about the detector rather than about the clock.
+    setup do
+      # Everything this test touches while the code server is down has to be warm
+      # already, including the scheduler's own warning path — a load inside that
+      # window would deadlock rather than fail.
+      :ok = :eta_run.preload([])
+      Code.ensure_loaded!(:eta_cold_probe)
+      _ = :logger.warning("eta_sched_test: warming the warning path", [])
+      :ok
+    end
+
+    # Suspends the code server from a short-lived process of its own. A suspend
+    # is released when the suspending process dies, so a hang in the test cannot
+    # leave the VM without a code server and take the rest of the suite with it.
+    defp without_code_server(fun) do
+      parent = self()
+      cs = Process.whereis(:code_server)
+
+      keeper =
+        spawn(fn ->
+          true = :erlang.suspend_process(cs)
+          send(parent, {self(), :suspended})
+
+          receive do
+            :resume -> :ok
+          after
+            10_000 -> :ok
+          end
+        end)
+
+      assert_receive {^keeper, :suspended}, 1_000
+
+      try do
+        fun.()
+      after
+        send(keeper, :resume)
+      end
+    end
+
+    test "a run that ends with a process on the code server says so" do
+      if :erlang.module_loaded(:eta_cold) do
+        :code.purge(:eta_cold)
+        :code.delete(:eta_cold)
+        :code.purge(:eta_cold)
+      end
+
+      refute :erlang.module_loaded(:eta_cold)
+
+      sched = @sched.new(%{seed: 1})
+
+      victim =
+        without_code_server(fn ->
+          victim = spawn(fn -> :eta_cold_probe.touch() end)
+          assert parked?(victim), "the probe never reached the code server"
+
+          # Nothing is runnable: the victim's mailbox is empty and will stay that
+          # way for as long as the code server is down. So the run ends here,
+          # believing the system quiescent — which is the whole failure.
+          sched = sched |> @sched.register([victim]) |> @sched.run(200)
+
+          assert %{cold_code: [entry]} = @sched.stats(sched)
+
+          assert %{pid: ^victim, at: {:eta_cold_probe, :touch, 0}} = entry,
+                 "the entry has to name the frame that reached the cold module, " <>
+                   "or it says a run is spoiled without saying what to preload"
+
+          victim
+        end)
+
+      @sched.release(sched)
+      Process.exit(victim, :kill)
+    end
+
+    test "a healthy run reports none" do
+      pid = spawn(fn -> receive do: (:never -> :ok) end)
+      sched = @sched.new(%{seed: 1}) |> @sched.register([pid]) |> @sched.run(50)
+
+      assert %{cold_code: []} = @sched.stats(sched)
+
+      @sched.release(sched)
+      Process.exit(pid, :kill)
+    end
+  end
+
+  defp parked?(pid, tries \\ 200)
+  defp parked?(_pid, 0), do: false
+
+  defp parked?(pid, tries) do
+    case Process.info(pid, :current_function) do
+      {:current_function, {:code_server, :call, 1}} ->
+        true
+
+      _ ->
+        Process.sleep(5)
+        parked?(pid, tries - 1)
+    end
+  end
 end

@@ -16,10 +16,39 @@ defmodule EtaSpawnTest do
   """
   use ExUnit.Case, async: false
 
+  # These tests drive `eta_sched` directly rather than through `eta_run`, so
+  # nothing has preloaded the code a gated child reaches — and a gated child
+  # reaches plenty of it, because a transformed module's rewritten sends land in
+  # `eta_net`.
+  #
+  # Without this the file fails at most seeds, and always in the first test or
+  # two, which is the tell. The first gated child to run is the one that finds
+  # `eta_net` cold: it calls `code_server`, `eta_sched` reads that as a process
+  # blocked in a receive, nothing else is runnable, and `run/2` returns at what
+  # looks exactly like quiescence with the child still parked. The child is
+  # released by the code server a moment later, with nothing left to step it.
+  #
+  # That is the failure `eta_run`'s moduledoc describes under "the worse
+  # failure, and why `preload` is on by default", reached from the one direction
+  # that has no `modules_loaded` to report it afterwards.
+  setup_all do
+    :ok = :eta_run.preload([])
+  end
+
   @sut :eta_spawn_sut
 
   defp pid_of(p) when is_pid(p), do: p
   defp pid_of({p, ref}) when is_pid(p) and is_reference(ref), do: p
+
+  # A scheduler is linked to the test process, so by the time cleanup runs it is
+  # usually already gone. `catch_exit/1` reads right and is not: it *requires* an
+  # exit, so it fails on the runs where the cleanup wins the race and releases
+  # the scheduler cleanly.
+  defp quietly(fun) do
+    fun.()
+  catch
+    :exit, _ -> :ok
+  end
 
   describe "inert with no scheduler running" do
     setup do
@@ -79,7 +108,7 @@ defmodule EtaSpawnTest do
   describe "gated under a scheduler" do
     setup do
       sched = :eta_sched.new(%{seed: 1})
-      on_exit(fn -> catch_exit(:eta_sched.release(sched)) end)
+      on_exit(fn -> quietly(fn -> :eta_sched.release(sched) end) end)
       {:ok, sched: sched}
     end
 
@@ -247,6 +276,82 @@ defmodule EtaSpawnTest do
       assert {:error, {:eta_sched, :unsupported_server_name, {:global, _}}} =
                under_scheduler(fn ->
                  :eta_spawn_sut.start_named({:global, :eta_spawn_global}, self())
+               end)
+    end
+  end
+
+  describe "gen_statem starts" do
+    # The same gate, reached through `eta_sched:statem_start_*`. The child runs a
+    # different `init/1` shape and enters a different loop, so it gets its own
+    # entry point — and its own coverage, because a gated entry point the
+    # scheduler does not recognise leaves its child waiting on a token nobody
+    # sends.
+    test "start_link/3 gates its child and still returns a live machine" do
+      assert {:ok, pid} = under_scheduler(fn -> :eta_statem_sut.start_link(self()) end)
+      assert Process.alive?(pid)
+      assert :eta_statem_sut.state(pid) == :off
+      :eta_statem_sut.stop(pid)
+    end
+
+    for {f, kind} <- [start_link_named: :link, start_named: :plain, start_monitor_named: :monitor] do
+      @f f
+      @kind kind
+      test "#{f} registers the name and enters the loop under it" do
+        name = :"eta_statem_#{@f}"
+        result = under_scheduler(fn -> apply(:eta_statem_sut, @f, [{:local, name}, self()]) end)
+
+        pid =
+          case @kind do
+            :monitor ->
+              assert {:ok, {p, ref}} = result
+              assert is_reference(ref)
+              p
+
+            _ ->
+              assert {:ok, p} = result
+              p
+          end
+
+        assert Process.whereis(name) == pid
+
+        # A call addressed to the *name* proves the loop was entered under it.
+        assert :eta_statem_sut.who(name) == pid
+
+        # And it is a genuine OTP process, not something that merely answers.
+        assert {:off, %{flips: 0}} = :sys.get_state(pid)
+        assert :proc_lib.translate_initial_call(pid) == {:eta_statem_sut, :init, 1}
+
+        :eta_statem_sut.stop(pid)
+      end
+    end
+
+    test "the gated machine is stepped by the scheduler, not running ahead of it" do
+      # `init/1` labels the process through `?ETA_LABEL`, which only a process the
+      # scheduler owns reaches — so a machine that answered here without being
+      # adopted would be one that ran outside the schedule.
+      assert {:ok, pid} = under_scheduler(fn -> :eta_statem_sut.start_link(self()) end)
+      assert :eta_statem_sut.state(pid) == :off
+      :eta_statem_sut.flip(pid)
+      assert :eta_statem_sut.state(pid) == :on
+      :eta_statem_sut.stop(pid)
+    end
+
+    test "a name already taken is reported, not crashed on" do
+      name = :eta_statem_taken
+
+      assert {:ok, first} =
+               under_scheduler(fn -> :eta_statem_sut.start_named({:local, name}, self()) end)
+
+      assert {:error, {:already_started, ^first}} =
+               under_scheduler(fn -> :eta_statem_sut.start_named({:local, name}, self()) end)
+
+      :eta_statem_sut.stop(first)
+    end
+
+    test "global and via are refused rather than silently ungated" do
+      assert {:error, {:eta_sched, :unsupported_server_name, {:global, _}}} =
+               under_scheduler(fn ->
+                 :eta_statem_sut.start_named({:global, :eta_statem_global}, self())
                end)
     end
   end

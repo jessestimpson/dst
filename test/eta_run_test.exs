@@ -404,5 +404,28 @@ defmodule DstRunTest do
       assert {:modules_loaded, loaded} = List.keyfind(reasons, :modules_loaded, 0)
       assert :eta_2pc_lazy in loaded
     end
+
+    test "audit/1 reports a process the run left waiting on the code server" do
+      # The other half of the cold-code problem, and the one `modules_loaded`
+      # structurally cannot see: the load had not finished when the run did, so
+      # there is nothing in `modules_loaded` to find. `eta_sched` catches it from
+      # the other side and reports it in `sched.cold_code`; this is the check
+      # that `audit/1` is actually looking at that field.
+      #
+      # Fabricated rather than provoked. Producing the state for real means
+      # racing the code server, which is what `eta_sched_test`'s "cold code"
+      # describe does properly — by suspending it. What is under test here is the
+      # plumbing between the two modules, which a real run cannot exercise any
+      # more directly than this can.
+      cold = %{id: 3, pid: self(), at: {:my_client, :commit, 2}}
+
+      result = %{
+        modules_loaded: [],
+        sched: %{adopted_late: 0, timeouts: 0, cold_code: [cold]}
+      }
+
+      assert {:suspect, reasons} = :eta_run.audit(result)
+      assert {:cold_code, [^cold]} = List.keyfind(reasons, :cold_code, 0)
+    end
   end
 end

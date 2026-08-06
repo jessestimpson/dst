@@ -142,7 +142,9 @@ waiting one out costs no real time.
     cast/2,
     call/2,
     call/3,
+    reply/1,
     reply/2,
+    statem_return/1,
     unsupported/2
 ]).
 
@@ -388,13 +390,16 @@ cast(Dest, Msg) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_server:call/2,3`, with **both legs on the network**.
+`gen_server:call/2,3` and `gen_statem:call/2,3`, with **both legs on the
+network**. One target for both, because the request is the same
+`{'$gen_call', From, Request}` either way.
 
 The request is an ordinary send this module routes. The reply cannot be reached
-from here — `gen:reply` sends it from inside `gen_server` — so `eta_transform`
-brings it on from the other end, rewriting a `gen_server` module's
-`handle_call/3` returns so `{reply, R, S}` becomes `eta_net:reply(From, R)` plus
-`{noreply, S}`.
+from here — `gen:reply` sends it from inside OTP — so `eta_transform` brings it
+on from the other end, rewriting the callee's returns: a `gen_server`'s
+`{reply, R, S}` becomes `eta_net:reply(From, R)` plus `{noreply, S}`, and a
+`gen_statem`'s `{reply, From, R}` action is taken out of the action list and sent
+through here instead. See `statem_return/1`.
 
 Both legs can therefore be dropped or delayed independently, which is what makes
 the asymmetric fault reachable: the work happened, the caller never learned it
@@ -422,12 +427,23 @@ silently unfaultable.
 call(Dest, Req) ->
     call(Dest, Req, 5000).
 
--spec call(dest() | term(), term(), timeout()) -> term().
+-spec call(dest() | term(), term(), timeout() | {clean_timeout | dirty_timeout, timeout()}) ->
+    term().
 call(Dest, Req, Timeout) ->
     case running() andalso normalize(Dest) of
-        To when is_pid(To) -> do_call(To, Dest, Req, Timeout);
-        _ -> gen_server:call(Dest, Req, Timeout)
+        To when is_pid(To) -> do_call(To, Dest, Req, call_timeout(Timeout));
+        _ -> gen_server:call(Dest, Req, call_timeout(Timeout))
     end.
+
+%% `gen_statem:call/3` accepts `{clean_timeout, T}` and `{dirty_timeout, T}` as
+%% well as a plain `timeout()`. Both choose how the *caller* waits — whether the
+%% wait happens in a proxy process — and neither is meaningful here: this module
+%% waits in a receive of its own, on the virtual clock. Unwrapping to the number
+%% is the honest reading, and it keeps `call/3` a single target for both
+%% behaviours.
+call_timeout({clean_timeout, T}) -> T;
+call_timeout({dirty_timeout, T}) -> T;
+call_timeout(T) -> T.
 
 do_call(To, Dest, Req, Timeout) ->
     Tag = make_ref(),
@@ -473,15 +489,16 @@ check_routed(Tag, To, Req) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_server:reply/2`, routed — so a reply can be lost independently of the request
-that caused it.
+`gen_server:reply/2` and `gen_statem:reply/2`, routed — so a reply can be lost
+independently of the request that caused it.
 
 Addressed to the caller's pid rather than to the alias in the tag. Both land in
 the same mailbox and the caller's selective receive matches on the tag either
 way.
 
-`eta_transform` also rewrites `handle_call/3` returns to call this, which is how
-the reply leg of `call/3` gets onto the network.
+`eta_transform` also rewrites a `gen_server`'s `handle_call/3` returns and a
+`gen_statem`'s reply actions to reach this, which is how the reply leg of
+`call/3` gets onto the network.
 """.
 -endif.
 -spec reply(term(), term()) -> ok.
@@ -503,10 +520,76 @@ reply(From, Reply) ->
 
 -if(?DOCATTRS).
 -doc """
+`gen_statem:reply/1`, routed. Takes one `{reply, From, Reply}` or a list of them,
+and puts each on the network through `reply/2`.
+""".
+-endif.
+-spec reply([{reply, term(), term()}] | {reply, term(), term()}) -> ok.
+reply({reply, From, Reply}) ->
+    reply(From, Reply);
+reply(Replies) when is_list(Replies) ->
+    lists:foreach(fun(R) -> reply(R) end, Replies).
+
+-if(?DOCATTRS).
+-doc """
+Puts the **reply** leg of a `gen_statem:call` on the network, given a state
+callback's return value.
+
+The `gen_server` half of this job needs the `From` out of the callback's
+arguments, so `eta_transform` generates a per-module helper for it. A
+`gen_statem` names its caller inside the return instead — a `{reply, From, Msg}`
+action — so the whole job is a function of the return value alone and lives
+here.
+
+Every action-carrying return shape is recognised. Each `{reply, From, Msg}`
+action is sent through `reply/2` and removed from the list, so `gen_statem` does
+not also send it directly:
+
+```erlang
+{next_state, S, D, [{reply, From, R}, Other]}  %% -> eta_net:reply(From, R),
+                                               %%    {next_state, S, D, [Other]}
+{stop_and_reply, Reason, [{reply, From, R}]}   %% -> eta_net:reply(From, R),
+                                               %%    {stop_and_reply, Reason, []}
+```
+
+Anything else is returned untouched, including a return with no actions and a
+return shape this does not know. Idempotent, so a return that has already passed
+through — from a helper function the transform also wrapped — is unchanged the
+second time.
+
+Actions may be a single action rather than a list, which is why the bare
+`{reply, _, _}` clause exists.
+""".
+-endif.
+-spec statem_return(term()) -> term().
+statem_return({next_state, S, D, A}) -> {next_state, S, D, statem_actions(A)};
+statem_return({keep_state, D, A}) -> {keep_state, D, statem_actions(A)};
+statem_return({keep_state_and_data, A}) -> {keep_state_and_data, statem_actions(A)};
+statem_return({repeat_state, D, A}) -> {repeat_state, D, statem_actions(A)};
+statem_return({repeat_state_and_data, A}) -> {repeat_state_and_data, statem_actions(A)};
+statem_return({stop_and_reply, R, A}) -> {stop_and_reply, R, statem_actions(A)};
+statem_return({stop_and_reply, R, A, D}) -> {stop_and_reply, R, statem_actions(A), D};
+statem_return(Ret) -> Ret.
+
+statem_actions([{reply, From, Msg} | T]) ->
+    ok = reply(From, Msg),
+    statem_actions(T);
+statem_actions([H | T]) ->
+    [H | statem_actions(T)];
+statem_actions([]) ->
+    [];
+statem_actions({reply, From, Msg}) ->
+    ok = reply(From, Msg),
+    [];
+statem_actions(Other) ->
+    Other.
+
+-if(?DOCATTRS).
+-doc """
 What `eta_transform` points the messaging functions this module does not
 implement at: broadcasts and multi-node calls, the asynchronous
-request/response interface, and the `gen_statem` and `gen_event` client APIs.
-The list is `?NET_UNSUPPORTED` in `eta_transform`.
+request/response interface, and the `gen_event` client API. The list is
+`?NET_UNSUPPORTED` in `eta_transform`.
 
 Raises while a network is running, and calls the original otherwise — so a module
 holding one on a path no simulation reaches still builds and behaves normally.
@@ -527,7 +610,8 @@ unsupported({M, F, _A} = MFA, Args) ->
                     {unsupported, MFA, <<
                         "eta_net cannot put this function's traffic on the network yet, "
                         "so a run that used it would be faulting less than it claims. "
-                        "Use gen_server:call/2,3, cast/2 or reply/2, which are routed, "
+                        "Use call/2,3, cast/2 or reply/2 on gen_server or gen_statem, "
+                        "which are routed, "
                         "or run without a network"
                     >>}}
             )

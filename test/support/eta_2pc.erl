@@ -161,15 +161,17 @@ execute({run_tx, TxId, Plan}, Sut = #{tab := Tab, coordinator := Coordinator, la
 %% Called from `execute/2`, which runs in the *driver* process, and that
 %% placement is deliberate rather than convenient. The version that actually
 %% bites a real system is a demand-load from inside a **scheduled** process, and
-%% it cannot be tested deterministically from inside one VM: a process waiting
+%% provoking that one here would be a race rather than a test: a process waiting
 %% on `code_server` looks to `eta_sched` exactly like one blocked in a receive,
 %% so it is not runnable, and whether the code server answers before the run
 %% reaches quiescence is a question about real time. Measured while it was
 %% wired that way: 2 failures in 14 runs, and once a whole run ending after 5
 %% steps with `outcome => ok`.
 %%
-%% So the test here covers the mechanism, and `eta_run`'s docs cover the hazard.
-%% Pretending otherwise would mean a flaky suite in a project about determinism.
+%% So the test here covers the mechanism `modules_loaded` reports. The scheduled
+%% one is covered by `eta_sched`'s `cold_code`, whose test removes the race
+%% instead of running it — see the "cold code" describe in `eta_sched_test`,
+%% which suspends the code server so the park is a state rather than a moment.
 maybe_touch_lazy(false, _TxId) -> ok;
 maybe_touch_lazy(true, 1) -> eta_2pc_lazy:touch();
 maybe_touch_lazy(true, _TxId) -> ok.

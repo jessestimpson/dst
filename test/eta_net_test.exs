@@ -79,7 +79,14 @@ defmodule EtaNetTest do
   # The echo is linked to the test process, so it is usually already gone by the
   # time cleanup runs. Racing that is not worth a failed test.
   defp stop_echo(name) do
-    :eta_net_echo.stop(name)
+    quietly(fn -> :eta_net_echo.stop(name) end)
+  end
+
+  # Same race, for anything else a cleanup shuts down. `catch_exit/1` is the
+  # wrong tool here even though it reads right: it *requires* an exit, so it
+  # fails on the runs where the cleanup wins and shuts the thing down cleanly.
+  defp quietly(fun) do
+    fun.()
   catch
     :exit, _ -> :ok
   end
@@ -1068,7 +1075,7 @@ defmodule EtaNetTest do
       # a crashed peer by monitor would simply hang.
       :ok = @net.start(%{seed: 1})
       s = :eta_sched.new(%{seed: 1})
-      on_exit(fn -> catch_exit(:eta_sched.release(s)) end)
+      on_exit(fn -> quietly(fn -> :eta_sched.release(s) end) end)
 
       watcher = sink()
       target = sink()
