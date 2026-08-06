@@ -199,6 +199,9 @@ waiting one out costs no real time.
 -define(PLACE, eta_net_place).
 -define(CALLS, eta_net_calls).
 -define(MONS, eta_net_mons).
+%% Pids the scheduler has reported as exited. See `simulate_monitor/4` for why
+%% this exists rather than asking the VM.
+-define(DEAD, eta_net_dead).
 
 -type dest() :: pid() | atom().
 
@@ -267,6 +270,7 @@ start(Opts) ->
     ?PLACE = ets:new(?PLACE, [named_table, public, set]),
     ?CALLS = ets:new(?CALLS, [named_table, public, set]),
     ?MONS = ets:new(?MONS, [named_table, public, set]),
+    ?DEAD = ets:new(?DEAD, [named_table, public, set]),
     Seed = maps:get(seed, Opts, 0),
     ets:insert(?STATE, [
         {rand, rand:seed_s(exsss, {Seed, Seed + 11, Seed + 23})},
@@ -316,7 +320,7 @@ stop() ->
                 error:badarg -> ok
             end
         end,
-        [?STATE, ?CHAN, ?PLACE, ?CALLS, ?MONS]
+        [?STATE, ?CHAN, ?PLACE, ?CALLS, ?MONS, ?DEAD]
     ),
     ok.
 
@@ -904,11 +908,43 @@ simulate_monitor(Watcher, Target, Item, Opts) ->
     %% `erlang:monitor/2` on a dead process delivers `noproc` at once rather than
     %% never, and code that waits for a DOWN it will not otherwise get relies on
     %% it.
-    case erlang:is_process_alive(Target) of
-        true -> ok;
-        false -> fire(Mon, noproc)
+    %%
+    %% **Liveness comes from `notify_exit/2`'s record, not from the VM**, and
+    %% neither obvious BIF will do.
+    %%
+    %% `erlang:is_process_alive/1` and `erlang:process_info/2` are both
+    %% signal-based against a live target: to keep their answer ordered against
+    %% signals the caller has already sent it, they ask the target and wait for a
+    %% reply — and a reply is something the target produces by *running*. Every
+    %% target here is one `eta_sched` owns, so it is suspended, and the watcher is
+    %% exactly the kind of process that has been sending it things. The watcher's
+    %% progress therefore came to depend on when its target was next stepped, which
+    %% is the VM ordering two processes where the schedule is supposed to. It cost
+    %% about one seed in forty its reproducibility, and showed up as a member
+    %% parked in `erts_internal:await_result/1` at a choice point — first under
+    %% `is_process_alive/1`, then in the same place under `process_info/2`, which
+    %% is what ruled out swapping one for the other.
+    %%
+    %% `eta_sched` reports every exit it sees, and every process that can be a
+    %% target here is one it owns — `simulated_pair/2` requires both ends placed —
+    %% so that report is the authority. Reading it asks the target for nothing.
+    case target_dead(Target) of
+        true -> fire(Mon, noproc);
+        false -> ok
     end,
     Ref.
+
+%% Whether a monitor's target has already exited.
+%%
+%% Which answer is authoritative depends on whether a scheduler is running, and
+%% that is the subtlety. Under one, nothing may ask a suspended process a question
+%% (see above) and nothing needs to, because the scheduler reports every exit
+%% through `notify_exit/2`. Without one — driving a network by hand, which this
+%% module supports — no exit is ever reported, but nothing is suspended either, so
+%% the VM is safe to ask.
+target_dead(Target) ->
+    ets:member(?DEAD, Target) orelse
+        (eta_sched:current() =:= undefined andalso not erlang:is_process_alive(Target)).
 
 %% Whether this pair is one a severed link could separate: both located, on
 %% different simulated nodes. Faultability is not consulted — it decides whose
@@ -1025,6 +1061,10 @@ monitors that cross a declared link.
 notify_exit(Pid, Reason) ->
     case running() of
         true ->
+            %% Recorded before the fan-out, so a monitor created later on a target
+            %% that has already exited answers `noproc` without asking the VM. See
+            %% `simulate_monitor/4`.
+            true = ets:insert(?DEAD, {Pid}),
             _ = [fire(M, Reason) || M <- monitors_on(Pid)],
             %% Whatever it was watching, it is not watching any more.
             true = ets:match_delete(?MONS, {'_', Pid, '_', '_', '_', '_'}),
@@ -1453,6 +1493,9 @@ kill_all(Dying) ->
     lists:foreach(
         fun(P) ->
             true = ets:delete(?PLACE, {pid, P}),
+            %% As `notify_exit/2` would, but the scheduler has not seen these
+            %% deaths yet and a survivor may monitor one before it does.
+            true = ets:insert(?DEAD, {P}),
             true = erlang:exit(P, kill)
         end,
         Dying

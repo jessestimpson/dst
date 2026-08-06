@@ -1154,7 +1154,9 @@ do_release(St = #st{procs = Procs, gated = Gated}) ->
     maps:foreach(fun(Pid, true) -> catch Pid ! ?GO end, Gated),
     maps:foreach(
         fun(_Id, Pid) ->
-            case erlang:is_process_alive(Pid) of
+            %% `process_info/2` rather than `is_process_alive/1`, for the reason
+            %% in `is_runnable/3`: these are still suspended when this runs.
+            case status(Pid) =/= dead of
                 true ->
                     erlang:trace(Pid, false, ?TRACE_FLAGS),
                     safe_resume(Pid);
@@ -1174,9 +1176,17 @@ do_release(St = #st{procs = Procs, gated = Gated}) ->
 runnable_ids(St = #st{procs = Procs}) ->
     lists:sort([Id || {Id, Pid} <- maps:to_list(Procs), is_runnable(St, Id, Pid)]).
 
+%% Liveness is read with `process_info/2` rather than `is_process_alive/1`, and it
+%% matters more here than anywhere else: this runs for every process at every
+%% choice point. `is_process_alive/1` is signal-based — it asks the target and
+%% waits for a reply the target produces by *running* — and every process here is
+%% one this scheduler owns and has suspended, several of which it has already sent
+%% a `?GO` token. Asking them would make the scheduler's own progress depend on
+%% when it next resumed them. `process_info/2` reads the target directly, which is
+%% how `queue_len/1` two lines down has always done it.
 -spec is_runnable(#st{}, id(), pid()) -> boolean().
 is_runnable(#st{exited = Exited, blocked_at = Blocked}, Id, Pid) ->
-    case maps:is_key(Id, Exited) orelse not erlang:is_process_alive(Pid) of
+    case maps:is_key(Id, Exited) orelse status(Pid) =:= dead of
         true ->
             false;
         false ->
@@ -1199,11 +1209,30 @@ do_step(St0 = #st{procs = Procs}, Id) ->
     {Quiescence, St1} = await_quiescent(St0, Pid),
     true = ets:delete(?ACTIVE, stepping),
     St2 = St1#st{steps = St1#st.steps + 1, choices = [Id | St1#st.choices]},
-    case status(Pid) of
-        dead ->
-            {exited, St2#st{exited = (St2#st.exited)#{Id => true}}};
-        _ ->
-            erlang:suspend_process(Pid),
+    %% Reading the status and then acting on it is a read followed by an action on
+    %% something that can change in between, so the two are taken as one: hold the
+    %% process first, and let a failure to hold it *be* the death.
+    %%
+    %% Splitting them was a latent crash. A step ends when the process stops being
+    %% runnable, which is usually a receive but is equally the last thing it does
+    %% before returning — so a short-lived worker (a registry member's gather
+    %% helper, a transaction worker) routinely dies in the window between the two
+    %% calls. `suspend_process/1` raises `badarg` on a dead pid, which took the
+    %% scheduler down for something that is nothing. Every other call site in this
+    %% module already guarded it; this one did not, and a system spawning such
+    %% workers under an injected node fault hit it about one run in three.
+    %%
+    %% The trace is drained either way. It was not before, and that was the more
+    %% consequential half: `trace_delivered/1` is the only thing that says the
+    %% tracer has every event, so a process that spawned a child and then exited
+    %% in the same step left the spawn event sitting in the mailbox, to be adopted
+    %% whenever `handle_info/2` next ran rather than at a point the schedule
+    %% fixes.
+    case hold(Pid) of
+        false ->
+            {_SelfSends, StDead} = drain_trace(St2, Pid),
+            {exited, StDead#st{exited = (StDead#st.exited)#{Id => true}}};
+        true ->
             {SelfSends, St3} = drain_trace(St2, Pid),
             QueueAfter = queue_len(Pid),
             Consumed = QueueBefore + SelfSends - QueueAfter,
@@ -1214,6 +1243,18 @@ do_step(St0 = #st{procs = Procs}, Id) ->
                     false -> no_progress
                 end,
             {Outcome, St4}
+    end.
+
+%% Suspend a process, answering whether there was one to suspend. `false` means it
+%% has exited, which is the only reason `suspend_process/1` raises here: the pid is
+%% one this scheduler owns, so it is local, and nothing else suspends it.
+-spec hold(pid()) -> boolean().
+hold(Pid) ->
+    try
+        erlang:suspend_process(Pid),
+        true
+    catch
+        error:badarg -> false
     end.
 
 %% Where a process blocked, but only when it actually blocked.
