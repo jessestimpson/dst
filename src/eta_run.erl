@@ -64,7 +64,7 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
 """.
 -endif.
 
--export([run/2, replay/3, spawn_op/1]).
+-export([run/2, replay/3, spawn_op/1, preload/1]).
 
 %% Reading a result. See `summary/1` and `audit/1`.
 -export([summary/1, audit/1]).
@@ -98,7 +98,7 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
     %% What the simulated network did, or `#{}` when none was installed. See
     %% `eta_net:stats/0`; `dropped` is what a non-vacuity guard asserts on.
     net := #{atom() => non_neg_integer()},
-    sched := #{atom() => non_neg_integer()}
+    sched := #{atom() => term()}
 }.
 
 -type fixture() :: #{
@@ -228,11 +228,28 @@ client touches: 5 operations, **5 steps**, nothing exited, `outcome => ok`. A
 healthy run of the same workload takes around a hundred steps.
 
 `modules_loaded` does not catch that one, because the loads complete after the
-run has finished. Nothing catches it. It is the reason `preload` defaults to
-loading `kernel`, `stdlib` and `eta` rather than waiting to be asked, and the
-reason to name your own application there even when runs look fine.
+run has finished — there is nothing to report by the time the run is over. It is
+the reason `preload` defaults to loading `kernel`, `stdlib` and `eta` rather than
+waiting to be asked, and the reason to name your own application there even when
+runs look fine.
 
-A run that ends far too early with `ok` and nothing exited is the symptom.
+`sched.cold_code` does catch it, from the other side. The scheduler looks once,
+at the moment a run finds nothing runnable and is about to return, for a process
+parked inside the code server's own `call` function — which is where a process
+waiting on the code server always is, since that function is a send followed by a
+one-clause receive. Each entry names the process and the frame that reached the
+cold module:
+
+```erlang
+#{sched := #{cold_code := [#{id := 3, pid := _, at := {my_client, commit, 2}}]}}
+```
+
+so the symptom is no longer "a run that ended far too early with `ok`" and a
+hunch, but a name and a line. A warning is logged too, because a run this
+damaged is worth noticing without being asked.
+
+This does not make `preload` optional. Detection is after the fact: the run is
+already spoiled, and all `cold_code` buys you is knowing rather than guessing.
 
 `audit/1` checks these for you, and keeps checking them as more are added:
 
@@ -338,6 +355,10 @@ knowing as more are added, this checks them:
 
 - `modules_loaded` — code loaded mid-run, so a scheduled process made a
   synchronous call into `code_server`. Fix with `preload`.
+- `sched.cold_code` — the other half of that: a process still *waiting* on the
+  code server when the run ended, so the run's quiescence was a lie and the load
+  finished too late to be in `modules_loaded` at all. Same fix, and each entry
+  names the line that reached the cold module.
 - `sched.adopted_late` — processes that ran before the scheduler owned them.
   Fix by spawning through `eta_run:spawn_op/1` and `eta_sched:spawn/1`.
 - `sched.timeouts` — steps that ended without the process reaching a receive,
@@ -358,6 +379,9 @@ audit(Result = #{modules_loaded := Modules, sched := Sched}) ->
         {modules_loaded, Modules, []},
         {adopted_late, maps:get(adopted_late, Sched, 0), 0},
         {timeouts, maps:get(timeouts, Sched, 0), 0},
+        %% The half of the cold-code problem `modules_loaded` cannot see: a load
+        %% that had not finished when the run did. See `eta_sched:stats/1`.
+        {cold_code, maps:get(cold_code, Sched, []), []},
         {stray_timers, maps:get(stray_timers, Result, 0), 0},
         %% A message that drew a delay with no clock to hang it on was delivered
         %% immediately, so the network was quieter than its policy said. Not a
@@ -594,6 +618,24 @@ start_net(Opts, Seed) when is_map(Opts) ->
 %% not an application, so it cannot infer what to load, and loading every module
 %% of every loaded application would drag in Mix, ExUnit and the whole of OTP,
 %% firing any `-on_load` functions they carry.
+-if(?DOCATTRS).
+-doc """
+Load every module of the named applications, plus `kernel`, `stdlib` and `eta`.
+
+`run/2` does this for you from its `preload` option; it is exported for code that
+drives `eta_sched` directly, which is otherwise in exactly the position a run with
+`preload => false` is in — and which has no `modules_loaded` to report the damage
+afterwards.
+
+Call it once, before there is a scheduler to be outside of. `false` is accepted
+and does nothing, so the option value can be passed straight through.
+
+    setup_all do
+      :ok = :eta_run.preload([:my_app])
+    end
+""".
+-endif.
+-spec preload([atom()] | false) -> ok.
 preload(false) ->
     ok;
 preload(Apps) when is_list(Apps) ->

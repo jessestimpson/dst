@@ -128,6 +128,13 @@ releasing, not after.
   the scheduler keeps waiting while the process is alive and not suspended, since
   the event is then in flight. Only a process that is dead, or that did not resume
   at all, ends a step this way in practice.
+- **Cold code.** A process that reaches a module it has not loaded yet makes a
+  synchronous call into `code_server`, which this scheduler does not own. From
+  here that is indistinguishable from a process blocked in a receive, so if it is
+  the last thing standing the run ends at what looks exactly like quiescence,
+  having done a fraction of the work, and reports success. `stats/1`'s
+  `cold_code` names the processes caught doing it and the line each was on; it
+  should be `[]`, and the fix is `eta_run:preload/1`.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -194,9 +201,20 @@ releasing, not after.
     gated/5
 ]).
 
+%% The same for `gen_statem`. Separate entry points rather than a behaviour
+%% argument, because the two differ in every step after the token: `init/1`
+%% returns a different shape, and the loop is entered through a different
+%% function. See `statem_start_link/3`.
+-export([
+    statem_start_monitor/3, statem_start_monitor/4,
+    statem_start_link/3, statem_start_link/4,
+    statem_start/3, statem_start/4,
+    statem_gated/5
+]).
+
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--export_type([sched/0, id/0, outcome/0]).
+-export_type([sched/0, id/0, outcome/0, cold/0]).
 
 %% `running` gives the in/out scheduling events quiescence is detected from.
 %% `send` lets a step count self-sends, the correction term consumption needs.
@@ -241,6 +259,17 @@ releasing, not after.
 -type outcome() :: progress | no_progress | exited.
 -opaque sched() :: {eta_sched, pid()}.
 
+%% One process caught waiting on the code server at quiescence. `at` is the
+%% frame in the system under test that reached the cold module, which is the fact
+%% that tells you what to preload.
+%%
+%% `undefined` when there is no such frame to read, which is not rare and is
+%% worth knowing about: a **tail call** into a cold module leaves nothing on the
+%% stack but the loading machinery itself. The `pid` is still the answer then —
+%% `erlang:process_info(Pid, initial_call)` and the process's own label say who
+%% it is, and the application it belongs to is the one to preload.
+-type cold() :: #{id := id(), pid := pid(), at := mfa() | undefined}.
+
 -record(st, {
     rand :: rand:state(),
     %% id => pid, and the reverse. Ids are stable across runs (assignment order is
@@ -259,6 +288,9 @@ releasing, not after.
     %% Steps that ended without the process reaching a receive. See
     %% `note_quiescence/5`; any nonzero value means the run is not replayable.
     timeouts = 0 :: non_neg_integer(),
+    %% Processes found parked in `code_server` at the moment a run gave up. See
+    %% `note_cold_code/1`; any entry means the run's quiescence was a lie.
+    cold_code = [] :: [cold()],
     steps = 0 :: non_neg_integer()
 }).
 
@@ -411,7 +443,9 @@ only genuinely ungated children.
 
 The child is spawned by MFA rather than as a fun so that the spawn trace event
 carries `{eta_sched, gated, _}` — that is how the scheduler tells a gated child from
-one it must chase.
+one it must chase. `gated_plib` and `statem_gated` are recognised the same way;
+adding a gated entry point means adding it to `is_gated/1` and to `handle_trace/2`
+as well, or its children wait on a token nobody sends.
 
 Inert with no scheduler running, exactly as `eta_time` is with no clock, so a
 transformed module behaves normally outside a simulation.
@@ -734,15 +768,83 @@ start(Name, Mod, Args, Options) ->
         true -> gated_start(Name, Mod, Args, plain)
     end.
 
+-if(?DOCATTRS).
+-doc """
+`gen_statem:start_link/3` for a system under simulation — the `gen_statem` half
+of `start_link/3`, on the same terms and for the same reasons.
+
+The child is gated identically: it waits for the scheduler's token, sets the two
+process-dictionary entries `proc_lib` would have set, registers its name, runs
+`init/1` itself, acknowledges, and then becomes the state machine through
+`gen_statem:enter_loop/6` — which is the same `enter/8` `gen_statem`'s own
+`init_it/6` converges on, so the callback mode is read and the initial state
+enter call is made exactly as in a real start.
+
+`init/1` returning `{ok, State, Data}` and `{ok, State, Data, Actions}` is
+covered, along with `{stop, Reason}` and `ignore`. Anything else raises rather
+than being guessed at.
+
+Inert with no scheduler running: delegates straight to `gen_statem`.
+""".
+-endif.
+-spec statem_start_monitor(module(), term(), list()) ->
+    {ok, {pid(), reference()}} | ignore | {error, term()}.
+statem_start_monitor(Mod, Args, Options) ->
+    case active() of
+        false -> gen_statem:start_monitor(Mod, Args, Options);
+        true -> gated_start(undefined, Mod, Args, monitor, statem_gated)
+    end.
+
+-spec statem_start_link(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
+statem_start_link(Mod, Args, Options) ->
+    case active() of
+        false -> gen_statem:start_link(Mod, Args, Options);
+        true -> gated_start(undefined, Mod, Args, link, statem_gated)
+    end.
+
+-spec statem_start(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
+statem_start(Mod, Args, Options) ->
+    case active() of
+        false -> gen_statem:start(Mod, Args, Options);
+        true -> gated_start(undefined, Mod, Args, plain, statem_gated)
+    end.
+
+-spec statem_start_monitor(gen_statem:server_name(), module(), term(), list()) ->
+    {ok, {pid(), reference()}} | ignore | {error, term()}.
+statem_start_monitor(Name, Mod, Args, Options) ->
+    case active() of
+        false -> gen_statem:start_monitor(Name, Mod, Args, Options);
+        true -> gated_start(Name, Mod, Args, monitor, statem_gated)
+    end.
+
+-spec statem_start_link(gen_statem:server_name(), module(), term(), list()) ->
+    {ok, pid()} | ignore | {error, term()}.
+statem_start_link(Name, Mod, Args, Options) ->
+    case active() of
+        false -> gen_statem:start_link(Name, Mod, Args, Options);
+        true -> gated_start(Name, Mod, Args, link, statem_gated)
+    end.
+
+-spec statem_start(gen_statem:server_name(), module(), term(), list()) ->
+    {ok, pid()} | ignore | {error, term()}.
+statem_start(Name, Mod, Args, Options) ->
+    case active() of
+        false -> gen_statem:start(Name, Mod, Args, Options);
+        true -> gated_start(Name, Mod, Args, plain, statem_gated)
+    end.
+
 gated_start(Name, Mod, Args, Kind) ->
+    gated_start(Name, Mod, Args, Kind, gated).
+
+gated_start(Name, Mod, Args, Kind, Entry) ->
     Parent = self(),
     Ancestors = [Parent | own_ancestors()],
     MFA = [Parent, Ancestors, Name, Mod, Args],
     {Pid, Ref} =
         case Kind of
-            monitor -> erlang:spawn_monitor(?MODULE, gated, MFA);
-            link -> {erlang:spawn_link(?MODULE, gated, MFA), undefined};
-            plain -> {erlang:spawn(?MODULE, gated, MFA), undefined}
+            monitor -> erlang:spawn_monitor(?MODULE, Entry, MFA);
+            link -> {erlang:spawn_link(?MODULE, Entry, MFA), undefined};
+            plain -> {erlang:spawn(?MODULE, Entry, MFA), undefined}
         end,
     await_start(Pid, Ref, Kind).
 
@@ -836,6 +938,48 @@ gated_continue(Mod, Name, C, State) ->
         {stop, Reason, _State1} -> exit(Reason)
     end.
 
+-if(?DOCATTRS).
+-doc false.
+-endif.
+statem_gated(Parent, Ancestors, Name, Mod, Args) ->
+    _ = wait_for_token(),
+    put('$ancestors', Ancestors),
+    put('$initial_call', {Mod, init, 1}),
+    case register_name(Name) of
+        ok ->
+            statem_gated_init(Parent, Name, Mod, Args);
+        {error, _} = Err ->
+            Parent ! {'$eta_started', self(), Err},
+            exit(normal)
+    end.
+
+statem_gated_init(Parent, Name, Mod, Args) ->
+    case Mod:init(Args) of
+        {ok, State, Data} ->
+            Parent ! {'$eta_started', self(), {ok, self()}},
+            statem_enter_loop(Mod, Name, State, Data, []);
+        {ok, State, Data, Actions} ->
+            Parent ! {'$eta_started', self(), {ok, self()}},
+            statem_enter_loop(Mod, Name, State, Data, Actions);
+        {stop, Reason} ->
+            Parent ! {'$eta_started', self(), {error, Reason}},
+            exit(Reason);
+        ignore ->
+            Parent ! {'$eta_started', self(), ignore},
+            exit(normal);
+        Other ->
+            Parent ! {'$eta_started', self(), {error, {eta_sched, unsupported_init, Other}}},
+            exit({eta_sched, unsupported_init, Other})
+    end.
+
+%% `enter_loop/6` rather than the shorter forms, because `Server` and `Actions`
+%% are both being passed and the 5-arity one has to guess between them. An
+%% anonymous machine names itself, which is what `gen_statem:enter_loop/4` does.
+statem_enter_loop(Mod, undefined, State, Data, Actions) ->
+    gen_statem:enter_loop(Mod, [], State, Data, self(), Actions);
+statem_enter_loop(Mod, Name, State, Data, Actions) ->
+    gen_statem:enter_loop(Mod, [], State, Data, Name, Actions).
+
 own_ancestors() ->
     case get('$ancestors') of
         undefined -> [];
@@ -881,14 +1025,29 @@ runnable(S) ->
 -if(?DOCATTRS).
 -doc """
 Run statistics: steps taken, processes known, how many have exited, how many
-children were adopted after they had already started running, and how many steps
-ended without the process reaching a receive.
+children were adopted after they had already started running, how many steps
+ended without the process reaching a receive, and any process caught waiting on
+the code server at the moment a run gave up.
 
-`adopted_late` and `timeouts` are both determinism failures and both should be
-0. See the module doc's determinism boundary.
+`adopted_late`, `timeouts` and `cold_code` are all determinism failures, and
+should read `0`, `0` and `[]`. See the module doc's determinism boundary.
+
+`cold_code` is a list of `t:cold/0` — the process, and the frame in the system
+under test that reached a module it had not loaded yet:
+
+```erlang
+#{cold_code := [#{id := 3, pid := Pid, at := {my_client, commit, 2}}]} =
+    eta_sched:stats(Sched).
+```
+
+A non-empty list means the run's quiescence was a lie: at least one process was
+about to be woken by the code server rather than by anything the schedule chose,
+so a run that ended here ended early and everything after this point is wall
+clock. The fix is `eta_run:preload/1`, and `at` names the application to give
+it. See `note_cold_code/1`.
 """.
 -endif.
--spec stats(sched()) -> #{atom() => non_neg_integer()}.
+-spec stats(sched()) -> #{atom() => term()}.
 stats(S) ->
     call(S, stats).
 
@@ -1026,14 +1185,16 @@ handle_call(stats, _From, St) ->
         procs = Procs,
         exited = Exited,
         adopted_late = Late,
-        timeouts = Timeouts
+        timeouts = Timeouts,
+        cold_code = Cold
     } = St,
     Reply = #{
         steps => Steps,
         processes => maps:size(Procs),
         exited => maps:size(Exited),
         adopted_late => Late,
-        timeouts => Timeouts
+        timeouts => Timeouts,
+        cold_code => Cold
     },
     {reply, Reply, St};
 handle_call({step, Id}, _From, St) ->
@@ -1118,6 +1279,7 @@ is_gated(Pid) ->
     case erlang:process_info(Pid, initial_call) of
         {initial_call, {?MODULE, gated, _}} -> true;
         {initial_call, {?MODULE, gated_plib, _}} -> true;
+        {initial_call, {?MODULE, statem_gated, _}} -> true;
         _ -> false
     end.
 
@@ -1284,6 +1446,78 @@ note_quiescence(St = #st{timeouts = Timeouts}, _Id, Pid, timeout, _QueueAfter) -
     ),
     St#st{timeouts = Timeouts + 1}.
 
+%% Called at the one moment it can be called: a run has found nothing runnable
+%% and its idle hook has declined to move the clock, so it is about to return —
+%% believing the system quiescent.
+%%
+%% A process waiting on `code_server` is, from here, indistinguishable from one
+%% blocked in a receive. It is not runnable, it holds no timer, and if it is the
+%% last thing standing then the run ends at what looks exactly like quiescence,
+%% having done a fraction of the work, and reports success. `eta_run`'s
+%% `modules_loaded` does not catch it either: the load completes after the run
+%% has finished, so nothing is recorded against the run at all.
+%%
+%% It is catchable because it has a signature. `code_server:call/1` is a send
+%% followed by a receive with one clause, so a process blocked there is blocked
+%% *in that function*, and `current_function` says so. That is one
+%% `process_info/2` per owned process, once per `run/3` call, on the path where
+%% the run is ending anyway.
+%%
+%% Recorded rather than raised. The run happened, its violation (if any) is
+%% real, and the caller decides — which is the same position `audit/1` takes on
+%% every other wall-clock leak. See `stats/1`.
+-spec note_cold_code(#st{}) -> #st{}.
+note_cold_code(St = #st{procs = Procs, exited = Exited, cold_code = Cold}) ->
+    Found = [
+        cold_entry(Id, Pid)
+     || {Id, Pid} <- lists:sort(maps:to_list(Procs)),
+        not maps:is_key(Id, Exited),
+        in_code_server(Pid)
+    ],
+    case Found -- Cold of
+        [] ->
+            St;
+        New ->
+            logger:warning(
+                "eta_sched: the run ended with ~w process(es) waiting on code_server, so "
+                "what looked like quiescence was not. The interleaving from here is wall "
+                "clock. Preload the application: ~p",
+                [length(New), New]
+            ),
+            St#st{cold_code = Cold ++ New}
+    end.
+
+%% `current_function` rather than the stack, because it is the cheap read and the
+%% one that cannot be ambiguous: `code_server:call/1` has a single receive in it.
+in_code_server(Pid) ->
+    case erlang:process_info(Pid, current_function) of
+        {current_function, {code_server, call, 1}} -> true;
+        _ -> false
+    end.
+
+cold_entry(Id, Pid) ->
+    At =
+        case erlang:process_info(Pid, current_stacktrace) of
+            {current_stacktrace, Stack} -> cold_site(Stack);
+            undefined -> undefined
+        end,
+    #{id => Id, pid => Pid, at => At}.
+
+%% The first frame that is not the loading machinery itself, which is the line in
+%% the system under test that reached a module it had not touched. Both routes in
+%% are covered: the implicit one through `error_handler:undefined_function/3`,
+%% and an explicit `code:ensure_loaded/1` — which is worth naming separately,
+%% because it goes to the code server *every time* for a module that is not
+%% there to be found.
+cold_site([{M, _F, _A, _Loc} | Rest]) when
+    M =:= code_server; M =:= code; M =:= error_handler; M =:= erl_prim_loader
+->
+    cold_site(Rest);
+cold_site([{M, F, A, _Loc} | _]) ->
+    {M, F, A};
+cold_site(_) ->
+    undefined.
+
 %% Wait for the process to run and then block again.  See the module doc on why
 %% the `in` event must be awaited before status is trusted.
 %%
@@ -1400,7 +1634,7 @@ do_drain(St, Pid, Ref, SelfSends) ->
 %% has not run.
 handle_trace(
     St = #st{ids = Ids, gated = Gated}, {trace, Parent, spawn, Child, {?MODULE, F, _}}
-) when F =:= gated; F =:= gated_plib ->
+) when F =:= gated; F =:= gated_plib; F =:= statem_gated ->
     %% A child belongs wherever its parent does. `eta_net` is inert if no network
     %% is running, and a no-op if the parent was never placed — see
     %% `eta_net:place/2` for why a topology that does not follow spawning is a
@@ -1474,7 +1708,7 @@ do_run(St, MaxSteps, OnIdle) ->
         [] ->
             case OnIdle() of
                 true -> do_run(St, MaxSteps - 1, OnIdle);
-                false -> St
+                false -> note_cold_code(St)
             end;
         Ids ->
             {I, Rand} = rand:uniform_s(length(Ids), St#st.rand),

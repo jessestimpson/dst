@@ -24,8 +24,8 @@ controlled by attributes rather than by naming another transform:
    Applied unless the module declares `-eta_after(false)`; see below.
 4. **State observability** — applied only to a module declaring
    `-eta_observe(all)` or `-eta_observe({Record, Fields})`, which republishes the
-   state on every `gen_server` callback return so a simulation can read it while
-   the process is suspended. See `eta_observe`.
+   state on every `gen_server` or `gen_statem` callback return so a simulation can
+   read it while the process is suspended. See `eta_observe`.
 
 They live here rather than in modules of their own for a build reason, and it is
 worth recording because it cost a broken CI run to find. **Mix does not reliably
@@ -139,6 +139,7 @@ The network pass rewrites, unless the module declares `-eta_net(false)`:
 | `gen_server:cast/2` | `eta_net:cast/2` |
 | `gen_statem:cast/2` | `eta_net:cast/2` |
 | `gen_server:reply/2` | `eta_net:reply/2` |
+| `gen_statem:reply/1,2` | `eta_net:reply/1,2` |
 | `erlang:monitor/2,3` | `eta_net:monitor/2,3` |
 | `erlang:demonitor/1,2` | `eta_net:demonitor/1,2` |
 
@@ -163,13 +164,30 @@ can be faulted later: routing has to be uniform per channel, because a direct
 send can overtake a delayed one, and module-granular rewriting is what makes that
 safe. See `eta_net`.
 
-`gen_server:call/2,3` is rewritten to `eta_net:call/2,3`, which routes the
-request. The **reply** leg is reached from the other end: in a module declaring
-`-behaviour(gen_server)`, every `handle_call/3` clause is wrapped so a
-`{reply, R, S}` return becomes a routed `eta_net:reply(From, R)` and a
-`{noreply, S}`. Both legs are then ordinary network traffic and can be faulted
-independently — which is what makes "the work happened, the caller never learned
-it did" a reachable state. See `eta_net:call/3`.
+`gen_server:call/2,3` and `gen_statem:call/2,3` are both rewritten to
+`eta_net:call/2,3`, which routes the request. The **reply** leg is reached from
+the other end, and how depends on the behaviour:
+
+- In a module declaring `-behaviour(gen_server)`, every `handle_call/3` clause is
+  wrapped so a `{reply, R, S}` return becomes a routed `eta_net:reply(From, R)`
+  and a `{noreply, S}`.
+- In a module declaring `-behaviour(gen_statem)`, every state callback is wrapped
+  so a `{reply, From, R}` action in the returned action list is sent through
+  `eta_net:reply/2` and removed from the list. See `eta_net:statem_return/1`.
+
+Both legs are then ordinary network traffic and can be faulted independently —
+which is what makes "the work happened, the caller never learned it did" a
+reachable state. See `eta_net:call/3`.
+
+`gen_statem`'s starts are gated like `gen_server`'s, through
+`eta_sched:statem_start_link/3` and friends.
+
+**What `gen_statem` support does not include.** The asynchronous
+`send_request`/`wait_response` interface, and any state-machine feature whose
+behaviour under simulation has not been established — state time-outs and
+`hibernate` in particular. `init/1` returning something other than
+`{ok, State, Data}` or `{ok, State, Data, Actions}` is refused by
+`eta_sched:statem_start_link/3` rather than guessed at.
 
 ## What raises rather than being rewritten
 
@@ -179,13 +197,15 @@ discoverable by using it instead of by reading a table.
 | | when |
 |---|---|
 | `gen_server:abcast`, `multi_call`, `send_request`/`wait_response`/`receive_response`/`check_response` | at run time, while a network is running |
-| every client-side function of `gen_statem` and `gen_event` except `gen_statem:cast/2` | the same |
-| a module declaring `-behaviour(gen_statem)` or `-behaviour(gen_event)` | at **compile** time |
+| `gen_statem`'s `send_request`/`wait_response`/`receive_response`/`check_response` | the same |
+| every client-side function of `gen_event` | the same |
+| a module declaring `-behaviour(gen_event)` | at **compile** time |
 
-The last one is a property of the module rather than of a code path: those
-behaviours reply from inside OTP rather than from a `handle_call` return, so
-every call answered by such a module would come around the network, in every run.
-`-eta_net(false).` opts the module out of this pass and keeps the rest.
+The last one is a property of the module rather than of a code path: a handler's
+reply is produced inside the event manager, which is neither the module this
+transform rewrote nor a process it can reach — so every call answered by such a
+module would come around the network, in every run. `-eta_net(false).` opts the
+module out of this pass and keeps the rest.
 
 The runtime ones are runtime because a module may hold one on a path no
 simulation reaches, and refusing to compile it would block adoption over code the
@@ -307,7 +327,17 @@ it would hide that rather than surface it.
     {gen_server, start_link, 3} => eta_sched,
     {gen_server, start_link, 4} => eta_sched,
     {gen_server, start, 3} => eta_sched,
-    {gen_server, start, 4} => eta_sched
+    {gen_server, start, 4} => eta_sched,
+    %% `gen_statem` starts its child through the same `gen:do_spawn/5`, so it
+    %% needs the same treatment. Separate targets rather than shared ones,
+    %% because the gated child has to run the right `init/1` shape and enter the
+    %% right loop. See `eta_sched:statem_start_link/3`.
+    {gen_statem, start_monitor, 3} => {eta_sched, statem_start_monitor},
+    {gen_statem, start_monitor, 4} => {eta_sched, statem_start_monitor},
+    {gen_statem, start_link, 3} => {eta_sched, statem_start_link},
+    {gen_statem, start_link, 4} => {eta_sched, statem_start_link},
+    {gen_statem, start, 3} => {eta_sched, statem_start},
+    {gen_statem, start, 4} => {eta_sched, statem_start}
 }).
 
 -if(?DOCATTRS).
@@ -406,6 +436,10 @@ rewrite(Node, _Locals) ->
     {gen_server, cast, 2} => {eta_net, cast},
     {gen_statem, cast, 2} => {eta_net, cast},
     {gen_server, reply, 2} => {eta_net, reply},
+    %% `gen_statem:reply/2` is `gen_server:reply/2` under another name.
+    %% `reply/1` is the list-or-single form, and gets its own target.
+    {gen_statem, reply, 1} => {eta_net, reply},
+    {gen_statem, reply, 2} => {eta_net, reply},
     %% Monitors. A partition has to fire the `noconnection` DOWNs real
     %% distribution would, and a monitor is created by a BIF inside the system
     %% under test — so the only way this module can know one exists is to be the
@@ -423,7 +457,12 @@ rewrite(Node, _Locals) ->
     %% the pair half-covered, and a reply that goes around the network can
     %% overtake a message that went through it. See `eta_net:call/3`.
     {gen_server, call, 2} => {eta_net, call},
-    {gen_server, call, 3} => {eta_net, call}
+    {gen_server, call, 3} => {eta_net, call},
+    %% The same request on the wire, so the same target. The reply leg comes back
+    %% through `statem_return_pass/1` below rather than through
+    %% `handle_call_pass/1`.
+    {gen_statem, call, 2} => {eta_net, call},
+    {gen_statem, call, 3} => {eta_net, call}
 }).
 
 %% Client-side messaging `eta_net` does not implement yet.
@@ -439,9 +478,8 @@ rewrite(Node, _Locals) ->
 %% would block adoption over code the run never executes.
 %%
 %% What is *not* here is as much of a statement as what is: `call/2,3`, `cast/2`
-%% and `reply/2` on `gen_server` are supported, and `gen_statem:cast/2` is too —
-%% a cast is a message whatever answers it. Everything else in these three
-%% interfaces is a gap with a name.
+%% and `reply/1,2` are supported on both `gen_server` and `gen_statem`.
+%% Everything else in these three interfaces is a gap with a name.
 -define(NET_UNSUPPORTED, [
     %% Broadcasts and multi-node calls: distribution, which `eta` does not
     %% simulate at all.
@@ -463,11 +501,10 @@ rewrite(Node, _Locals) ->
     {gen_server, receive_response, 3},
     {gen_server, check_response, 2},
     {gen_server, check_response, 3},
-    %% `gen_statem` replies from inside its own action handling rather than from a
-    %% `handle_call` return, so nothing here can bring that leg onto the network
-    %% yet. See `statem_unsupported/1`.
-    {gen_statem, call, 2},
-    {gen_statem, call, 3},
+    %% `gen_statem:call/2,3` is *not* here: its reply leg is brought onto the
+    %% network by `statem_return_pass/1`, the same way `handle_call_pass/1` does
+    %% it for `gen_server`. What remains is the asynchronous interface, which has
+    %% the same `ReqId` problem as `gen_server`'s.
     {gen_statem, send_request, 2},
     {gen_statem, send_request, 4},
     {gen_statem, wait_response, 1},
@@ -504,41 +541,46 @@ net_pass(Forms, Locals) ->
         false ->
             Forms;
         true ->
-            ok = statem_unsupported(Forms),
-            handle_call_pass(net_walk(Forms, Locals))
+            ok = behaviour_unsupported(Forms),
+            statem_return_pass(handle_call_pass(net_walk(Forms, Locals)))
     end.
 
-%% A `gen_statem` or `gen_event` module cannot have its replies put on the
-%% network, so it is refused at **compile time** rather than at run time.
+%% A `gen_event` module cannot have its replies put on the network, so it is
+%% refused at **compile time** rather than at run time.
 %%
 %% The difference from `?NET_UNSUPPORTED` is that this is a property of the module
-%% rather than of a code path. A `gen_statem` does not reply from a `handle_call`
-%% return — it replies from a `{reply, From, Msg}` action handled inside
-%% `gen_statem` itself, where `handle_call_pass/1` cannot reach. So *every* call
-%% answered by this module would come around the network, and there is no run in
-%% which that is not true. A runtime raise would report it once per call site
-%% instead of once, and only for the paths a run happened to take.
+%% rather than of a code path. A handler's reply to `gen_event:call/3` is produced
+%% inside the event manager — a process this transform never sees, running a
+%% module it never rewrites — so *every* call answered by this module would come
+%% around the network, and there is no run in which that is not true. A runtime
+%% raise would report it once per call site instead of once, and only for the
+%% paths a run happened to take.
+%%
+%% `gen_statem` used to be refused here too, on the grounds that it replies from
+%% inside its own action handling rather than from a `handle_call` return. That
+%% is true and it is not an obstacle: the action naming the caller is in the value
+%% the callback *returns*, so `statem_return_pass/1` can take it out and route it
+%% before `gen_statem` ever sees it. A `gen_event` handler has no such seam.
 %%
 %% `-eta_net(false).` is the opt-out, and it is a real one: the module keeps timer,
 %% clock and spawn rewriting and simply takes no part in the network. That is the
-%% right answer for a state machine that is not a peer.
-statem_unsupported(Forms) ->
-    case behaviours(Forms) -- [gen_server, supervisor] of
-        [] ->
+%% right answer for an event manager that is not a peer.
+behaviour_unsupported(Forms) ->
+    case lists:member(gen_event, behaviours(Forms)) of
+        false ->
             ok;
-        [B | _] when B =:= gen_statem; B =:= gen_event ->
+        true ->
             error(
                 {eta_net,
-                    {behaviour_unsupported, B, <<
+                    {behaviour_unsupported, gen_event, <<
                         "eta_net cannot route this behaviour's replies: they are sent "
-                        "from inside OTP rather than from a handle_call return, so a "
-                        "call answered here would always come around the network. Add "
-                        "`-eta_net(false).` to keep this module out of the network pass "
-                        "(timer, clock and spawn rewriting are unaffected)"
+                        "from inside the event manager rather than from anything this "
+                        "transform rewrites, so a call answered here would always come "
+                        "around the network. Add `-eta_net(false).` to keep this module "
+                        "out of the network pass (timer, clock and spawn rewriting are "
+                        "unaffected)"
                     >>}}
-            );
-        _ ->
-            ok
+            )
     end.
 
 behaviours(Forms) ->
@@ -631,6 +673,113 @@ reply_fun(Anno) ->
     {function, Anno, ?REPLY_FUN, 2, [
         {clause, Anno, [From, Ret], [], [{'case', Anno, Ret, Clauses}]}
     ]}.
+
+%% ---------------------------------------------------------------------------
+%% The `gen_statem` reply pass
+%% ---------------------------------------------------------------------------
+
+%% The `gen_statem` counterpart of `handle_call_pass/1`, and the same job: get the
+%% reply leg of a call onto the network so it can be faulted apart from the
+%% request.
+%%
+%% Where a `gen_server` returns `{reply, R, S}` and leaves OTP to work out who
+%% asked, a `gen_statem` says so itself — the reply is a `{reply, From, Msg}`
+%% action in the value the callback returns. That makes the rewrite simpler than
+%% the `gen_server` one rather than harder: nothing from the clause head is
+%% needed, so there is no generated per-module helper. The body is passed to
+%% `eta_net:statem_return/1`, which sends each reply action and takes it out of
+%% the list:
+%%
+%%     handle_event(T, C, S, D) -> eta_net:statem_return(begin OriginalBody end).
+%%
+%% Inspecting the value at runtime rather than the `{reply, ...}` literals in the
+%% source is the same choice `handle_call_pass/1` and the observability pass make,
+%% for the same reason: a callback that builds its actions in a helper has no
+%% literal here to rewrite.
+%%
+%% ## Which functions are wrapped
+%%
+%% Whichever ones `gen_statem` will call, which depends on the callback mode:
+%% `handle_event/4` in `handle_event_function` mode, and every state function in
+%% `state_functions` mode. A state function is named by the state, so there is no
+%% fixed list — but `gen_statem` invokes it as `Module:StateName/3`, so it must be
+%% **exported**, and that is the filter used. `terminate/3` is the one exported
+%% arity-3 name that is a callback and not a state, so it is excluded by name.
+%%
+%% The mode is read from a literal `callback_mode/0`, which is how essentially
+%% every module writes it. A module that computes it gets both sets wrapped,
+%% which is the safe direction: `eta_net:statem_return/1` returns anything it does
+%% not recognise untouched, and it is idempotent, so wrapping a function that
+%% turns out not to be a callback costs a function call.
+statem_return_pass(Forms) ->
+    case lists:member(gen_statem, behaviours(Forms)) of
+        false ->
+            Forms;
+        true ->
+            Callbacks = statem_callbacks(Forms),
+            [wrap_statem(F, Callbacks) || F <- Forms]
+    end.
+
+wrap_statem({function, Anno, Name, Arity, Clauses}, Callbacks) ->
+    case sets:is_element({Name, Arity}, Callbacks) of
+        true -> {function, Anno, Name, Arity, [wrap_statem_clause(C) || C <- Clauses]};
+        false -> {function, Anno, Name, Arity, Clauses}
+    end;
+wrap_statem(Form, _Callbacks) ->
+    Form.
+
+wrap_statem_clause({clause, Anno, Pats, Guards, Body}) ->
+    Call =
+        {call, Anno, {remote, Anno, {atom, Anno, eta_net}, {atom, Anno, statem_return}}, [
+            {block, Anno, Body}
+        ]},
+    {clause, Anno, Pats, Guards, [Call]}.
+
+%% Every `{Name, Arity}` `gen_statem` may call as a state callback. Shared with
+%% the observability pass, which needs the same set for the same reason.
+statem_callbacks(Forms) ->
+    Exported = exported(Forms),
+    HandleEvent = sets:from_list([{handle_event, 4}]),
+    States = sets:from_list([
+        {N, 3}
+     || {N, 3} <- sets:to_list(Exported), N =/= terminate
+    ]),
+    case statem_callback_mode(Forms) of
+        handle_event_function -> sets:intersection(Exported, HandleEvent);
+        state_functions -> States;
+        unknown -> sets:union(States, sets:intersection(Exported, HandleEvent))
+    end.
+
+%% Only a literal is read. `callback_mode() -> state_functions.` and
+%% `callback_mode() -> [handle_event_function, state_enter].` both resolve;
+%% anything computed is `unknown`.
+statem_callback_mode(Forms) ->
+    case [Cs || {function, _, callback_mode, 0, Cs} <- Forms] of
+        [[{clause, _, [], [], [Body]}]] -> mode_of(Body);
+        _ -> unknown
+    end.
+
+mode_of({atom, _, state_functions}) ->
+    state_functions;
+mode_of({atom, _, handle_event_function}) ->
+    handle_event_function;
+mode_of({cons, _, H, T}) ->
+    case mode_of(H) of
+        unknown -> mode_of(T);
+        Mode -> Mode
+    end;
+mode_of(_) ->
+    unknown.
+
+exported(Forms) ->
+    case lists:any(fun is_export_all/1, Forms) of
+        true -> local_functions(Forms);
+        false -> sets:from_list(lists:append([FAs || {attribute, _, export, FAs} <- Forms]))
+    end.
+
+is_export_all({attribute, _, compile, export_all}) -> true;
+is_export_all({attribute, _, compile, Opts}) when is_list(Opts) -> lists:member(export_all, Opts);
+is_export_all(_) -> false.
 
 net_enabled([{attribute, _, eta_net, false} | _]) -> false;
 net_enabled([_ | Rest]) -> net_enabled(Rest);
@@ -814,7 +963,7 @@ after_call(Anno, Mod, Fun, Args) ->
 %% Observability pass — applied only to a module declaring `-eta_observe(...)`
 %% ---------------------------------------------------------------------------
 
-%% The callbacks whose return value carries the state.
+%% The `gen_server` callbacks whose return value carries the state.
 -define(WRAPPED, [
     {init, 1},
     {handle_call, 3},
@@ -836,8 +985,22 @@ observe_pass(Forms) ->
         Spec ->
             {Record, Fields} = resolve(Spec, records(Forms)),
             Anno = erl_anno:new(0),
-            Wrapped = [wrap(F) || F <- Forms],
-            insert_before_eof(Wrapped, helpers(Anno, Record, Fields))
+            {Callbacks, Shapes} = observe_target(Forms),
+            Wrapped = [wrap(F, Callbacks) || F <- Forms],
+            insert_before_eof(Wrapped, helpers(Anno, Shapes, Record, Fields))
+    end.
+
+%% Which callbacks to republish from, and which return shapes carry the state.
+%%
+%% For a `gen_statem` the observed term is the **data**, not the state name: the
+%% state name is one atom a run can read off the trace, and the data is what an
+%% invariant is actually about. The callbacks are the same set the reply pass
+%% wraps, plus `init/1` — a machine that publishes nothing until its first event
+%% is one an invariant cannot check at step zero.
+observe_target(Forms) ->
+    case lists:member(gen_statem, behaviours(Forms)) of
+        true -> {sets:add_element({init, 1}, statem_callbacks(Forms)), statem};
+        false -> {sets:from_list(?WRAPPED), server}
     end.
 
 %% ---------------------------------------------------------------------------
@@ -902,12 +1065,12 @@ index_of(F, [_ | Rest], N) -> index_of(F, Rest, N + 1).
 %% Rewriting
 %% ---------------------------------------------------------------------------
 
-wrap({function, Anno, Name, Arity, Clauses}) ->
-    case lists:member({Name, Arity}, ?WRAPPED) of
+wrap({function, Anno, Name, Arity, Clauses}, Callbacks) ->
+    case sets:is_element({Name, Arity}, Callbacks) of
         true -> {function, Anno, Name, Arity, [wrap_clause(C) || C <- Clauses]};
         false -> {function, Anno, Name, Arity, Clauses}
     end;
-wrap(Form) ->
+wrap(Form, _Callbacks) ->
     Form.
 
 wrap_clause({clause, Anno, Pats, Guards, Body}) ->
@@ -925,15 +1088,20 @@ insert_before_eof([], Helpers) ->
 %% Generated code
 %% ---------------------------------------------------------------------------
 
-helpers(Anno, Record, Fields) ->
-    [publish_fun(Anno), put_fun(Anno, Record, Fields)].
+helpers(Anno, Shapes, Record, Fields) ->
+    [publish_fun(Anno, Shapes), put_fun(Anno, Record, Fields)].
 
 %% '$eta_observe'(Ret) -> _ = case Ret of ... end, Ret.
 %%
 %% Every gen_server return shape carries its state in a position the leading tag
 %% disambiguates: {reply,_,S} against {stop,_,S} at arity three, {reply,_,S,_}
 %% against {stop,_,_,S} at arity four.
-publish_fun(Anno) ->
+%%
+%% The gen_statem shapes are read the same way, with the **data** in the observed
+%% position. `keep_state_and_data` and `repeat_state_and_data` carry nothing new
+%% and fall through to the catch-all, which is right: they say the data is
+%% unchanged, so the last publish still stands.
+publish_fun(Anno, Shapes) ->
     Ret = {var, Anno, 'Ret'},
     S = {var, Anno, 'S'},
     Put = fun(Pats) ->
@@ -942,19 +1110,37 @@ publish_fun(Anno) ->
         ]}
     end,
     U = {var, Anno, '_'},
-    Clauses = [
-        Put([{atom, Anno, reply}, U, S]),
-        Put([{atom, Anno, reply}, U, S, U]),
-        Put([{atom, Anno, noreply}, S]),
-        Put([{atom, Anno, noreply}, S, U]),
-        Put([{atom, Anno, stop}, U, S]),
-        Put([{atom, Anno, stop}, U, U, S]),
-        Put([{atom, Anno, ok}, S]),
-        Put([{atom, Anno, ok}, S, U]),
-        {clause, Anno, [U], [], [{atom, Anno, ok}]}
-    ],
+    A = fun(Name) -> {atom, Anno, Name} end,
+    Clauses =
+        case Shapes of
+            server ->
+                [
+                    Put([A(reply), U, S]),
+                    Put([A(reply), U, S, U]),
+                    Put([A(noreply), S]),
+                    Put([A(noreply), S, U]),
+                    Put([A(stop), U, S]),
+                    Put([A(stop), U, U, S]),
+                    Put([A(ok), S]),
+                    Put([A(ok), S, U])
+                ];
+            statem ->
+                [
+                    Put([A(next_state), U, S]),
+                    Put([A(next_state), U, S, U]),
+                    Put([A(keep_state), S]),
+                    Put([A(keep_state), S, U]),
+                    Put([A(repeat_state), S]),
+                    Put([A(repeat_state), S, U]),
+                    Put([A(stop), U, S]),
+                    Put([A(stop_and_reply), U, U, S]),
+                    %% init/1.
+                    Put([A(ok), U, S]),
+                    Put([A(ok), U, S, U])
+                ]
+        end,
     Body = [
-        {match, Anno, U, {'case', Anno, Ret, Clauses}},
+        {match, Anno, U, {'case', Anno, Ret, Clauses ++ [{clause, Anno, [U], [], [A(ok)]}]}},
         Ret
     ],
     {function, Anno, ?PUBLISH_FUN, 1, [{clause, Anno, [Ret], [], Body}]}.

@@ -21,6 +21,10 @@ every callback return republishes it, into the process dictionary, where
 `erlang:process_info/2` can read it from outside — including while suspended, in a
 couple of microseconds, regardless of mailbox depth.
 
+`gen_server` and `gen_statem` are both covered. For a state machine the observed
+term is the **data**, not the state name: the state name is one atom a trace
+already carries, and the data is what an invariant is about.
+
 ```erlang
 -ifdef(DST).
 -compile({parse_transform, eta_transform}).

@@ -128,7 +128,8 @@ The transform rewrites qualified calls, and only qualified calls:
 | `erlang:timestamp/0` | `eta_time:timestamp/0` |
 | `os:system_time/0,1`, `os:timestamp/0` | `eta_time:*` |
 | `erlang:spawn/1,3`, `spawn_link`, `proc_lib` equivalents | `eta_sched:*` |
-| `gen_server:start/3`, `start_link/3`, `start_monitor/3` | `eta_sched:*` |
+| `gen_server:start/3,4`, `start_link/3,4`, `start_monitor/3,4` | `eta_sched:*` |
+| the same six on `gen_statem` | `eta_sched:statem_*` |
 
 A bare `monotonic_time()` is left alone, and has to be. None of these functions
 are auto-imported, so an unqualified call names something your own module
@@ -156,7 +157,7 @@ whose state the invariants need:
 ```
 
 The transform republishes those fields into the process dictionary on every
-`gen_server` callback return, and `eta_observe:read/1` reads them back from
+`gen_server` or `gen_statem` callback return, and `eta_observe:read/1` reads them back from
 outside. That works while the process is suspended, in a couple of microseconds,
 whatever the mailbox depth:
 
@@ -239,6 +240,9 @@ added:
 
 - `modules_loaded` - code loaded mid-run, so a scheduled process called into
   `code_server`. Fix with `preload`.
+- `sched.cold_code` - a process still *waiting* on `code_server` when the run
+  ended, so what looked like quiescence wasn't. Same fix, and each entry names
+  the line that reached the cold module.
 - `sched.adopted_late` - processes that ran before the scheduler owned them.
   Fix by spawning through `eta_run:spawn_op/1`.
 - `sched.timeouts` - steps that ended without the process reaching a receive, so

@@ -69,12 +69,20 @@ and `eta` are always included.
 eta_run:run(my_harness, #{seed => 1, preload => [my_app]}).
 ```
 
+If you drive `eta_sched` yourself instead of going through `eta_run`, nothing
+preloads for you and there's no `modules_loaded` afterwards to tell you it
+happened. Call it directly, once, before the first scheduler exists:
+
+```erlang
+ok = eta_run:preload([my_app]).
+```
+
 Running a seed twice is not a substitute, and this is worth being precise about:
 **warming is per code path, not per VM.** A seed that first reaches a timeout
 handler runs a branch no earlier seed touched and loads code no earlier seed
 needed. Warming up fixes the seed you warmed and not the next one.
 
-### The worse failure, which nothing catches
+### The worse failure, and the field that catches it
 
 A process waiting on `code_server` is, to `eta_sched`, a process blocked in a
 receive. It isn't runnable. So if enough of the system reaches for cold code at
@@ -89,11 +97,31 @@ ops: 5, steps: 5, exited: 0, processes: 9, outcome: ok
 ```
 
 5 steps for 5 operations, against a workload that normally takes about a
-hundred. Reported as success. `modules_loaded` doesn't catch this one either,
-because the loads complete after the run has finished.
+hundred. Reported as success. `modules_loaded` doesn't catch this one, because
+the loads complete after the run has finished — there's nothing left to report
+by the time anybody looks.
 
-The symptom is a run that ends far too early with `ok` and nothing exited. The
-prevention is `preload`, so use it even when your runs look fine.
+`sched.cold_code` catches it from the other side. The scheduler looks once, at
+the moment a run finds nothing runnable and is about to return, for a process
+sitting in `code_server:call/1` — which is where a process waiting on the code
+server always is, because that function is a send followed by a one-clause
+receive. Each entry names the process and the frame that reached the cold
+module, and a warning is logged:
+
+```erlang
+#{sched := #{cold_code := [#{id := 3, pid := _, at := {my_client, commit, 2}}]}}
+```
+
+`at` is `undefined` when there's no frame to name, which happens when the call
+into the cold module was a **tail call** — nothing of the caller is left on the
+stack. The pid is still the answer then.
+
+`audit/1` checks the field, so you get this for free if you're already asserting
+on it.
+
+None of that makes `preload` optional. Detection is after the fact: by the time
+`cold_code` has something in it the run is already spoiled, and all you've
+gained is knowing rather than guessing.
 
 There's a second form that isn't a warm-up effect. `code:ensure_loaded/1`
 returns immediately for a module that's already loaded, but for a *missing*
@@ -187,9 +215,10 @@ scheduler can send, so there is no interval in which it is alive and unowned.
 
 **Inside a transformed module you get this for free.** Every local spawn form is
 rewritten: `spawn`, `spawn_link`, `spawn_monitor` and `spawn_opt`, on both
-`erlang` and `proc_lib`, qualified or bare. `gen_server:start`, `start_link` and
-`start_monitor` are rewritten too, at both arities, because those spawn inside
-OTP where no transform of your code reaches.
+`erlang` and `proc_lib`, qualified or bare. `start`, `start_link` and
+`start_monitor` on `gen_server` and `gen_statem` are rewritten too, at both
+arities, because those spawn inside OTP where no transform of your code
+reaches.
 
 **Inside `execute/2` you don't**, because your harness isn't transformed. Use
 `eta_run:spawn_op/1` there. It is the same mechanism under a different name:
