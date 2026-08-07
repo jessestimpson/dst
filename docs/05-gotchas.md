@@ -357,6 +357,53 @@ workaround is to configure the timeout high enough that it can't fire during a
 run, which removes the behaviour it guards from the set of things you're
 testing.
 
+A **transformed** module's calls are virtual whenever a clock is running,
+whether or not you asked for a network. That used to depend on the network, so
+the ordinary configuration — scheduler and clock up, `net => false` — waited out
+a real 5 second `after` inside OTP on every call. If you have a run from before
+that was mysteriously sensitive to machine load, this was why.
+
+### A call from the driver still can't have a virtual timeout
+
+The exception to the above, and it follows from how the clock moves. `eta_run`
+advances only to deadlines belonging to a process it can step, and steps over
+everything else as a stray. A virtual deadline armed by the driver is therefore
+one nothing ever reaches: the driver is blocked waiting for a timeout that only
+the driver can deliver.
+
+So a call made from `execute/2` or `check/1` keeps its real timeout, which is
+the same rule as before by a different route — those callbacks must not call
+into a scheduled process, and `eta_harness` says why. What changed is only that
+getting it wrong still ends in a 5 second exit rather than in a run with no way
+to finish.
+
+### What a virtual call timeout means is not what a real one means
+
+Worth internalizing before reading a counterexample. The clock only moves when
+nothing is runnable, so a virtual call timeout fires exactly when the system
+reached a state where nothing could make progress and this was the earliest
+deadline. That's a much stronger statement than production's, where a timeout
+mostly means somebody was slow — and it's a good lost-message and deadlock
+detector for it.
+
+The flip side is that **"the callee was slow" doesn't exist under a virtual
+clock**, because computation costs no virtual time. The race where a caller
+gives up and the answer arrives just afterwards is reachable only through a
+timer or a network delay, never through the callee taking too long. If that race
+is what you're hunting, you need `skew_ms` or a lossy network policy; a timeout
+on its own won't find it.
+
+For the same reason, the *numbers* matter more than they do in production.
+Deadlines are what the clock jumps between, so a timeout value orders events
+against every heartbeat, lease and retry in the system. Every default is 5000,
+so they land on one deadline and fire in creation order, the same order every
+run. `skew_ms` is what breaks the tie, and it reaches receive and call deadlines
+as well as the timers your system sets itself.
+
+`drop_p` deliberately does *not* reach them. A timer your system sets to fire at
+another process can go missing with that process; a deadline a process arms for
+itself cannot, and dropping one produces a hang wearing the shape of a finding.
+
 ## Observability hazards
 
 ### An invariant that asks is an invariant that checks nothing

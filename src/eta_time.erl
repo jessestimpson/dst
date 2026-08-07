@@ -357,11 +357,22 @@ read_timer(Ref) ->
 %% deterministic.
 -spec insert_timer(non_neg_integer(), pid() | atom(), term(), send | timeout) -> reference().
 insert_timer(Time, Dest, Msg, Kind) ->
+    insert_timer(Time, Dest, Msg, Kind, faultable).
+
+%% `exempt` is still skewed and still ordered like any other timer; it is only
+%% `drop_p` it is out of. See `arm_after/2` for what claims it and why.
+%%
+%% The `andalso` short-circuits, so an exempt timer draws nothing from the fault
+%% RNG. That keeps the stream a function of the faultable timers alone rather
+%% than of how many receives happened to be armed alongside them.
+-spec insert_timer(non_neg_integer(), pid() | atom(), term(), send | timeout, faultable | exempt) ->
+    reference().
+insert_timer(Time, Dest, Msg, Kind, Fault) ->
     Ref = make_ref(),
     Seq = ets:update_counter(?STATE, seq, 1),
     Deadline = now_ms() + skew(Time),
     Key = {Deadline, Seq},
-    Drop = roll_drop(),
+    Drop = Fault =:= faultable andalso roll_drop(),
     ets:insert(?TIMERS, {Key, Ref, Dest, Msg, Kind, Drop}),
     ets:insert(?REFS, {Ref, Key}),
     Ref.
@@ -386,6 +397,21 @@ a mailbox poll, not a wait: routing it through the timer wheel would block until
 something advanced the clock, turning a non-blocking poll into a wait. Appending to
 our own mailbox also keeps the ordering right, since a selective receive scans in
 arrival order and therefore still prefers anything already queued.
+
+## Exempt from `drop_p`
+
+Skewed like anything else, never dropped. `drop_p` models *a timer lost with the
+process or connection it belonged to* (see `set_faults/1`), and this timer has
+neither: a process arms it for itself, and the BEAM does not lose a receive
+timeout. `eta_net:call/3` arms its call deadline through here for the same
+reason.
+
+Dropping one is not a fault, it is a hang. The waiting process has nothing left
+that can wake it, so the run stalls or burns its step budget, and the trace says
+a timeout never fired rather than that a message was lost — a finding about the
+framework wearing the shape of a finding about the system. `send_after/3` and
+`start_timer/3` stay faultable, because a timer a system sets to fire at *another*
+process is exactly the thing that can go missing with it.
 """.
 -endif.
 -spec arm_after(timeout(), reference()) -> term().
@@ -395,7 +421,10 @@ arm_after(0, Ref) ->
     self() ! {'$eta_after', Ref},
     flush_only;
 arm_after(Timeout, Ref) when is_integer(Timeout), Timeout > 0 ->
-    send_after(Timeout, self(), {'$eta_after', Ref}).
+    case running() of
+        false -> erlang:send_after(Timeout, self(), {'$eta_after', Ref});
+        true -> insert_timer(Timeout, self(), {'$eta_after', Ref}, send, exempt)
+    end.
 
 -if(?DOCATTRS).
 -doc """
@@ -457,6 +486,12 @@ Sets the timer fault policy.
 
 Skew is applied at creation rather than at firing, so the deadline remains
 meaningful to `read_timer/1` and `cancel_timer/1`.
+
+**`drop_p` reaches `send_after/3` and `start_timer/3` only.** A deadline armed
+through `arm_after/2` — a rewritten `receive ... after`, or `eta_net:call/3`'s
+timeout — is skewed but never dropped; see `arm_after/2` for why. `skew_ms`
+applies to everything, which is what makes it the knob for the tie between two
+timeouts written with the same number.
 """.
 -endif.
 -spec set_faults(fault_opts()) -> ok.

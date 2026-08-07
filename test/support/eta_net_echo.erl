@@ -11,7 +11,7 @@
 
 -include_lib("eta/include/eta.hrl").
 
--export([start_link/1, bang/2, qualified/2, cast/2, call/2, broadcast/2, stop/1]).
+-export([start_link/1, bang/2, qualified/2, cast/2, call/2, call/3, broadcast/2, stop/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 start_link(Name) ->
@@ -36,6 +36,11 @@ cast(Dest, Msg) ->
 call(Dest, Msg) ->
     gen_server:call(Dest, Msg, 5000).
 
+%% The same call with the timeout named, for a test that wants one short enough
+%% to wait out on the real clock.
+call(Dest, Msg, Timeout) ->
+    gen_server:call(Dest, Msg, Timeout).
+
 %% One of the client-side functions eta_net does not implement. Rewritten to
 %% `eta_net:unsupported/2`, which raises while a network is running.
 broadcast(Name, Msg) ->
@@ -50,6 +55,10 @@ init([]) ->
 handle_call({echo, V}, From, State) ->
     gen_server:reply(From, {echoed, V}),
     {noreply, State};
+%% Parks the caller and answers only when told to, so a test can put a reply on
+%% the far side of the caller's timeout. Answering is `{answer, Key, V}` below.
+handle_call({defer, Key}, From, State) ->
+    {noreply, State#{Key => From}};
 handle_call(_Req, _From, State) ->
     {reply, ok, State}.
 
@@ -61,5 +70,16 @@ handle_cast({forward, To, Msg}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+%% An ordinary message rather than a cast, so a test can send it *from* the same
+%% process that made the deferred call and have the channel's ordering clamp
+%% guarantee this is seen first.
+handle_info({answer, Key, V}, State) ->
+    case State of
+        #{Key := From} ->
+            gen_server:reply(From, V),
+            {noreply, maps:remove(Key, State)};
+        _ ->
+            {noreply, State}
+    end;
 handle_info(_Msg, State) ->
     {noreply, State}.

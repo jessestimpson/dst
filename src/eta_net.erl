@@ -409,7 +409,7 @@ Monitors the callee and takes a timeout, as `gen_server:call/3` does, with two
 differences:
 
 - **The timeout is virtual**, so waiting one out on a dropped request costs no
-  real time and fires where the schedule chose.
+  real time and fires where the schedule chose. See below for when.
 - **The monitor is `eta_net`'s own and is deliberately left real**, rather than
   going through `monitor/2`. It exists to notice a callee that died, and it has
   to work whatever the scheduler is or is not reporting — this is the path that
@@ -420,7 +420,39 @@ differences:
 
 **Raises `unrouted_reply` if the callee was not built with the transform**, since
 its reply then comes around the network and one direction of the channel is
-silently unfaultable.
+silently unfaultable. Only on the routed path — with no network there is nothing
+to route and nothing to come around.
+
+## Three paths, and the timeout is virtual on two of them
+
+The network is not what decides whether the timeout is real. The **clock** is,
+which is a distinction that used to be got wrong here and is worth stating
+plainly, because the default run (`net => false`) took the wrong branch.
+
+- **Network running** — the request is routed, and the wait is on the virtual
+  clock.
+- **No network, but a virtual clock** — the request is an ordinary send and the
+  wait is still on the virtual clock. This is `gen:call`'s own protocol with
+  the deadline moved, alias and all, so a reply that loses the race to the
+  timeout is dropped by the VM exactly as it is outside a simulation.
+- **Neither** — a plain `gen_server:call/3`, real timeout, which is what the
+  module does about everything when it is inert.
+
+What made the old gating a bug rather than a gap: a transformed system with the
+scheduler and the clock up and no network is the ordinary configuration, and
+every `gen_server:call` in it was waiting out a real 5-second `after` inside OTP
+while the driver did other work. When it fired was decided by machine load, so a
+seed did not reproduce its own run, and nothing reported it.
+
+**A virtual deadline is only armed for a process the scheduler is stepping.**
+`eta_run` advances the clock only to deadlines belonging to a process it owns and
+steps over every other one as a stray (`eta_time:advance_to_next/1`), so a
+virtual timeout armed by anything else — the driver, a harness `execute/2` that
+calls instead of spawning — is a deadline nothing will ever reach, and a hang
+with no timeout to end it. Those callers keep the real one. The check is a read
+of `eta_sched:stepping/0`, and it fails towards the real timeout: an owned caller
+this misses gets nondeterminism, which is bad, where an unowned caller it wrongly
+claimed would get a stalled run, which is worse.
 """.
 -endif.
 -spec call(dest() | term(), term()) -> term().
@@ -429,11 +461,31 @@ call(Dest, Req) ->
 
 -spec call(dest() | term(), term(), timeout() | {clean_timeout | dirty_timeout, timeout()}) ->
     term().
-call(Dest, Req, Timeout) ->
-    case running() andalso normalize(Dest) of
-        To when is_pid(To) -> do_call(To, Dest, Req, call_timeout(Timeout));
-        _ -> gen_server:call(Dest, Req, call_timeout(Timeout))
+call(Dest, Req, Timeout0) ->
+    Timeout = call_timeout(Timeout0),
+    case normalize(Dest) of
+        To when is_pid(To) ->
+            case running() of
+                true -> do_call(To, Dest, Req, Timeout);
+                false -> sim_call(To, Dest, Req, Timeout)
+            end;
+        _ ->
+            gen_server:call(Dest, Req, Timeout)
     end.
+
+%% Whether a deadline armed by *this* process will actually be reached.
+%%
+%% Needs a clock, obviously. The second condition is the one with teeth: if a
+%% scheduler is running then `eta_run` drives the clock, and it advances only to
+%% deadlines owned by a process it can step. `eta_sched:stepping/0` is the
+%% sharpest available statement of that, and it is an ETS read — asking the
+%% scheduler would deadlock against the very step this is running inside.
+%%
+%% With no scheduler at all (a unit test driving `eta_time:advance/1` by hand)
+%% every deadline is reachable, so the clock alone is enough.
+virtual_timeout() ->
+    eta_time:running() andalso
+        (not eta_sched:active() orelse eta_sched:stepping() =:= self()).
 
 %% `gen_statem:call/3` accepts `{clean_timeout, T}` and `{dirty_timeout, T}` as
 %% well as a plain `timeout()`. Both choose how the *caller* waits — whether the
@@ -441,6 +493,12 @@ call(Dest, Req, Timeout) ->
 %% waits in a receive of its own, on the virtual clock. Unwrapping to the number
 %% is the honest reading, and it keeps `call/3` a single target for both
 %% behaviours.
+%%
+%% What `clean_timeout` is *for* — a reply that arrives after the caller gave up
+%% never reaching the caller's mailbox — is honoured on both paths regardless of
+%% which form was asked for: by the alias in `sim_call/4`, and by the abandoned
+%% tag in `do_call/4`. The proxy process is the mechanism, and the mechanism is
+%% what does not survive; the guarantee does.
 call_timeout({clean_timeout, T}) -> T;
 call_timeout({dirty_timeout, T}) -> T;
 call_timeout(T) -> T.
@@ -452,22 +510,99 @@ do_call(To, Dest, Req, Timeout) ->
     %% mistaken for an unrouted one.
     true = ets:insert(?CALLS, {Tag, outstanding}),
     _ = route(self(), To, {'$gen_call', {self(), Tag}, Req}, tag(Req)),
-    AfterRef = make_ref(),
-    TRef = eta_time:arm_after(Timeout, AfterRef),
-    receive
-        {Tag, Reply} ->
-            ok = eta_time:disarm_after(TRef, AfterRef),
+    case wait(Tag, Mon, Timeout) of
+        {reply, Reply} ->
             true = erlang:demonitor(Mon, [flush]),
             ok = check_routed(Tag, To, Req),
             Reply;
-        {'DOWN', Mon, process, _, Reason} ->
-            ok = eta_time:disarm_after(TRef, AfterRef),
+        {down, Reason} ->
             true = ets:delete(?CALLS, Tag),
             exit({Reason, {eta_net, call, [Dest, Req, Timeout]}});
-        {'$eta_after', G} when G =:= AfterRef ->
+        timeout ->
             true = erlang:demonitor(Mon, [flush]),
-            true = ets:delete(?CALLS, Tag),
+            %% Marked, not deleted. The reply may still be coming — the callee is
+            %% alive and may be about to answer, or the answer may be sitting in
+            %% the network on a delay — and `reply/2` needs to know this caller
+            %% has stopped listening so it can drop it.
+            %%
+            %% Outside a simulation the VM does this for us: `gen:call/4` waits on
+            %% an alias and deactivates it on timeout, so a late reply is
+            %% discarded before it reaches the mailbox. `reply/2` routes to the
+            %% caller's *pid* rather than to the alias, because the network places
+            %% and faults pids, so that protection is gone here and has to be
+            %% rebuilt. Without it a late reply lands as a `{Tag, Reply}` nothing
+            %% will ever match — which for a `gen_server` caller is an
+            %% `handle_info` clause it never expected, and a crash the simulation
+            %% manufactured rather than found.
+            %%
+            %% One entry per timed-out call, taken by `reply/2` if the reply does
+            %% arrive and discarded with the table otherwise.
+            true = ets:insert(?CALLS, {Tag, abandoned}),
             exit({timeout, {eta_net, call, [Dest, Req, Timeout]}})
+    end.
+
+%% The same request `gen:call/4` sends and the same wait, with the deadline moved
+%% onto the virtual clock. For a run with a clock but no network — the default —
+%% where there is nothing to route but every reason to keep the timeout off the
+%% wall clock. See `call/3`.
+
+%% `[alias|Mon]` is an improper list, and deliberately: it is the tag shape
+%% `gen:reply/2` matches on to answer through an alias rather than a pid, so it
+%% has to be built exactly this way or the protection below does not exist. The
+%% analyser has no way to know that, and the warning is right about the shape and
+%% wrong about the intent.
+-dialyzer({no_improper_lists, sim_call/4}).
+sim_call(To, Dest, Req, Timeout) ->
+    case virtual_timeout() of
+        false ->
+            gen_server:call(Dest, Req, Timeout);
+        true ->
+            %% `{alias, demonitor}` and the `[alias|Mon]` tag are `gen`'s, copied
+            %% deliberately: `gen:reply/2` recognises that tag shape and answers
+            %% through the alias, so the `demonitor` below deactivates it and a
+            %% reply that loses the race to the timeout is dropped by the VM. That
+            %% is the protection `do_call/4` has to rebuild by hand, and here it
+            %% comes for free.
+            Mon = erlang:monitor(process, To, [{alias, demonitor}]),
+            Tag = [alias | Mon],
+            _ = erlang:send(To, {'$gen_call', {self(), Tag}, Req}),
+            case wait(Tag, Mon, Timeout) of
+                {reply, Reply} ->
+                    true = erlang:demonitor(Mon, [flush]),
+                    Reply;
+                {down, Reason} ->
+                    exit({Reason, {eta_net, call, [Dest, Req, Timeout]}});
+                timeout ->
+                    true = erlang:demonitor(Mon, [flush]),
+                    exit({timeout, {eta_net, call, [Dest, Req, Timeout]}})
+            end
+    end.
+
+%% One receive for both clocks.
+%%
+%% When the deadline can be reached virtually it arrives as a message and the real
+%% `after` is `infinity`; otherwise nothing is armed, the `'$eta_after'` clause
+%% cannot match because nothing will ever send it, and the real `after` is the
+%% deadline. Writing it as one receive rather than two keeps the reply and `DOWN`
+%% clauses from being stated twice, which is where a divergence would hide.
+wait(Tag, Mon, Timeout) ->
+    Ref = make_ref(),
+    {TRef, Real} =
+        case virtual_timeout() of
+            true -> {eta_time:arm_after(Timeout, Ref), infinity};
+            false -> {undefined, Timeout}
+        end,
+    receive
+        {Tag, Reply} ->
+            ok = eta_time:disarm_after(TRef, Ref),
+            {reply, Reply};
+        {'DOWN', Mon, process, _, Reason} ->
+            ok = eta_time:disarm_after(TRef, Ref),
+            {down, Reason};
+        {'$eta_after', G} when G =:= Ref ->
+            timeout
+    after Real ->
+        timeout
     end.
 
 %% `reply/2` takes the tag out on its way past, so a tag still here when the reply
@@ -512,19 +647,35 @@ way.
 `eta_transform` also rewrites a `gen_server`'s `handle_call/3` returns and a
 `gen_statem`'s reply actions to reach this, which is how the reply leg of
 `call/3` gets onto the network.
+
+**A reply to a caller that already timed out is dropped**, which is what the
+alias `gen:call` waits on does outside a simulation. See `call/3`.
 """.
 -endif.
 -spec reply(term(), term()) -> ok.
 reply(From = {To, Tag}, Reply) when is_pid(To) ->
     case running() of
         true ->
+            %% Taking the tag marks the call answered through the network —
+            %% `call/3` uses the absence to detect a reply that came around it —
+            %% and reads the caller's disposition in the same operation.
+            %%
+            %% `abandoned` means the caller timed out and is no longer listening,
+            %% so this reply is dropped rather than routed. Anything else is
+            %% either an outstanding call or a tag this module never issued (an
+            %% untransformed client's, which is an ordinary alias), and both are
+            %% answered.
+            %%
             %% Tagged `'$gen_reply'` rather than by the caller's tag, which is a
             %% fresh reference per call and so names nothing a policy could scope
-            %% on. Deleting marks the call answered through the network — `call/3`
-            %% uses the absence to detect a reply that came around it.
-            true = ets:delete(?CALLS, Tag),
-            _ = route(self(), To, {Tag, Reply}, '$gen_reply'),
-            ok;
+            %% on.
+            case ets:take(?CALLS, Tag) of
+                [{Tag, abandoned}] ->
+                    ok;
+                _ ->
+                    _ = route(self(), To, {Tag, Reply}, '$gen_reply'),
+                    ok
+            end;
         false ->
             gen_server:reply(From, Reply)
     end;

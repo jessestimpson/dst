@@ -365,6 +365,41 @@ defmodule DstTimeTest do
       refute_received(:never)
       assert @time.stats().dropped == 1
     end
+
+    test "drop_p does not reach a deadline armed through arm_after/2" do
+      # `drop_p` models a timer lost with the process or connection it belonged
+      # to. A receive timeout has neither: a process arms it for itself, and the
+      # BEAM does not lose one. Dropping it is not a fault, it is a hang — the
+      # waiting process has nothing left that can wake it, and the trace says a
+      # timeout never fired rather than that a message was lost.
+      :ok = @time.start(%{start_ms: 0, seed: 1, faults: %{drop_p: 1.0}})
+
+      ref = make_ref()
+      tref = @time.arm_after(100, ref)
+      @time.advance(1_000)
+
+      assert_received {:"$eta_after", ^ref}
+      assert @time.stats().dropped == 0
+
+      # Still an ordinary timer in every other way.
+      assert @time.cancel_timer(tref) == false
+    end
+
+    test "skew_ms still reaches one, which is what breaks a tie between two" do
+      # Two timeouts written with the same number are the common case — every
+      # `gen_server:call` default is 5000 — and under a virtual clock they land
+      # on one deadline and fire in creation order, the same way every run.
+      # `skew_ms` is the knob that separates them.
+      :ok = @time.start(%{start_ms: 0, seed: 5, faults: %{skew_ms: 20}})
+
+      remaining =
+        for _ <- 1..30 do
+          @time.read_timer(@time.arm_after(50, make_ref()))
+        end
+
+      assert length(Enum.uniq(remaining)) > 1, "skew did not reach an armed deadline"
+      assert Enum.all?(remaining, &(&1 >= 30 and &1 <= 70))
+    end
   end
 
   defp drain_mailbox(n) do

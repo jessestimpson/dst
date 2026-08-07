@@ -14,6 +14,7 @@ defmodule EtaNetTest do
 
   @net :eta_net
   @time :eta_time
+  @sched :eta_sched
 
   setup do
     on_exit(fn ->
@@ -354,6 +355,108 @@ defmodule EtaNetTest do
       Process.sleep(10)
 
       assert {:exit, {:noproc, _}} = call_from(caller, :call_echo, {:echo, 6})
+    end
+
+    test "a reply that loses the race to the timeout is dropped", %{caller: caller} do
+      # Outside a simulation `gen:call/4` waits on an alias and deactivates it on
+      # timeout, so an answer that arrives too late never reaches the caller.
+      # `reply/2` routes to the caller's *pid*, because the network places and
+      # faults pids, so that protection has to be rebuilt here.
+      #
+      # Without it the late reply lands as a `{Tag, Reply}` nothing will ever
+      # match — for a gen_server caller, an `handle_info` clause it never
+      # expected, and a crash the simulation manufactured rather than found.
+      task = call_async(caller, :call_echo, {:defer, :k})
+      Process.sleep(20)
+      @time.advance(5_000)
+      assert {:exit, {:timeout, _}} = await_call(task)
+
+      # Anything parked before the answer is not what this is about.
+      _ = drained(caller)
+
+      # Sent from the caller itself, so the channel's ordering clamp puts it
+      # ahead of the sync call below, and a returned sync call therefore proves
+      # the echo has already answered the deferred one.
+      send_from(caller, :call_echo, {:answer, :k, :too_late})
+      assert {:ok, {:echoed, :sync}} = call_from(caller, :call_echo, {:echo, :sync})
+
+      assert drained(caller) == [],
+             "a reply the caller had already given up on reached its mailbox"
+    end
+  end
+
+  describe "a call with a clock but no network" do
+    setup do
+      :ok = @time.start(%{start_ms: 0})
+      :ok
+    end
+
+    test "keeps its timeout on the virtual clock" do
+      # The default run configuration — transform on, scheduler and clock up,
+      # `net => false`. This used to take OTP's own `receive ... after`, so every
+      # call in an ordinary run counted down real milliseconds while the driver
+      # did other work, and when it fired was decided by machine load rather than
+      # by the seed. Nothing reported it.
+      callee = sink()
+      me = self()
+      ref = make_ref()
+
+      spawn(fn ->
+        result =
+          try do
+            {:ok, :eta_net_echo.call(callee, :never_answered)}
+          catch
+            :exit, reason -> {:exit, reason}
+          end
+
+        send(me, {ref, result})
+      end)
+
+      Process.sleep(20)
+
+      # The deadline is in eta's wheel rather than the VM's, which is the claim.
+      assert @time.pending() == 1
+      refute_received {^ref, _}
+
+      # Five virtual seconds, and no real ones.
+      {micros, _} = :timer.tc(fn -> @time.advance(5_000) end)
+
+      assert_receive {^ref, {:exit, {:timeout, _}}}, 1_000
+      assert micros < 1_000_000, "a 5s virtual timeout took #{div(micros, 1_000)}ms"
+    end
+
+    test "answers normally, and arms nothing it does not need" do
+      {:ok, _} = :eta_net_echo.start_link(:nonet_echo)
+      on_exit(fn -> stop_echo(:nonet_echo) end)
+
+      assert :eta_net_echo.call(:nonet_echo, {:echo, 1}) == {:echoed, 1}
+      assert @time.pending() == 0, "the deadline outlived the call it belonged to"
+    end
+
+    test "falls back to a real timeout for a caller the scheduler is not stepping" do
+      # `eta_run` advances the clock only to deadlines owned by a process it can
+      # step and treats every other one as a stray, so a virtual deadline armed
+      # here would be a deadline nothing ever reaches. The test process stands in
+      # for the driver, or for a harness `execute/2` that calls instead of
+      # spawning. Nondeterminism is bad; a run with no way to end is worse.
+      callee = sink()
+      sched = @sched.new(%{seed: 1})
+
+      {micros, result} =
+        :timer.tc(fn ->
+          try do
+            {:ok, :eta_net_echo.call(callee, :never_answered, 150)}
+          catch
+            :exit, reason -> {:exit, reason}
+          end
+        end)
+
+      pending = @time.pending()
+      @sched.release(sched)
+
+      assert {:exit, {:timeout, _}} = result
+      assert micros >= 150_000, "the wait did not happen on the real clock"
+      assert pending == 0, "a deadline nothing could reach was armed anyway"
     end
   end
 
