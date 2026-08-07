@@ -1268,7 +1268,11 @@ do_register(St = #st{ids = Ids, gated = Gated}, Pid) when is_pid(Pid) ->
                         St1
                 end
             catch
-                error:badarg -> St
+                %% `trace/3` raises `badarg` on a dead pid, and
+                %% `suspend_process/1` raises two different ways for that one
+                %% reason — see `hold/1`. All of them mean the same thing here.
+                error:badarg -> St;
+                error:exited -> St
             end
     end.
 
@@ -1379,7 +1383,7 @@ do_step(St0 = #st{procs = Procs}, Id) ->
     %% runnable, which is usually a receive but is equally the last thing it does
     %% before returning — so a short-lived worker (a registry member's gather
     %% helper, a transaction worker) routinely dies in the window between the two
-    %% calls. `suspend_process/1` raises `badarg` on a dead pid, which took the
+    %% calls. `suspend_process/1` raises on a pid that is gone, which took the
     %% scheduler down for something that is nothing. Every other call site in this
     %% module already guarded it; this one did not, and a system spawning such
     %% workers under an injected node fault hit it about one run in three.
@@ -1410,13 +1414,31 @@ do_step(St0 = #st{procs = Procs}, Id) ->
 %% Suspend a process, answering whether there was one to suspend. `false` means it
 %% has exited, which is the only reason `suspend_process/1` raises here: the pid is
 %% one this scheduler owns, so it is local, and nothing else suspends it.
+%%
+%% It raises **two** ways for that one reason, and the difference between them is
+%% a race rather than a distinction worth acting on. `suspend_process/1` blocks
+%% until the target has actually stopped, so:
+%%
+%% - already dead when the call is made — `error:badarg`
+%% - dies while the call is waiting for it to stop — `error:exited`
+%%
+%% Catching only the first is a driver that dies on the second. Which one you get
+%% depends on whether the target was *running* when the scheduler reached for it,
+%% so the gap is invisible to a system whose processes only ever sit in receives
+%% and opens up as soon as they start exiting on purpose — an agent aborting, a
+%% `gen_server` stopping, anything that ends a step by terminating.
+%%
+%% Measured on OTP 28, racing a suspend against a process spending its last few
+%% reductions: 19598 suspends, 398 `badarg`, 4 `exited` out of 20000. Rare enough
+%% to survive a lot of testing, common enough to take a run down.
 -spec hold(pid()) -> boolean().
 hold(Pid) ->
     try
         erlang:suspend_process(Pid),
         true
     catch
-        error:badarg -> false
+        error:badarg -> false;
+        error:exited -> false
     end.
 
 %% Where a process blocked, but only when it actually blocked.
@@ -1650,7 +1672,9 @@ handle_trace(
                 Child ! ?GO,
                 St1#st{gated = Gated#{Child => true}}
             catch
-                error:badarg -> St
+                %% Gone before the suspend, or gone during it; see `hold/1`.
+                error:badarg -> St;
+                error:exited -> St
             end
     end;
 handle_trace(St = #st{ids = Ids}, {trace, Parent, spawn, Child, _MFA}) ->
@@ -1666,16 +1690,19 @@ handle_trace(St = #st{ids = Ids}, {trace, Parent, spawn, Child, _MFA}) ->
             %% It may already be gone: a system that spawns short-lived helpers —
             %% a registry member's gather and snapshot workers, a generic server's
             %% transaction workers — routinely finishes one before the spawn event
-            %% has even been handled. `suspend_process/1` raises `badarg` on a dead
-            %% pid, which would take the scheduler down for something that is
+            %% has even been handled. `suspend_process/1` raises on a pid that is
+            %% gone, which would take the scheduler down for something that is
             %% nothing. There is nothing left to schedule, so it is not adopted.
             try
                 erlang:suspend_process(Child),
                 St1 = adopt(St, Child),
                 St1#st{adopted_late = St#st.adopted_late + 1}
             catch
-                error:badarg ->
-                    adopt_exited(St, Child)
+                %% Gone before the suspend, or gone during it; see `hold/1`. This
+                %% is the site most exposed to the second, because the child here
+                %% is by definition still running.
+                error:badarg -> adopt_exited(St, Child);
+                error:exited -> adopt_exited(St, Child)
             end
     end;
 handle_trace(St = #st{ids = Ids, exited = Exited}, {trace, Pid, exit, Reason}) ->

@@ -472,6 +472,15 @@ do_call(To, Dest, Req, Timeout) ->
 
 %% `reply/2` takes the tag out on its way past, so a tag still here when the reply
 %% lands means the callee answered by a path this module never saw.
+%%
+%% What it does *not* tell you is which path. The message used to name one cause
+%% — "the callee was not built with eta_transform" — and that is only the first
+%% of two, which sends anyone hitting the second one to look in the wrong place.
+%% A module can carry the transform and still answer from somewhere the transform
+%% has nothing to rewrite: `locks_agent` replies to its waiters with a bare
+%% `Pid ! {Tag, Status}` rather than `gen_server:reply/2`, so the send is routed
+%% as an ordinary message and the tag survives. The guard is right in both cases;
+%% only the explanation was wrong.
 check_routed(Tag, To, Req) ->
     case ets:take(?CALLS, Tag) of
         [] ->
@@ -480,9 +489,13 @@ check_routed(Tag, To, Req) ->
             error(
                 {eta_net,
                     {unrouted_reply, To, tag(Req), <<
-                        "the callee was not built with eta_transform, so its reply "
-                        "came around the network and cannot be faulted. Build it with "
-                        "the transform, or place both ends on one node"
+                        "the reply reached the caller without passing through this "
+                        "module, so it could not be faulted. Either the callee was "
+                        "not built with eta_transform, or it answers this call from "
+                        "somewhere the transform does not rewrite - a bare send to "
+                        "the caller rather than gen_server:reply/2 or a gen_statem "
+                        "reply action. Route that reply, build the callee with the "
+                        "transform, or place both ends on one node"
                     >>}}
             )
     end.
