@@ -39,7 +39,9 @@ demonstrate exactly that over the course of this document.
 
 We'll put the project beside your `eta` checkout so the dependency can be a
 plain relative path. We're using `mix` because the tooling makes for a simpler
-walkthrough, but `rebar` could just as well be used, with some modification.
+walkthrough. That means this document will combine Erlang and Elixir throughout.
+`rebar` and Erlang could just as well be used in full, with some modification.
+
 We'll write the ABD register itself in Erlang - we're going to use `parse_transform`.
 
 ```bash
@@ -102,8 +104,7 @@ needed, usually for `MIX_ENV=test`.
 `eta_time` falls back to the real `erlang` functions whenever no virtual clock
 is running, so a transformed module behaves normally outside a simulation.
 
-**No `mod:` in `application/0`.** ABD is small enough not to need one, and this
-keeps the walkthrough short.
+**No `mod:` in `application/0`.** ABD is just a simple library.
 
 ## Step 3: the replica `gen_server`
 
@@ -475,6 +476,8 @@ result = :eta_run.run(:abd_harness, opts)
 :eta_run.audit(result)
 ```
 
+TODO - explain opts, especially `seed` and `max_ops`.
+
 The `preload` option is required, and we'll explain why coming up.
 
 RESULT:
@@ -770,7 +773,8 @@ along and deleted that, thinking it was superfluous. You could just delete the l
 of code, but for demo purposes, we'll make the bug a configurable property of our
 app.
 
-Let's introduce `Mode` to define the buggy behavior. In `src/abd_client.erl`:
+Let's introduce `Mode` to define the buggy behavior. We'll use some inline comments
+to guide your eye to the critical changes. In `src/abd_client.erl`:
 
 ```erlang
 read(Replicas) ->
@@ -778,12 +782,15 @@ read(Replicas) ->
 
 read(Replicas, Mode) ->
     {Ts, Val} = query_phase(Replicas),
+
+    % `Mode=no_writeback` introduces a bug
     case Mode of
         correct ->
             ok = write_phase(Replicas, Ts, Val);
         no_writeback ->
             ok
     end,
+    
     {Ts, Val}.
 ```
 
@@ -796,7 +803,7 @@ Three edits in `test/support/abd_harness.erl`.
 
 ```erlang
     {ok, #{tab => Tab, replicas => Replicas, clients => [], next_op => 1,
-           mode => maps:get(mode, Config, correct)}}.
+           mode => maps:get(mode, Config, correct)}}. % <- store the mode
 ```
 
 `execute/2` pattern-matches it and plumbs it into `run_op`.
@@ -804,7 +811,10 @@ Three edits in `test/support/abd_harness.erl`.
 ```erlang
 execute(Op, Sut = #{tab := Tab, replicas := Replicas, clients := Clients, mode := Mode}) ->
     N = op_number(Op),
+
+    % Mode passed into run_op
     Client = eta_run:spawn_op(fun() -> run_op(Op, Tab, Replicas, Mode) end),
+    
     Sut#{clients := [Client | Clients], next_op := N + 1}.
 ```
 
@@ -821,7 +831,7 @@ run_op({partial_write, N, Value, Targets}, Tab, Replicas, _Mode) ->
     ets:insert(Tab, {{partial_write, N}, Start, eta_log:log({finished, Ts}), Ts, Value});
 run_op({read, N}, Tab, Replicas, Mode) ->
     Start = eta_log:log(started),
-    {Ts, Val} = abd_client:read(Replicas, Mode),
+    {Ts, Val} = abd_client:read(Replicas, Mode), % <- Mode passed to client
     ets:insert(Tab, {{read, N}, Start, eta_log:log({finished, Ts}), Ts, Val}).
 ```
 
@@ -866,7 +876,9 @@ reported the older `{0, 0}`.
 
 The trace can potentially be very long. One advantage of having a replayable
 system is that we can conduct a search to find the shortest possible trace
-that reproduces the same violation. (Note: global minimization is not guaranteed)
+that reproduces the same violation. That's what `eta_shrink` is for.
+
+(Note: global minimization is not guaranteed)
 
 ```elixir
 opts6 = Map.put(opts, :seed, 6)
@@ -931,7 +943,7 @@ simply does not exist.
 
 ```erlang
 init(Index) ->
-    ok = ?ETA_LABEL({replica, Index}),
+    ok = ?ETA_LABEL({replica, Index}), % <-
     {ok, #st{index = Index}}.
 ```
 
@@ -939,12 +951,12 @@ and log what it does (with `?ETA_LOG`), in the `handle_cast` clauses:
 
 ```erlang
 handle_cast({read, Ref, From}, St = #st{index = I, ts = Ts, val = Val}) ->
-    _ = ?ETA_LOG({answered_read, Ts}),
+    _ = ?ETA_LOG({answered_read, Ts}), % <-
     From ! {read_ack, Ref, I, Ts, Val},
     {noreply, St};
 handle_cast({write, Ref, From, Ts, Val}, St = #st{index = I}) ->
     St1 = store(Ts, Val, St),
-    _ = ?ETA_LOG({applied_write, Ts, St1#st.ts =:= Ts}),
+    _ = ?ETA_LOG({applied_write, Ts, St1#st.ts =:= Ts}), % <-
     From ! {write_ack, Ref, I},
     {noreply, St1}.
 ```
@@ -959,10 +971,10 @@ using `?ETA_LOG`. In `query_phase/1`, surrounding the collection:
 ```erlang
 query_phase(Replicas) ->
     Ref = make_ref(),
-    _ = ?ETA_LOG(query_sent),
+    _ = ?ETA_LOG(query_sent), % <-
     [abd_replica:read(Pid, Ref, self()) || Pid <- Replicas],
     Best = collect_reads(Ref, ?QUORUM, {{0, 0}, undefined}),
-    _ = ?ETA_LOG({quorum_max, element(1, Best)}),
+    _ = ?ETA_LOG({quorum_max, element(1, Best)}), % <-
     Best.
 ```
 
@@ -985,22 +997,18 @@ and in `read/2`'s `no_writeback` branch, which is the one that names the bug:
             _ = ?ETA_LOG({returned_without_writeback, Ts})
 ```
 
-This instrumentation requires knowledge of the system under test, ABD in this case,
-to be useful. `eta` can't do that for you. Choosing the right instrumentation means
-the trace will be readable. Luckily, since traces are replayable, the instrumentation
-can be decided upon post-fact. You will be able to hone your instrumentation over time
-using real bugs to define the narrative.
+For instrumentation to be useful, the developer must have some knowledge or expertise about
+the distributed system being implemented, ABD in this case. `eta` can't do that for you.
+Choosing the right instrumentation is important because it means the trace will be readable.
+Luckily, since traces are replayable, the instrumentation can be decided upon post-fact.
+You will be able to hone your instrumentation over time using real bugs to define the narrative.
+And you will be the expert of the system that you're writing.
 
 ### What you add to your harness
 
 `test/support/abd_harness.erl` never ships, so it can go either way: include
-`eta.hrl` and use the macros, or call `eta_log` directly. We call directly.
-
-The reason: **The macros are Erlang**. A harness that calls the functions instead
-could be written in Elixir, or another BEAM language. The system under test cannot,
-because `eta_transform` is an Erlang parse transform and never reaches an Elixir
-module. Your harness does not have special compile-time requirements, so write it
-in Elixir if you want.
+`eta.hrl` and use the macros, or call `eta_log` directly. Here we choose to
+call it directly.
 
 First, one function that decides what every client is called. Each one calls it
 on itself, which we wire up in a moment:
@@ -1164,8 +1172,8 @@ reader-6's quorum was `{replica-2, replica-3}` and reader-7's was
 
 Reader-6 got lucky enough to observe a value that was never durable, and by
 returning it, published something the system could no longer produce. **The
-write-back is what turns "I observed this" into "this is durable at a quorum"
-before the value escapes.** With it, reader-6 writes `{1,1}` to 2 replicas
+write-back is the action that converts "I observed this" into "this is durable at a quorum"
+before the value escapes to a caller.** With it, reader-6 writes `{1,1}` to 2 replicas
 before returning, and reader-7's quorum of 2 cannot miss it.
 
 One other item to note. There are entries in this trace that are a result of
@@ -1294,8 +1302,11 @@ That's why this throws rather than returning the partial result.
 
 ### The harness injects the new faults
 
-3 changes in `test/support/abd_harness.erl`. `generate/2` gains a pause operation,
-and the other thresholds shift up to make room:
+3 changes in `test/support/abd_harness.erl`. We'll add a new pause operation to
+`generate/2` and the other thresholds are increased to make room. Note: changing
+the generated workload like this means that a given seed, like the one from earlier,
+is unlikely to replay in the same way, because different operations will be selected
+from the RNG.
 
 ```erlang
 generate(#{next_op := N, replicas := Replicas}, Rand0) ->
@@ -1384,11 +1395,12 @@ RESULT: every outcome `:ok`. `clock_ms` reads **10000 on 23 of the 40 seeds and
 0 on the other 17.**
 
 Outcomes should all be `:ok`. Pausing doesn't break the cluster, it only makes things
-run more slowly and causes some clients to give up.
+run more slowly (in production) and causes some clients to give up.
 
 Notice that `clock_ms` is nonzero now; the virtual clock is engaged. Nothing in the
 system actually had to wait around for 10 seconds. We simulated it in a fraction of
-the time.
+the time. The magnitude of the speed up can vary, but it's common for DST systems
+to be able to test days worth of wall clock in a matter of hours of real time.
 
 Feel free to run the `:eta_log` functions in your shell to inspect some traces.
 
